@@ -20,7 +20,8 @@ export default function App(){
 
   async function fetchTrades(){
     try{
-      const res = await fetch('http://127.0.0.1:8000/trades')
+      const apiBase = getApiBase()
+      const res = await fetch((apiBase || '') + '/trades')
       const data = await res.json()
       setTrades(data)
     }catch(e){
