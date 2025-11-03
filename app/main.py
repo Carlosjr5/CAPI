@@ -191,6 +191,22 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
         body_obj["positionType"] = BITGET_POSITION_TYPE
 
     body = json.dumps(body_obj, separators=(',', ':'))  # compact body
+    # If dry-run is enabled, don't call Bitget — return a simulated successful response
+    # before we attempt to build signatures or make network calls. This avoids
+    # errors when secrets are intentionally not provided during local testing.
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        try:
+            print(f"[bitget] DRY-RUN enabled — would POST {url}")
+            print(f"[bitget] DRY-RUN payload: {body}")
+        except Exception:
+            pass
+        fake_resp = {
+            "code": "00000",
+            "msg": "dry-run: simulated order placed",
+            "data": {"orderId": f"DRY-{str(uuid.uuid4())}"}
+        }
+        return 200, json.dumps(fake_resp)
+
     timestamp = str(int(time.time() * 1000))
     sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
 
@@ -214,19 +230,7 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     except Exception:
         pass
 
-    # If dry-run is enabled, don't call Bitget — return a simulated successful response
-    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
-        try:
-            print(f"[bitget] DRY-RUN enabled — would POST {url}")
-            print(f"[bitget] DRY-RUN payload: {body}")
-        except Exception:
-            pass
-        fake_resp = {
-            "code": "00000",
-            "msg": "dry-run: simulated order placed",
-            "data": {"orderId": f"DRY-{str(uuid.uuid4())}"}
-        }
-        return 200, json.dumps(fake_resp)
+    # (live request path continues below)
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(url, headers=headers, content=body)
@@ -629,6 +633,15 @@ async def startup():
     # Print important runtime info to help verify demo vs prod endpoints and dry-run
     try:
         print(f"[startup] BITGET_BASE={BITGET_BASE} BITGET_DRY_RUN={BITGET_DRY_RUN}")
+    except Exception:
+        pass
+    # Warn if we're configured to send real orders but credentials are missing
+    try:
+        dry = str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on")
+        missing_creds = not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE)
+        if not dry and missing_creds:
+            print("[startup][warning] BITGET_DRY_RUN is disabled but one or more Bitget credentials are missing: BITGET_API_KEY, BITGET_SECRET, BITGET_PASSPHRASE")
+            print("[startup][warning] Set BITGET_DRY_RUN=1 to test locally without sending orders, or provide valid Bitget credentials to enable live/demo placements.")
     except Exception:
         pass
 
