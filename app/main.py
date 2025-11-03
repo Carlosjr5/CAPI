@@ -302,6 +302,10 @@ async def webhook(req: Request):
         # else: allow anyway but note in logs (you can change this to reject)
     # Extract fields
     signal = payload.get("signal") or payload.get("action") or ""
+    # If there's no explicit signal, fail loudly so misconfigured alerts are obvious.
+    if not signal:
+        # Return 400 so TradingView shows an error in the alert log and you can fix the alert message
+        raise HTTPException(status_code=400, detail="Missing required field: 'signal' (expected 'BUY' or 'SELL')")
     symbol = payload.get("symbol") or payload.get("ticker") or ""
     price = payload.get("price")
 
