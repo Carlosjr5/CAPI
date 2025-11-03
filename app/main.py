@@ -743,6 +743,66 @@ async def debug_ping_bitget():
 
     return result
 
+
+@app.post('/debug/bitget-positions')
+async def debug_bitget_positions(req: Request):
+    """Query Bitget for positions for a symbol in simulated/productType mode.
+    Accepts JSON { secret, symbol? } or Tradingview-Secret header. Returns Bitget response.
+    """
+    header_secret = req.headers.get("tradingview-secret") or req.headers.get("tradingview_secret")
+    body_text = await req.body()
+    try:
+        payload = json.loads(body_text.decode()) if body_text else {}
+    except Exception:
+        raise HTTPException(status_code=400, detail="Payload must be JSON")
+
+    # auth
+    if header_secret:
+        if header_secret != TRADINGVIEW_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid tradingview secret header")
+    else:
+        if not payload.get("secret") or payload.get("secret") != TRADINGVIEW_SECRET:
+            raise HTTPException(status_code=403, detail="Missing or invalid secret")
+
+    symbol = payload.get("symbol") or payload.get("ticker") or "BTCUSDT"
+    # Map to Bitget symbol format
+    raw = symbol.replace("BINANCE:", "").replace("/", "")
+    if "_" not in raw and BITGET_PRODUCT_TYPE:
+        bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+    else:
+        bitget_symbol = raw
+
+    body_obj = {"symbol": bitget_symbol, "marginCoin": BITGET_MARGIN_COIN}
+    body = json.dumps(body_obj, separators=(",", ":"))
+    request_path = "/api/mix/v1/position/singlePosition"
+
+    # build signature
+    timestamp = str(int(time.time() * 1000))
+    sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
+    headers = {
+        "ACCESS-KEY": BITGET_API_KEY,
+        "ACCESS-SIGN": sign,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+        "Content-Type": "application/json",
+        "paptrading": PAPTRADING,
+        "locale": "en-US",
+    }
+
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        return {"ok": False, "dry_run": True, "note": "BITGET_DRY_RUN is enabled — not querying live Bitget", "payload": body_obj}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = resp.text
+            return {"ok": True, "status_code": resp.status_code, "response": parsed}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.on_event("startup")
 async def startup():
     await database.connect()
