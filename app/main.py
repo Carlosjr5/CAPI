@@ -29,6 +29,7 @@ BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "usdt-futures")
 BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN", "USDT")
 BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE", "single")  # optional: e.g. 'single' for unilateral / one-way
 BITGET_POSITION_TYPE = os.getenv("BITGET_POSITION_TYPE", "unilateral")  # optional: try values like 'unilateral' or 'one-way' if Bitget expects 'positionType'
+BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN", "0")
 
 # DB (sqlite)
 DATABASE_URL = "sqlite:///./trades.db"
@@ -152,6 +153,20 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
         print(f"[bitget] safe-headers: {safe_headers}")
     except Exception:
         pass
+
+        # If dry-run is enabled, don't call Bitget — return a simulated successful response
+        if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+            try:
+                print(f"[bitget] DRY-RUN enabled — would POST {url}")
+                print(f"[bitget] DRY-RUN payload: {body}")
+            except Exception:
+                pass
+            fake_resp = {
+                "code": "00000",
+                "msg": "dry-run: simulated order placed",
+                "data": {"orderId": f"DRY-{str(uuid.uuid4())}"}
+            }
+            return 200, json.dumps(fake_resp)
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(url, headers=headers, content=body)
