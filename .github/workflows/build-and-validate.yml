@@ -1,0 +1,50 @@
+name: Build frontend and validate
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install frontend deps
+        run: |
+          npm ci --prefix frontend
+
+      - name: Build frontend
+        run: |
+          npm run build --prefix frontend
+
+      - name: Copy frontend build to static
+        run: |
+          mkdir -p static
+          cp -r frontend/dist/* static/
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install backend deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Quick smoke check - list /trades
+        env:
+          BITGET_DRY_RUN: '1'
+        run: |
+          # Start the app in the background and give it a moment to boot
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+          sleep 2
+          # Ensure the /trades endpoint responds (returns JSON array)
+          curl -fsS http://127.0.0.1:8000/trades | jq -e '.' || (echo 'trades endpoint failed' && exit 1)
