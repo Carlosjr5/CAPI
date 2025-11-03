@@ -19,9 +19,9 @@ async def check_order_symbol():
             else:
                 print(f"Error: {resp.text}")
 
-            # Try without the suffix
-            resp2 = await client.get(f'{base}/api/mix/v1/market/ticker?symbol=BTCUSDT')
-            print(f"\nTicker check for BTCUSDT: Status {resp2.status_code}")
+            # Try SUMCBL symbols
+            resp2 = await client.get(f'{base}/api/mix/v1/market/ticker?symbol=SBTCSUSDT_SUMCBL')
+            print(f"\nTicker check for SBTCSUSDT_SUMCBL: Status {resp2.status_code}")
             if resp2.status_code == 200:
                 data = resp2.json()
                 if 'data' in data:
@@ -30,6 +30,18 @@ async def check_order_symbol():
                     print("No ticker data")
             else:
                 print(f"Error: {resp2.text}")
+
+            # Try current product type (SUMCBL)
+            resp3 = await client.get(f'{base}/api/mix/v1/market/ticker?symbol=BTCUSDT_SUMCBL')
+            print(f"\nTicker check for BTCUSDT_SUMCBL: Status {resp3.status_code}")
+            if resp3.status_code == 200:
+                data = resp3.json()
+                if 'data' in data:
+                    print(f"Ticker data: {data['data']}")
+                else:
+                    print("No ticker data")
+            else:
+                print(f"Error: {resp3.text}")
 
     except Exception as e:
         print(f"Exception: {e}")
