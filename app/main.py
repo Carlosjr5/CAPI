@@ -96,6 +96,18 @@ if not os.path.isdir(STATIC_DIR):
 
 app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
 
+# Some production builds reference assets at '/assets/...' (absolute path).
+# Mount the `static/assets` folder at '/assets' so those requests resolve correctly
+# and the built `index.html` can find its JS/CSS when served from the root.
+assets_dir = os.path.join(STATIC_DIR, 'assets')
+try:
+    if os.path.isdir(assets_dir):
+        app.mount('/assets', StaticFiles(directory=assets_dir), name='assets')
+except Exception:
+    # non-fatal: if we can't mount assets for some reason, continue and the root
+    # handler will still return an informative message when index.html is missing.
+    pass
+
 
 @app.get('/')
 async def root_index():
