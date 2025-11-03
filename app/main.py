@@ -254,7 +254,25 @@ async def debug_payload(req: Request):
     signal = payload.get("signal") or payload.get("action") or ""
     symbol = payload.get("symbol") or payload.get("ticker") or ""
     price = payload.get("price")
+    # support both explicit size and USD-based size (mirrors /webhook behavior)
     size = payload.get("size")
+    size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
+    computed_size = None
+    if size is not None:
+        try:
+            computed_size = float(size)
+        except Exception:
+            computed_size = None
+    elif size_usd is not None:
+        try:
+            usd = float(size_usd)
+            p = float(price) if price else 1.0
+            if p and p != 0:
+                computed_size = usd / p
+            else:
+                computed_size = None
+        except Exception:
+            computed_size = None
 
     # Map signal to side
     if signal and str(signal).upper() in ("BUY", "LONG"):
@@ -264,12 +282,18 @@ async def debug_payload(req: Request):
     else:
         raise HTTPException(status_code=400, detail="Unknown signal; must be BUY or SELL")
 
-    constructed = construct_bitget_payload(symbol=symbol, side=side, size=size)
+    # prefer computed_size (from size_usd) when provided so debug mirrors webhook
+    constructed = construct_bitget_payload(symbol=symbol, side=side, size=computed_size if computed_size is not None else size)
     return {"payload": constructed}
 
 @app.on_event("startup")
 async def startup():
     await database.connect()
+    # Print important runtime info to help verify demo vs prod endpoints and dry-run
+    try:
+        print(f"[startup] BITGET_BASE={BITGET_BASE} BITGET_DRY_RUN={BITGET_DRY_RUN}")
+    except Exception:
+        pass
 
 @app.on_event("shutdown")
 async def shutdown():
