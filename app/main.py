@@ -27,13 +27,13 @@ BITGET_SECRET = os.getenv("BITGET_SECRET")
 BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
 PAPTRADING = os.getenv("PAPTRADING", "1")
 TRADINGVIEW_SECRET = os.getenv("TRADINGVIEW_SECRET")
-BITGET_BASE = os.getenv("BITGET_BASE", "https://api.bitget.com")
-BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "usdt-futures")
-BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN", "USDT")
-BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE", "single")  # optional: e.g. 'single' for unilateral / one-way
-BITGET_POSITION_TYPE = os.getenv("BITGET_POSITION_TYPE", "unilateral")  # optional: try values like 'unilateral' or 'one-way' if Bitget expects 'positionType'
+BITGET_BASE = os.getenv("BITGET_BASE")
+BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE")
+BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN")
+BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE")  # optional: e.g. 'single' for unilateral / one-way
+BITGET_POSITION_TYPE = os.getenv("BITGET_POSITION_TYPE")  # optional: try values like 'unilateral' or 'one-way' if Bitget expects 'positionType'
 BITGET_POSITION_SIDE = os.getenv("BITGET_POSITION_SIDE")  # optional: explicit position side e.g. 'long' or 'short'
-BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN", "0")
+BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN")
 
 # DB (sqlite)
 DATABASE_URL = "sqlite:///./trades.db"
@@ -199,7 +199,10 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # set BITGET_POSITION_MODE in Railway (try 'single' or the value shown in Bitget docs) — this
     # will add a "positionMode" key to the order payload.
     if BITGET_POSITION_MODE:
-        body_obj["positionMode"] = BITGET_POSITION_MODE
+        if BITGET_POSITION_MODE.lower() == "single":
+            body_obj["positionMode"] = "one_way"
+        else:
+            body_obj["positionMode"] = BITGET_POSITION_MODE
 
     # Map the incoming generic side (buy/sell) to the Bitget API's expected
     # values for the account's hold/position mode. For single/unilateral (one-way)
@@ -209,8 +212,8 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     side_key = side.lower()
     pm = str(BITGET_POSITION_MODE or "").lower()
     pt = str(BITGET_POSITION_TYPE or "").lower()
-    single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way")
-    if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way")):
+    single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way", "oneway")
+    if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way", "oneway")):
         # Use the single-hold side enum
         mapped = "buy_single" if side_key == "buy" else "sell_single"
         body_obj["side"] = mapped
@@ -463,8 +466,8 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     side_key = side.lower()
     pm = str(BITGET_POSITION_MODE or "").lower()
     pt = str(BITGET_POSITION_TYPE or "").lower()
-    single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way")
-    if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way")):
+    single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way", "oneway")
+    if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way", "oneway")):
         mapped = "buy_single" if side_key == "buy" else "sell_single"
         body_obj["side"] = mapped
     else:
