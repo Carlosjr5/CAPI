@@ -463,6 +463,12 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
         if base_match:
             base = base_match.group(1)
             bitget_symbol = f"S{base}USDT_SUMCBL"
+        else:
+            # Fallback: add 'S' prefix to the whole symbol before the suffix
+            if "_SUMCBL" in bitget_symbol:
+                bitget_symbol = bitget_symbol.replace("USDT_SUMCBL", "SUSDT_SUMCBL")
+            else:
+                bitget_symbol = f"S{bitget_symbol}"
 
     body_obj = {
         "productType": BITGET_PRODUCT_TYPE,
