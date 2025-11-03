@@ -5,9 +5,10 @@ body{margin:0;background:#333333;color:#E6E6E6}
 header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
 .brand{font-weight:700}
 .status{color:#9CA3AF}
-main{display:flex;gap:16px}
+.main{ /* helper class not used directly; kept for future extensibility */ display:block }
+main{display:flex;gap:16px;align-items:flex-start}
 .left{flex:1;max-height:calc(100vh - 160px);overflow-y:auto}
-.right{width:360px}
+.right{width:360px;height:fit-content}
 /* keep the right column visible while the left content scrolls */
 .right{position:sticky;top:28px;align-self:flex-start}
 .kpis{display:flex;gap:10px;margin-bottom:12px}
@@ -22,6 +23,19 @@ main{display:flex;gap:16px}
 .eventsList{max-height:220px;overflow-y:auto;padding:4px;}
 .eventsList .evt{padding:6px;border-bottom:1px solid rgba(255,255,255,0.04)}
 .toolbar{display:flex;justify-content:flex-end;margin-bottom:8px}
+
+/* Inputs, selects and pre blocks inside cards to match dark theme and remain visible */
+.card input,
+.card select,
+.card textarea {
+	background: #1b1b1b;
+	color: #E6E6E6;
+	border: 1px solid rgba(255,255,255,0.06);
+	padding: 8px;
+	border-radius: 6px;
+}
+.card input::placeholder { color: #9CA3AF }
+.card pre { background: transparent; border-radius: 6px; padding: 8px }
 
 /* Buttons */
 button{background:#3b82f6;color:#fff;border:none;padding:8px 10px;border-radius:8px;cursor:pointer}
