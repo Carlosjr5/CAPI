@@ -22,8 +22,8 @@
     h1{margin:0;font-size:18px}
     .sub{color:var(--muted);font-size:13px}
 
-    .grid{display:grid;grid-template-columns:1fr 380px;gap:18px}
-    .card{background:var(--card);border-radius:12px;padding:16px;box-shadow:0 6px 18px rgba(17,24,39,0.06)}
+  .grid{display:grid;grid-template-columns:1fr 380px;gap:18px;align-items:flex-start}
+  .card{background:var(--card);border-radius:12px;padding:16px;box-shadow:0 6px 18px rgba(17,24,39,0.06);overflow:visible}
 
     /* summary */
     .summary{display:flex;gap:12px}
@@ -48,8 +48,13 @@
     .badge.closed{background:rgba(239,68,68,0.08);color:var(--danger)}
     .muted{color:var(--muted)}
 
-    /* right column */
-    .chart-wrap{display:flex;flex-direction:column;gap:12px}
+  /* right column */
+  .chart-wrap{display:flex;flex-direction:column;gap:12px}
+  /* keep the status / chart panel visible while the left column scrolls */
+  .card.chart-wrap{position:sticky;top:24px;align-self:flex-start}
+
+  /* constrain the main table so the page doesn't scroll the chart off-screen */
+  #tableWrap{max-height:calc(100vh - 300px);overflow:auto}
     canvas{background:transparent}
 
     /* modal */
