@@ -100,25 +100,8 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     request_path = "/api/v2/mix/order/place-order"
     url = BITGET_BASE + request_path
 
-    # Build order payload (example uses usdt-futures, market order)
-    # Note: adjust productType/orderType/size/price per your needs; size expected as strings
-    # Build order payload. Bitget expects a margin coin for some product types; include a sensible default (USDT).
-    # Use a common productType for USDT-margined futures. If you use a different market, adjust accordingly.
-    # Build order payload. Make certain fields configurable via env vars so we can try
-    # different product types / modes without code edits.
-    body_obj = {
-        "productType": BITGET_PRODUCT_TYPE,
-        "symbol": symbol.replace("BINANCE:", "").replace("/", ""),  # ensure symbol format like BTCUSDT
-        # we'll set `side` below after mapping for single/unilateral accounts
-        "orderType": "market",
-        # size is required; for market orders size should be contract quantity.
-        # If caller passed `size` (a numeric quantity), use it; otherwise fall back to "1".
-        "size": str(size) if size is not None else "1",
-        # Explicit margin coin to avoid errors like "Margin Coin cannot be empty"
-        "marginCoin": BITGET_MARGIN_COIN,
-        "marginMode": "crossed",
-        "clientOid": str(uuid.uuid4())
-    }
+    # Build the order payload using the shared helper
+    body_obj = construct_bitget_payload(symbol=symbol, side=side, size=size)
 
     # Optional: include position mode if set via env. Bitget accounts can be one-way (unilateral)
     # or hedged. If your account is in unilateral mode and Bitget expects a matching order field,
@@ -207,6 +190,82 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
         except Exception:
             pass
         return resp.status_code, resp.text
+
+
+def construct_bitget_payload(symbol: str, side: str, size: float = None):
+    """Construct the Bitget order payload dictionary without signing/sending.
+    This mirrors the logic used by place_demo_order so it can be tested by
+    the debug endpoint without making external calls.
+    """
+    body_obj = {
+        "productType": BITGET_PRODUCT_TYPE,
+        "symbol": symbol.replace("BINANCE:", "").replace("/", ""),
+        "orderType": "market",
+        "size": str(size) if size is not None else "1",
+        "marginCoin": BITGET_MARGIN_COIN,
+        "marginMode": "crossed",
+        "clientOid": str(uuid.uuid4())
+    }
+
+    # Map side for single/unilateral accounts when necessary
+    side_key = side.lower()
+    pm = str(BITGET_POSITION_MODE or "").lower()
+    pt = str(BITGET_POSITION_TYPE or "").lower()
+    single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way")
+    if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way")):
+        mapped = "buy_single" if side_key == "buy" else "sell_single"
+        body_obj["side"] = mapped
+    else:
+        body_obj["side"] = side_key
+
+    # positionSide inference
+    if BITGET_POSITION_SIDE:
+        body_obj["positionSide"] = BITGET_POSITION_SIDE
+    else:
+        try:
+            inferred = "long" if side_key == "buy" else "short"
+            body_obj["positionSide"] = inferred
+        except Exception:
+            pass
+
+    # Only include positionType if it's set and not the problematic 'unilateral' literal
+    if BITGET_POSITION_TYPE and str(BITGET_POSITION_TYPE).lower() not in ("unilateral", "one-way"):
+        body_obj["positionType"] = BITGET_POSITION_TYPE
+
+    # Optionally include positionMode if the environment variable is set
+    if BITGET_POSITION_MODE:
+        body_obj["positionMode"] = BITGET_POSITION_MODE
+
+    return body_obj
+
+
+@app.post("/debug/payload")
+async def debug_payload(req: Request):
+    """Return the Bitget payload that would be sent for a TradingView alert.
+    Accepts the same JSON body as `/webhook` (signal, symbol, price, size).
+    This endpoint never sends anything to Bitget.
+    """
+    body_text = await req.body()
+    try:
+        payload = json.loads(body_text.decode())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Payload must be JSON")
+
+    signal = payload.get("signal") or payload.get("action") or ""
+    symbol = payload.get("symbol") or payload.get("ticker") or ""
+    price = payload.get("price")
+    size = payload.get("size")
+
+    # Map signal to side
+    if signal and str(signal).upper() in ("BUY", "LONG"):
+        side = "buy"
+    elif signal and str(signal).upper() in ("SELL", "SHORT"):
+        side = "sell"
+    else:
+        raise HTTPException(status_code=400, detail="Unknown signal; must be BUY or SELL")
+
+    constructed = construct_bitget_payload(symbol=symbol, side=side, size=size)
+    return {"payload": constructed}
 
 @app.on_event("startup")
 async def startup():
