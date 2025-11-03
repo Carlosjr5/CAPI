@@ -84,13 +84,27 @@ app.add_middleware(
 connected_websockets: List[WebSocket] = []
 
 # Serve the frontend from the `static` folder. Index is available at '/'.
-app.mount('/static', StaticFiles(directory=os.path.join(os.path.dirname(__file__), '..', 'static')), name='static')
+# Ensure the static directory exists at runtime so the app doesn't crash if the build
+# step wasn't run (CI/deploy should generate `static/` before start).
+STATIC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'static'))
+if not os.path.isdir(STATIC_DIR):
+    try:
+        print(f"[startup] static directory '{STATIC_DIR}' not found; creating empty directory to avoid startup crash.")
+        os.makedirs(STATIC_DIR, exist_ok=True)
+    except Exception as e:
+        print(f"[startup] failed to create static dir: {e}")
+
+app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
 
 
 @app.get('/')
 async def root_index():
-    # return the dashboard index.html from the static folder
-    return FileResponse(os.path.join(os.path.dirname(__file__), '..', 'static', 'index.html'))
+    # Return the dashboard index.html from the static folder if present,
+    # otherwise return a small informative JSON so the process doesn't crash.
+    index_path = os.path.join(STATIC_DIR, 'index.html')
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"ok": False, "message": "Static site not built. Run the frontend build to generate static/index.html before starting the server."}
 
 # helper: send message to all connected frontends
 async def broadcast(event: dict):
