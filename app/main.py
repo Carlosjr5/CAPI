@@ -212,6 +212,29 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
         return resp.status_code, resp.text
 
 
+async def fetch_market_price(symbol: str):
+    """Try to fetch a current market price for the given symbol from a public ticker (Binance).
+    Returns a float price or None if it couldn't be fetched.
+    """
+    # Normalize symbol for Binance (e.g., BTCUSDT)
+    try:
+        s = symbol.replace('/', '').upper()
+    except Exception:
+        s = symbol
+    url = f"https://api.binance.com/api/v3/ticker/price?symbol={s}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(url)
+            if r.status_code == 200:
+                j = r.json()
+                p = j.get('price')
+                if p:
+                    return float(p)
+    except Exception:
+        pass
+    return None
+
+
 def construct_bitget_payload(symbol: str, side: str, size: float = None):
     """Construct the Bitget order payload dictionary without signing/sending.
     This mirrors the logic used by place_demo_order so it can be tested by
@@ -286,11 +309,17 @@ async def debug_payload(req: Request):
     elif size_usd is not None:
         try:
             usd = float(size_usd)
-            p = float(price) if price else 1.0
+            if price:
+                p = float(price)
+            else:
+                # try to fetch a live market price when caller did not provide one
+                p = await fetch_market_price(payload.get("symbol") or payload.get("ticker") or "")
             if p and p != 0:
                 computed_size = usd / p
             else:
-                computed_size = None
+                raise HTTPException(status_code=400, detail="Missing price and unable to fetch market price; include price in payload or try again")
+        except HTTPException:
+            raise
         except Exception:
             computed_size = None
 
@@ -358,9 +387,15 @@ async def debug_place_test(req: Request):
     elif size_usd is not None:
         try:
             usd = float(size_usd)
-            p = float(price) if price else 1.0
+            if price:
+                p = float(price)
+            else:
+                # try to fetch market price when price not provided
+                p = await fetch_market_price(symbol)
             if p and p != 0:
                 computed_size = usd / p
+            else:
+                raise HTTPException(status_code=400, detail="Missing price and unable to fetch market price; include price or try again")
         except Exception:
             computed_size = None
 
@@ -585,12 +620,15 @@ async def webhook(req: Request):
     elif size_usd is not None:
         try:
             usd = float(size_usd)
-            p = float(price) if price else 1.0
+            if price:
+                p = float(price)
+            else:
+                p = await fetch_market_price(symbol)
             if p and p != 0:
                 # simple conversion: number of contracts = usd / price
                 computed_size = usd / p
             else:
-                computed_size = None
+                raise HTTPException(status_code=400, detail="Missing price and unable to fetch market price; include price in the webhook or try again")
         except Exception:
             computed_size = None
 
