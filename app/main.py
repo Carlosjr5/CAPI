@@ -164,14 +164,27 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
                         raw = symbol.replace("BINANCE:", "").replace("/", "")
                         raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
                         raw_up = raw.upper()
+                        # base coin (e.g. BTC from BTCUSDT)
+                        base = raw_up.replace("USDT", "").replace("_", "")
                         for item in data:
-                            s = item.get("symbol") if isinstance(item, dict) else None
-                            if not s:
+                            if not isinstance(item, dict):
                                 continue
-                            # match base symbol ignoring suffixes/case
-                            if s.upper().startswith(raw_up):
-                                mapped_symbol = s
+                            s = (item.get("symbol") or "").upper()
+                            display = (item.get("symbolDisplayName") or "").upper()
+                            # direct match with symbol or display
+                            if raw_up == s or raw_up == display:
+                                mapped_symbol = item.get("symbol")
                                 break
+                            # substring match: raw contained in symbol/display
+                            if raw_up in s or raw_up in display:
+                                mapped_symbol = item.get("symbol")
+                                break
+                            # match by base coin presence (handles demo prefixes like 'SBTC')
+                            if base and (base in s or base in display):
+                                # ensure it's a USDT pair (display contains USDT)
+                                if "USDT" in s or "USDT" in display:
+                                    mapped_symbol = item.get("symbol")
+                                    break
                 except Exception:
                     mapped_symbol = None
     except Exception:
