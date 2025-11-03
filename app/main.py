@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import socket
+import re
 from urllib.parse import urlparse
 import httpx
 import sqlalchemy
@@ -356,11 +357,23 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     # simulated products. If symbol already contains an underscore (e.g.
     # BTCUSDT_SUMCBL) assume caller provided the correct Bitget symbol and
     # don't append the product type.
+    # Normalize incoming symbol from TradingView or other sources.
+    # Common forms: 'BTCUSDT', 'BINANCE:BTCUSDT', 'BTCUSDT.P' (perpetual),
+    # or already Bitget style 'BTCUSDT_SUMCBL'. Remove prefixes and
+    # non-alphanumeric/dot/underscore characters, then construct the
+    # Bitget symbol as RAW + '_' + productType when needed.
     raw = symbol.replace("BINANCE:", "").replace("/", "")
-    if "_" not in raw and BITGET_PRODUCT_TYPE:
-        bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
-    else:
+    # remove dots and any characters except letters, digits and underscore
+    raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
+    # If symbol already appears to include the product suffix, keep as-is
+    if BITGET_PRODUCT_TYPE and ("_" in raw and raw.upper().endswith(str(BITGET_PRODUCT_TYPE).upper())):
         bitget_symbol = raw
+    else:
+        # append product type if not present
+        if BITGET_PRODUCT_TYPE:
+            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+        else:
+            bitget_symbol = raw
 
     body_obj = {
         "productType": BITGET_PRODUCT_TYPE,
