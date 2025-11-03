@@ -1,8 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react'
-import { Doughnut } from 'react-chartjs-2'
-import { Chart, ArcElement, Tooltip, Legend } from 'chart.js'
+// Chart.js removed - use simple status boxes instead
 import TradeTable from './TradeTable'
-Chart.register(ArcElement, Tooltip, Legend)
+// Chart registration removed
 
 export default function App(){
   const [trades, setTrades] = useState([])
@@ -104,8 +103,12 @@ export default function App(){
 
         <aside className="right">
           <div className="card">
-            <h3>Status distribution</h3>
-            <Doughnut data={pieData} />
+            <h3>Status</h3>
+            <div style={{display:'flex',gap:10,alignItems:'center',marginTop:8}}>
+              <div style={{padding:8,borderRadius:8,background:'rgba(16,185,129,0.15)',color:'#10b981',fontWeight:700}}>Open: {counts.open}</div>
+              <div style={{padding:8,borderRadius:8,background:'rgba(239,68,68,0.12)',color:'#ef4444',fontWeight:700}}>Closed: {counts.closed}</div>
+              <div style={{padding:8,borderRadius:8,background:'rgba(148,163,184,0.12)',color:'#94a3b8',fontWeight:700}}>Other: {counts.other}</div>
+            </div>
           </div>
           
           <div className="card events">

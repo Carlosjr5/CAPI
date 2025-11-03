@@ -358,6 +358,45 @@ async def debug_place_test(req: Request):
         if not payload.get("secret") or payload.get("secret") != TRADINGVIEW_SECRET:
             raise HTTPException(status_code=403, detail="Missing or invalid secret")
 
+    
+
+    # extract order params (defaults useful small test)
+    signal = payload.get("signal") or payload.get("action") or "BUY"
+    symbol = payload.get("symbol") or payload.get("ticker") or "BTCUSDT"
+    price = payload.get("price") or None
+    size = payload.get("size")
+    size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
+
+    # determine side
+    if signal and str(signal).upper() in ("BUY", "LONG"):
+        side = "buy"
+    elif signal and str(signal).upper() in ("SELL", "SHORT"):
+        side = "sell"
+    else:
+        raise HTTPException(status_code=400, detail="Unknown signal; must be BUY or SELL")
+
+    # compute size from size_usd if provided
+    computed_size = None
+    if size is not None:
+        try:
+            computed_size = float(size)
+        except Exception:
+            computed_size = None
+    elif size_usd is not None:
+        try:
+            usd = float(size_usd)
+            if price:
+                p = float(price)
+            else:
+                # try to fetch market price when price not provided
+                p = await fetch_market_price(symbol)
+            if p and p != 0:
+                computed_size = usd / p
+            else:
+                raise HTTPException(status_code=400, detail="Missing price and unable to fetch market price; include price or try again")
+        except Exception:
+            computed_size = None
+
     # If dry-run is enabled, simulate placing an order by inserting a DB row
     if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
         # Construct the payload for reporting and the simulated response
@@ -396,43 +435,6 @@ async def debug_place_test(req: Request):
             "response": fake_resp,
             "payload": constructed_payload,
         }
-
-    # extract order params (defaults useful small test)
-    signal = payload.get("signal") or payload.get("action") or "BUY"
-    symbol = payload.get("symbol") or payload.get("ticker") or "BTCUSDT"
-    price = payload.get("price") or None
-    size = payload.get("size")
-    size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
-
-    # determine side
-    if signal and str(signal).upper() in ("BUY", "LONG"):
-        side = "buy"
-    elif signal and str(signal).upper() in ("SELL", "SHORT"):
-        side = "sell"
-    else:
-        raise HTTPException(status_code=400, detail="Unknown signal; must be BUY or SELL")
-
-    # compute size from size_usd if provided
-    computed_size = None
-    if size is not None:
-        try:
-            computed_size = float(size)
-        except Exception:
-            computed_size = None
-    elif size_usd is not None:
-        try:
-            usd = float(size_usd)
-            if price:
-                p = float(price)
-            else:
-                # try to fetch market price when price not provided
-                p = await fetch_market_price(symbol)
-            if p and p != 0:
-                computed_size = usd / p
-            else:
-                raise HTTPException(status_code=400, detail="Missing price and unable to fetch market price; include price or try again")
-        except Exception:
-            computed_size = None
 
     # Place the order using the existing helper
     try:
