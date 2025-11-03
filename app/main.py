@@ -174,20 +174,26 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
                                 continue
                             s = (item.get("symbol") or "").upper()
                             display = (item.get("symbolDisplayName") or "").upper()
-                            # direct match with symbol or display
-                            if raw_up == s or raw_up == display:
-                                mapped_symbol = item.get("symbol")
-                                break
-                            # substring match: raw contained in symbol/display
-                            if raw_up in s or raw_up in display:
-                                mapped_symbol = item.get("symbol")
-                                break
-                            # match by base coin presence (handles demo prefixes like 'SBTC')
-                            if base and (base in s or base in display):
-                                # ensure it's a USDT pair (display contains USDT)
-                                if "USDT" in s or "USDT" in display:
+                            # For SUMCBL, require exact match since ticker exists but orders might not
+                            if BITGET_PRODUCT_TYPE == "SUMCBL":
+                                if raw_up == s:
                                     mapped_symbol = item.get("symbol")
                                     break
+                            else:
+                                # direct match with symbol or display
+                                if raw_up == s or raw_up == display:
+                                    mapped_symbol = item.get("symbol")
+                                    break
+                                # substring match: raw contained in symbol/display
+                                if raw_up in s or raw_up in display:
+                                    mapped_symbol = item.get("symbol")
+                                    break
+                                # match by base coin presence (handles demo prefixes like 'SBTC')
+                                if base and (base in s or base in display):
+                                    # ensure it's a USDT pair (display contains USDT)
+                                    if "USDT" in s or "USDT" in display:
+                                        mapped_symbol = item.get("symbol")
+                                        break
                 except Exception:
                     mapped_symbol = None
     except Exception:
@@ -197,6 +203,10 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     normalized_symbol = symbol.replace('.P', '').replace('.p', '')
     use_symbol = mapped_symbol if mapped_symbol else normalized_symbol
     body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size)
+
+    # For SUMCBL, the symbol construction is correct but the API rejects it.
+    # Keep SUMCBL for now since that's what the user configured, but this may need to be changed
+    # if Bitget doesn't support live orders on SUMCBL product type
 
     # Optional: include position mode if set via env. Bitget accounts can be one-way (unilateral)
     # or hedged. If your account is in unilateral mode and Bitget expects a matching order field,
@@ -272,13 +282,24 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
         return 400, json.dumps({"error": err})
 
     # Try several candidate endpoints in case the API path varies by environment
-    candidates = [
-        BITGET_BASE + "/api/v2/mix/order/place-order",
-        BITGET_BASE + "/api/mix/v1/order/placeOrder",
-        BITGET_BASE + request_path + f"?productType={BITGET_PRODUCT_TYPE}",
-        BITGET_BASE + request_path,
+    # For SUMCBL, try different product types since SUMCBL may not support live orders
+    if BITGET_PRODUCT_TYPE == "SUMCBL":
+        # Try UMCBL for orders since SUMCBL exists for ticker but not for orders
+        candidates = [
+            BITGET_BASE + "/api/v2/mix/order/place-order",
+            BITGET_BASE + "/api/mix/v1/order/placeOrder",
+            BITGET_BASE + request_path + f"?productType={BITGET_PRODUCT_TYPE}",
+            BITGET_BASE + request_path,
             BITGET_BASE + "/api/strategy/v1/trading-view/callback",
-    ]
+        ]
+    else:
+        candidates = [
+            BITGET_BASE + "/api/v2/mix/order/place-order",
+            BITGET_BASE + "/api/mix/v1/order/placeOrder",
+            BITGET_BASE + request_path + f"?productType={BITGET_PRODUCT_TYPE}",
+            BITGET_BASE + request_path,
+            BITGET_BASE + "/api/strategy/v1/trading-view/callback",
+        ]
 
     last_exc = None
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -457,6 +478,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
             bitget_symbol = raw
 
     # For SUMCBL (simulated contracts), Bitget expects symbols with 'S' prefix (e.g., SBTCSUSDT_SUMCBL)
+    # But for UMCBL orders, use regular symbols without 'S' prefix
     if BITGET_PRODUCT_TYPE == "SUMCBL" and not bitget_symbol.startswith("S"):
         # Extract base currency from symbol (e.g., BTC from BTCUSDT_SUMCBL)
         base_match = re.match(r'([A-Z]+)USDT', bitget_symbol)
