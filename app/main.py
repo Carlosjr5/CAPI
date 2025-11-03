@@ -147,8 +147,39 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     request_path = "/api/mix/v1/order/placeOrder"
     url = BITGET_BASE + request_path
 
-    # Build the order payload using the shared helper
-    body_obj = construct_bitget_payload(symbol=symbol, side=side, size=size)
+    # Attempt to discover the exact Bitget contract symbol for the configured
+    # productType to avoid mismatches (e.g. TradingView 'BTCUSDT.P' or differing
+    # suffixes). If discovery fails we'll fall back to the simple mapping.
+    mapped_symbol = None
+    try:
+        # Query Bitget's public contracts for the productType
+        contracts_url = f"{BITGET_BASE}/api/mix/v1/market/contracts?productType={BITGET_PRODUCT_TYPE}"
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(contracts_url)
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                    data = j.get("data") if isinstance(j, dict) else None
+                    if isinstance(data, list):
+                        raw = symbol.replace("BINANCE:", "").replace("/", "")
+                        raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
+                        raw_up = raw.upper()
+                        for item in data:
+                            s = item.get("symbol") if isinstance(item, dict) else None
+                            if not s:
+                                continue
+                            # match base symbol ignoring suffixes/case
+                            if s.upper().startswith(raw_up):
+                                mapped_symbol = s
+                                break
+                except Exception:
+                    mapped_symbol = None
+    except Exception:
+        mapped_symbol = None
+
+    # Build the order payload using the shared helper. Prefer discovered symbol.
+    use_symbol = mapped_symbol if mapped_symbol else symbol
+    body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size)
 
     # Optional: include position mode if set via env. Bitget accounts can be one-way (unilateral)
     # or hedged. If your account is in unilateral mode and Bitget expects a matching order field,
