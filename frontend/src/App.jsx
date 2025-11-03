@@ -55,8 +55,15 @@ export default function App(){
   }
 
   function getApiBase(){
+    // Default behavior:
+    // - When running the dev frontend locally (localhost:5173/3000) use the API base
+    //   defined by Vite env var VITE_API_BASE if present, otherwise fall back to
+    //   the deployed Railway URL so dev frontend talks to the deployed backend.
     const usingDevFrontend = location.hostname === 'localhost' && (location.port === '5173' || location.port === '3000')
-    return usingDevFrontend ? 'http://127.0.0.1:8000' : ''
+    let viteBase = ''
+    try{ viteBase = (import.meta && import.meta.env && import.meta.env.VITE_API_BASE) || '' }catch(e){}
+    const defaultRailway = 'https://capi-production-7bf3.up.railway.app'
+    return usingDevFrontend ? (viteBase || defaultRailway) : ''
   }
 
   function pushEvent(msg){

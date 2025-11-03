@@ -6,3 +6,4 @@ databases[sqlite]
 sqlalchemy
 websockets
 python-multipart
+requests

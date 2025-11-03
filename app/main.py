@@ -13,6 +13,8 @@ from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconn
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+import socket
+from urllib.parse import urlparse
 import httpx
 import sqlalchemy
 from databases import Database
@@ -53,10 +55,28 @@ engine = sqlalchemy.create_engine(
 metadata.create_all(engine)
 
 app = FastAPI()
-# Allow CORS from local dev servers (React/Vite). Adjust origins in production.
+# Allow CORS from local dev servers (React/Vite) and deployed frontend.
+# You can override allowed origins via the FRONTEND_ORIGINS env var (comma-separated).
+default_frontend_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    # Railway frontend / deployed origin - adjust if you host frontend elsewhere
+    "https://capi-production-7bf3.up.railway.app",
+]
+env_origins = os.getenv("FRONTEND_ORIGINS")
+if env_origins:
+    try:
+        origins = [o.strip() for o in env_origins.split(",") if o.strip()]
+    except Exception:
+        origins = default_frontend_origins
+else:
+    origins = default_frontend_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -447,6 +467,63 @@ async def debug_order_status(req: Request):
         except Exception:
             parsed = resp.text
         return {"ok": True, "status_code": resp.status_code, "response": parsed}
+
+
+@app.get('/debug/config')
+async def debug_config():
+    """Return non-sensitive runtime configuration useful for debugging remote deployments.
+    Does NOT return secrets. Safe to call remotely when protected by network controls.
+    """
+    return {
+        "bitget_base": BITGET_BASE,
+        "bitget_dry_run": str(BITGET_DRY_RUN),
+        "bitget_product_type": BITGET_PRODUCT_TYPE,
+        "bitget_margin_coin": BITGET_MARGIN_COIN,
+        "bitget_position_mode": BITGET_POSITION_MODE,
+        "bitget_position_type": BITGET_POSITION_TYPE,
+        "paptrading": PAPTRADING,
+        # don't return raw secrets; only indicate presence
+        "has_api_key": bool(BITGET_API_KEY),
+        "has_secret": bool(BITGET_SECRET),
+        "has_passphrase": bool(BITGET_PASSPHRASE),
+    }
+
+
+@app.get('/debug/ping-bitget')
+async def debug_ping_bitget():
+    """Attempt a DNS lookup for the configured BITGET_BASE host and optionally try a simple GET.
+    Returns addresses found or an error message. This helps diagnose DNS / network issues
+    like the "[Errno -2] Name or service not known" error.
+    """
+    try:
+        parsed = urlparse(BITGET_BASE)
+        host = parsed.hostname or BITGET_BASE
+    except Exception:
+        host = BITGET_BASE
+
+    result = {"host": host}
+    try:
+        infos = socket.getaddrinfo(host, None)
+        addrs = []
+        for info in infos:
+            addr = info[4][0]
+            if addr not in addrs:
+                addrs.append(addr)
+        result["resolved"] = True
+        result["addresses"] = addrs
+    except Exception as e:
+        result["resolved"] = False
+        result["error"] = str(e)
+
+    # Try a very short HEAD request to the base URL to check reachability (no auth)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(BITGET_BASE)
+            result["http_status"] = resp.status_code
+    except Exception as e:
+        result["http_error"] = str(e)
+
+    return result
 
 @app.on_event("startup")
 async def startup():
