@@ -109,7 +109,7 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     body_obj = {
         "productType": BITGET_PRODUCT_TYPE,
         "symbol": symbol.replace("BINANCE:", "").replace("/", ""),  # ensure symbol format like BTCUSDT
-        "side": side.lower(),  # buy or sell
+        # we'll set `side` below after mapping for single/unilateral accounts
         "orderType": "market",
         # size is required; for market orders size should be contract quantity.
         # If caller passed `size` (a numeric quantity), use it; otherwise fall back to "1".
@@ -127,12 +127,29 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     if BITGET_POSITION_MODE:
         body_obj["positionMode"] = BITGET_POSITION_MODE
 
+    # Map the incoming generic side (buy/sell) to the Bitget API's expected
+    # values for the account's hold/position mode. For single/unilateral (one-way)
+    # accounts Bitget expects 'buy_single' / 'sell_single' (or similar). For other
+    # account modes we keep the original simple mapping (buy/sell) to avoid
+    # accidental mismatches.
+    side_key = side.lower()
+    pm = str(BITGET_POSITION_MODE or "").lower()
+    pt = str(BITGET_POSITION_TYPE or "").lower()
+    single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way")
+    if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way")):
+        # Use the single-hold side enum
+        mapped = "buy_single" if side_key == "buy" else "sell_single"
+        body_obj["side"] = mapped
+    else:
+        # default to the simple buy/sell mapping (keeps prior behaviour)
+        body_obj["side"] = side_key
+
     # Include a position side (long/short). Prefer explicit env var, otherwise map from order side.
     if BITGET_POSITION_SIDE:
         body_obj["positionSide"] = BITGET_POSITION_SIDE
     else:
         try:
-            inferred = "long" if side.lower() == "buy" else "short"
+            inferred = "long" if side_key == "buy" else "short"
             body_obj["positionSide"] = inferred
         except Exception:
             pass
@@ -168,19 +185,19 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     except Exception:
         pass
 
-        # If dry-run is enabled, don't call Bitget — return a simulated successful response
-        if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
-            try:
-                print(f"[bitget] DRY-RUN enabled — would POST {url}")
-                print(f"[bitget] DRY-RUN payload: {body}")
-            except Exception:
-                pass
-            fake_resp = {
-                "code": "00000",
-                "msg": "dry-run: simulated order placed",
-                "data": {"orderId": f"DRY-{str(uuid.uuid4())}"}
-            }
-            return 200, json.dumps(fake_resp)
+    # If dry-run is enabled, don't call Bitget — return a simulated successful response
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        try:
+            print(f"[bitget] DRY-RUN enabled — would POST {url}")
+            print(f"[bitget] DRY-RUN payload: {body}")
+        except Exception:
+            pass
+        fake_resp = {
+            "code": "00000",
+            "msg": "dry-run: simulated order placed",
+            "data": {"orderId": f"DRY-{str(uuid.uuid4())}"}
+        }
+        return 200, json.dumps(fake_resp)
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(url, headers=headers, content=body)
