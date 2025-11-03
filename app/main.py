@@ -283,22 +283,41 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
         print(f"[bitget][error] {err}")
         return 400, json.dumps({"error": err})
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, headers=headers, content=body)
-            # Log response for easier debugging
+    # Try several candidate endpoints in case the API path varies by environment
+    candidates = [
+        BITGET_BASE + request_path,
+        BITGET_BASE + request_path + f"?productType={BITGET_PRODUCT_TYPE}",
+        BITGET_BASE + "/api/v2/mix/order/place-order",
+        BITGET_BASE + "/api/mix/v1/order/placeOrder",
+    ]
+
+    last_exc = None
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for u in candidates:
             try:
-                print(f"[bitget] response status={resp.status_code} text={resp.text}")
-            except Exception:
-                pass
-            return resp.status_code, resp.text
-    except Exception as e:
-        # Network / DNS / TLS / other transport error
-        try:
-            print(f"[bitget][exception] request to {url} failed: {e}")
-        except Exception:
-            pass
-        return 502, json.dumps({"error": str(e)})
+                print(f"[bitget] trying POST {u}")
+                resp = await client.post(u, headers=headers, content=body)
+                try:
+                    print(f"[bitget] response status={resp.status_code} text={resp.text}")
+                except Exception:
+                    pass
+                # If endpoint not found, try next candidate
+                if resp.status_code == 404:
+                    print(f"[bitget] endpoint {u} returned 404, trying next candidate")
+                    continue
+                return resp.status_code, resp.text
+            except Exception as e:
+                last_exc = e
+                try:
+                    print(f"[bitget][exception] request to {u} failed: {e}")
+                except Exception:
+                    pass
+                # try next candidate
+
+    # If we exhausted candidates, return last exception or a 502
+    if last_exc:
+        return 502, json.dumps({"error": str(last_exc)})
+    return 502, json.dumps({"error": "all candidate endpoints returned 404"})
 
 
 async def fetch_market_price(symbol: str):
@@ -852,6 +871,59 @@ async def debug_bitget_positions(req: Request):
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = resp.text
+            return {"ok": True, "status_code": resp.status_code, "response": parsed}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get('/debug/check-creds')
+async def debug_check_creds():
+    """Lightweight credentials check: perform a signed GET against a non-destructive
+    account listing endpoint so we can see whether Bitget accepts the provided
+    API key / secret / passphrase. This does NOT place trades.
+    """
+    # If dry-run is enabled, explicitly state that we won't call Bitget
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        return {"ok": False, "dry_run": True, "note": "BITGET_DRY_RUN is enabled — not calling Bitget"}
+
+    # Ensure credentials present
+    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE):
+        return {"ok": False, "error": "Missing Bitget credentials (API key/secret/passphrase)"}
+
+    # Use account listing endpoint for the mix product as a safe read-only check.
+    # Build request path including query string as required by Bitget's signature scheme.
+    qp = f"productType={BITGET_PRODUCT_TYPE}" if BITGET_PRODUCT_TYPE else ""
+    request_path = "/api/mix/v1/account/accounts"
+    if qp:
+        request_path_q = request_path + "?" + qp
+    else:
+        request_path_q = request_path
+
+    timestamp = str(int(time.time() * 1000))
+    # GET requests use empty body for signing
+    try:
+        sign = build_signature(timestamp, "GET", request_path_q, "", BITGET_SECRET)
+    except Exception as e:
+        return {"ok": False, "error": f"failed to build signature: {e}"}
+
+    headers = {
+        "ACCESS-KEY": BITGET_API_KEY,
+        "ACCESS-SIGN": sign,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+        "Content-Type": "application/json",
+        "paptrading": PAPTRADING,
+        "locale": "en-US",
+    }
+
+    url = BITGET_BASE + request_path_q
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(url, headers=headers)
             try:
                 parsed = resp.json()
             except Exception:
