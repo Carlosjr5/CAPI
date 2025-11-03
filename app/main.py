@@ -190,8 +190,9 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     except Exception:
         mapped_symbol = None
 
-    # Build the order payload using the shared helper. Prefer discovered symbol.
-    use_symbol = mapped_symbol if mapped_symbol else symbol
+    # Normalize symbol for Bitget - remove TradingView suffixes like .P
+    normalized_symbol = symbol.replace('.P', '').replace('.p', '')
+    use_symbol = mapped_symbol if mapped_symbol else normalized_symbol
     body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size)
 
     # Optional: include position mode if set via env. Bitget accounts can be one-way (unilateral)
@@ -337,9 +338,9 @@ async def fetch_market_price(symbol: str):
     """Try to fetch a current market price for the given symbol from a public ticker (Binance).
     Returns a float price or None if it couldn't be fetched.
     """
-    # Normalize symbol (remove slashes, uppercase). Prefer plain symbol like BTCUSDT
+    # Normalize symbol (remove slashes, TradingView suffixes, uppercase). Prefer plain symbol like BTCUSDT
     try:
-        s = symbol.replace('/', '').upper()
+        s = symbol.replace('/', '').replace('.P', '').replace('.p', '').upper()
     except Exception:
         s = symbol
 
@@ -435,10 +436,10 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     # don't append the product type.
     # Normalize incoming symbol from TradingView or other sources.
     # Common forms: 'BTCUSDT', 'BINANCE:BTCUSDT', 'BTCUSDT.P' (perpetual),
-    # or already Bitget style 'BTCUSDT_SUMCBL'. Remove prefixes and
-    # non-alphanumeric/dot/underscore characters, then construct the
+    # or already Bitget style 'BTCUSDT_UMCBL'. Remove prefixes and
+    # non-alphanumeric/underscore characters, then construct the
     # Bitget symbol as RAW + '_' + productType when needed.
-    raw = symbol.replace("BINANCE:", "").replace("/", "")
+    raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
     # remove dots and any characters except letters, digits and underscore
     raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
     # If symbol already appears to include the product suffix, keep as-is
