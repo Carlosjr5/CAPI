@@ -27,7 +27,8 @@ TRADINGVIEW_SECRET = os.getenv("TRADINGVIEW_SECRET")
 BITGET_BASE = "https://api.bitget.com"
 BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "usdt-futures")
 BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN", "USDT")
-BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE", "unilateral")  # optional: e.g. 'single' for unilateral / one-way
+BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE", "single")  # optional: e.g. 'single' for unilateral / one-way
+BITGET_POSITION_TYPE = os.getenv("BITGET_POSITION_TYPE", "unilateral")  # optional: try values like 'unilateral' or 'one-way' if Bitget expects 'positionType'
 
 # DB (sqlite)
 DATABASE_URL = "sqlite:///./trades.db"
@@ -123,6 +124,10 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # will add a "positionMode" key to the order payload.
     if BITGET_POSITION_MODE:
         body_obj["positionMode"] = BITGET_POSITION_MODE
+    # Some Bitget APIs expect a separate 'positionType' or similar field for unilateral/one-way accounts.
+    # Allow this to be added via env so you can try the exact name/value required by your account.
+    if BITGET_POSITION_TYPE:
+        body_obj["positionType"] = BITGET_POSITION_TYPE
 
     body = json.dumps(body_obj, separators=(',', ':'))  # compact body
     timestamp = str(int(time.time() * 1000))
