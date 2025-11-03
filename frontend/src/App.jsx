@@ -53,6 +53,8 @@ export default function App(){
     d.className = 'evt'
     d.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`
     el.prepend(d)
+    // keep the events container scrolled to top so new events don't push the page down
+    try{ el.scrollTop = 0 }catch(e){}
     while(el.children.length>50) el.removeChild(el.lastChild)
   }
 
