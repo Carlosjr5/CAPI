@@ -142,8 +142,8 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     Place an order on Bitget demo futures (v2 mix order)
     We'll place a market order by default. Modify `orderType` to 'limit' if you want limit.
     """
-    # endpoint
-    request_path = "/api/v2/mix/order/place-order"
+    # Use Bitget mix v1 place order endpoint (docs show simulated/demo trading on v1 paths)
+    request_path = "/api/mix/v1/order/placeOrder"
     url = BITGET_BASE + request_path
 
     # Build the order payload using the shared helper
@@ -352,9 +352,19 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     This mirrors the logic used by place_demo_order so it can be tested by
     the debug endpoint without making external calls.
     """
+    # Map simple symbols (e.g., BTCUSDT) to Bitget's expected symbol format for
+    # simulated products. If symbol already contains an underscore (e.g.
+    # BTCUSDT_SUMCBL) assume caller provided the correct Bitget symbol and
+    # don't append the product type.
+    raw = symbol.replace("BINANCE:", "").replace("/", "")
+    if "_" not in raw and BITGET_PRODUCT_TYPE:
+        bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+    else:
+        bitget_symbol = raw
+
     body_obj = {
         "productType": BITGET_PRODUCT_TYPE,
-        "symbol": symbol.replace("BINANCE:", "").replace("/", ""),
+        "symbol": bitget_symbol,
         "orderType": "market",
         "size": str(size) if size is not None else "1",
         "marginCoin": BITGET_MARGIN_COIN,
