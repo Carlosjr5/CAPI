@@ -25,6 +25,9 @@ BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
 PAPTRADING = os.getenv("PAPTRADING", "1")
 TRADINGVIEW_SECRET = os.getenv("TRADINGVIEW_SECRET")
 BITGET_BASE = "https://api.bitget.com"
+BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "usdt-futures")
+BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN", "USDT")
+BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE", "unilateral")  # optional: e.g. 'single' for unilateral / one-way
 
 # DB (sqlite)
 DATABASE_URL = "sqlite:///./trades.db"
@@ -98,8 +101,10 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # Note: adjust productType/orderType/size/price per your needs; size expected as strings
     # Build order payload. Bitget expects a margin coin for some product types; include a sensible default (USDT).
     # Use a common productType for USDT-margined futures. If you use a different market, adjust accordingly.
+    # Build order payload. Make certain fields configurable via env vars so we can try
+    # different product types / modes without code edits.
     body_obj = {
-        "productType": "usdt-futures",
+        "productType": BITGET_PRODUCT_TYPE,
         "symbol": symbol.replace("BINANCE:", "").replace("/", ""),  # ensure symbol format like BTCUSDT
         "side": side.lower(),  # buy or sell
         "orderType": "market",
@@ -107,10 +112,17 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
         # If caller passed `size` (a numeric quantity), use it; otherwise fall back to "1".
         "size": str(size) if size is not None else "1",
         # Explicit margin coin to avoid errors like "Margin Coin cannot be empty"
-        "marginCoin": "USDT",
+        "marginCoin": BITGET_MARGIN_COIN,
         "marginMode": "crossed",
         "clientOid": str(uuid.uuid4())
     }
+
+    # Optional: include position mode if set via env. Bitget accounts can be one-way (unilateral)
+    # or hedged. If your account is in unilateral mode and Bitget expects a matching order field,
+    # set BITGET_POSITION_MODE in Railway (try 'single' or the value shown in Bitget docs) — this
+    # will add a "positionMode" key to the order payload.
+    if BITGET_POSITION_MODE:
+        body_obj["positionMode"] = BITGET_POSITION_MODE
 
     body = json.dumps(body_obj, separators=(',', ':'))  # compact body
     timestamp = str(int(time.time() * 1000))
