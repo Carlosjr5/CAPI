@@ -358,9 +358,44 @@ async def debug_place_test(req: Request):
         if not payload.get("secret") or payload.get("secret") != TRADINGVIEW_SECRET:
             raise HTTPException(status_code=403, detail="Missing or invalid secret")
 
-    # refuse to run if dry-run is enabled
+    # If dry-run is enabled, simulate placing an order by inserting a DB row
     if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
-        raise HTTPException(status_code=400, detail="BITGET_DRY_RUN is enabled — disable it to place a real test order")
+        # Construct the payload for reporting and the simulated response
+        constructed_payload = construct_bitget_payload(symbol=symbol, side=side, size=computed_size)
+        fake_resp = {
+            "code": "00000",
+            "msg": "dry-run: simulated order placed",
+            "data": {"orderId": f"DRY-{str(uuid.uuid4())}"}
+        }
+        # Persist a simulated trade row so the UI can display it
+        trade_id = str(uuid.uuid4())
+        now = time.time()
+        simulated_status = "placed"
+        try:
+            await database.execute(trades.insert().values(
+                id=trade_id,
+                signal=signal,
+                symbol=symbol,
+                price=price or 0.0,
+                status=simulated_status,
+                response=json.dumps(fake_resp),
+                created_at=now
+            ))
+            # Broadcast the simulated placed event to connected frontends
+            await broadcast({"type": "placed", "id": trade_id, "status_code": 200, "response": fake_resp})
+        except Exception as e:
+            # Fall back to returning simulated response even if DB write failed
+            print(f"[debug/place-test] failed to write simulated trade to DB: {e}")
+
+        return {
+            "ok": True,
+            "dry_run": True,
+            "note": "BITGET_DRY_RUN is enabled — simulated order created locally",
+            "orderId": fake_resp["data"]["orderId"],
+            "trade_id": trade_id,
+            "response": fake_resp,
+            "payload": constructed_payload,
+        }
 
     # extract order params (defaults useful small test)
     signal = payload.get("signal") or payload.get("action") or "BUY"
