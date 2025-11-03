@@ -96,15 +96,18 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
 
     # Build order payload (example uses usdt-futures, market order)
     # Note: adjust productType/orderType/size/price per your needs; size expected as strings
+    # Build order payload. Bitget expects a margin coin for some product types; include a sensible default (USDT).
+    # Use a common productType for USDT-margined futures. If you use a different market, adjust accordingly.
     body_obj = {
-        "productType": "umcbl",  # older docs differ; for v2 futures often "usdt-futures" or leave as in docs
-        # safer approach: use "usdt-futures" (common), but if you see v2 examples use /api/v2/mix/order/place-order -> productType "usdt-futures"
+        "productType": "usdt-futures",
         "symbol": symbol.replace("BINANCE:", "").replace("/", ""),  # ensure symbol format like BTCUSDT
         "side": side.lower(),  # buy or sell
         "orderType": "market",
         # size is required; for market orders size should be contract quantity.
         # If caller passed `size` (a numeric quantity), use it; otherwise fall back to "1".
         "size": str(size) if size is not None else "1",
+        # Explicit margin coin to avoid errors like "Margin Coin cannot be empty"
+        "marginCoin": "USDT",
         "marginMode": "crossed",
         "clientOid": str(uuid.uuid4())
     }
@@ -123,8 +126,23 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
         "locale": "en-US",
     }
 
+    # Debugging: log outgoing request (without sensitive secrets) to help diagnose API errors.
+    try:
+        print(f"[bitget] POST {url}")
+        print(f"[bitget] payload: {body}")
+        # Do not print headers that contain secrets; only log the non-secret keys for context
+        safe_headers = {k: v for k, v in headers.items() if k not in ("ACCESS-KEY", "ACCESS-SIGN", "ACCESS-PASSPHRASE")}
+        print(f"[bitget] safe-headers: {safe_headers}")
+    except Exception:
+        pass
+
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(url, headers=headers, content=body)
+        # Log response for easier debugging
+        try:
+            print(f"[bitget] response status={resp.status_code} text={resp.text}")
+        except Exception:
+            pass
         return resp.status_code, resp.text
 
 @app.on_event("startup")
