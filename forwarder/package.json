@@ -1,0 +1,14 @@
+{
+  "name": "tv-webhook-forwarder",
+  "version": "1.0.0",
+  "description": "Simple webhook forwarder that adds Tradingview-Secret header and proxies alerts to a local webhook",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "start:port80": "PORT=80 node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "undici": "^5.14.0"
+  }
+}
