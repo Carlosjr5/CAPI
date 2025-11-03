@@ -274,6 +274,7 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
         BITGET_BASE + "/api/mix/v1/order/placeOrder",
         BITGET_BASE + request_path + f"?productType={BITGET_PRODUCT_TYPE}",
         BITGET_BASE + request_path,
+            BITGET_BASE + "/api/strategy/v1/trading-view/callback",
     ]
 
     last_exc = None
@@ -908,43 +909,58 @@ async def debug_check_creds():
     if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE):
         return {"ok": False, "error": "Missing Bitget credentials (API key/secret/passphrase)"}
 
-    # Use account listing endpoint for the mix product as a safe read-only check.
-    # Build request path including query string as required by Bitget's signature scheme.
-    qp = f"productType={BITGET_PRODUCT_TYPE}" if BITGET_PRODUCT_TYPE else ""
-    request_path = "/api/mix/v1/account/accounts"
-    if qp:
-        request_path_q = request_path + "?" + qp
-    else:
-        request_path_q = request_path
+    # Try multiple authenticated read endpoints and HTTP methods to determine
+    # whether credentials are accepted (some endpoints expect POST with a body,
+    # others accept GET with a query string). We'll report each attempt's
+    # status and response so you can see whether the failure is auth-related
+    # (400) or path-related (404).
+    attempts = []
+    candidates = []
+    # Candidate: POST /api/mix/v1/account/accounts with JSON body {productType}
+    candidates.append(("POST", "/api/mix/v1/account/accounts", json.dumps({"productType": BITGET_PRODUCT_TYPE})))
+    # Candidate: GET /api/mix/v1/account/accounts?productType=...
+    candidates.append(("GET", f"/api/mix/v1/account/accounts?productType={BITGET_PRODUCT_TYPE}", ""))
+    # Candidate: POST /api/v2/mix/account/accounts (v2 variant)
+    candidates.append(("POST", "/api/v2/mix/account/accounts", json.dumps({"productType": BITGET_PRODUCT_TYPE})))
+    # Candidate: GET /api/v2/mix/account/accounts?productType=...
+    candidates.append(("GET", f"/api/v2/mix/account/accounts?productType={BITGET_PRODUCT_TYPE}", ""))
 
-    timestamp = str(int(time.time() * 1000))
-    # GET requests use empty body for signing
-    try:
-        sign = build_signature(timestamp, "GET", request_path_q, "", BITGET_SECRET)
-    except Exception as e:
-        return {"ok": False, "error": f"failed to build signature: {e}"}
-
-    headers = {
-        "ACCESS-KEY": BITGET_API_KEY,
-        "ACCESS-SIGN": sign,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
-        "Content-Type": "application/json",
-        "paptrading": PAPTRADING,
-        "locale": "en-US",
-    }
-
-    url = BITGET_BASE + request_path_q
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(url, headers=headers)
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        for method, path, body in candidates:
             try:
-                parsed = resp.json()
-            except Exception:
-                parsed = resp.text
-            return {"ok": True, "status_code": resp.status_code, "response": parsed}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+                ts = str(int(time.time() * 1000))
+                # For signing include query string in path if present
+                request_path_for_sign = path
+                # Build signature
+                sign = build_signature(ts, method, request_path_for_sign, body if body else "", BITGET_SECRET)
+
+                headers = {
+                    "ACCESS-KEY": BITGET_API_KEY,
+                    "ACCESS-SIGN": sign,
+                    "ACCESS-TIMESTAMP": ts,
+                    "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+                    "Content-Type": "application/json",
+                    "paptrading": PAPTRADING,
+                    "locale": "en-US",
+                }
+
+                url = BITGET_BASE + path
+                # perform request according to method
+                if method == "GET":
+                    resp = await client.get(url, headers=headers)
+                else:
+                    resp = await client.post(url, headers=headers, content=body)
+
+                try:
+                    parsed = resp.json()
+                except Exception:
+                    parsed = resp.text
+
+                attempts.append({"method": method, "url": url, "status_code": resp.status_code, "response": parsed})
+            except Exception as e:
+                attempts.append({"method": method, "url": BITGET_BASE + path, "error": str(e)})
+
+    return {"ok": True, "attempts": attempts}
 
 @app.on_event("startup")
 async def startup():
