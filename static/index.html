@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CJR Trading — Dashboard</title>
+  <!-- Google Font + Feather Icons + Chart.js -->
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/feather-icons"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root{
+      --bg:#f6f8fb; --card:#ffffff; --muted:#6b7280; --accent:#2563eb; --success:#10b981; --danger:#ef4444;
+      --glass: rgba(255,255,255,0.7);
+    }
+    *{box-sizing:border-box}
+    body{font-family:Inter,system-ui,Segoe UI,Roboto, Arial; margin:0; background:linear-gradient(180deg,#f8fafc, #f1f5f9); color:#07122b}
+    .container{max-width:1100px;margin:28px auto;padding:20px}
+    header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+    .brand{display:flex;gap:12px;align-items:center}
+    .logo{width:48px;height:48px;border-radius:10px;background:linear-gradient(135deg,var(--accent),#7c3aed);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700}
+    h1{margin:0;font-size:18px}
+    .sub{color:var(--muted);font-size:13px}
+
+    .grid{display:grid;grid-template-columns:1fr 380px;gap:18px}
+    .card{background:var(--card);border-radius:12px;padding:16px;box-shadow:0 6px 18px rgba(17,24,39,0.06)}
+
+    /* summary */
+    .summary{display:flex;gap:12px}
+    .kpi{flex:1;padding:14px;border-radius:10px;background:linear-gradient(180deg, rgba(255,255,255,0.9), var(--glass));display:flex;flex-direction:column}
+    .kpi .label{color:var(--muted);font-size:13px}
+    .kpi .value{font-size:20px;font-weight:700;margin-top:6px}
+
+    /* controls */
+    .controls{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+    .search{flex:1}
+    input[type=text]{width:100%;Padding:10px;border-radius:8px;border:1px solid #e6edf3}
+    .btn{background:var(--accent);color:#fff;padding:8px 12px;border-radius:8px;border:none;cursor:pointer}
+    .btn.ghost{background:transparent;color:var(--accent);border:1px solid #e2e8f0}
+
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    th,td{padding:10px;border-bottom:1px solid #f1f5f9;text-align:left;font-size:13px}
+    th{color:var(--muted);font-weight:600}
+    tr:hover td{background:linear-gradient(90deg, rgba(37,99,235,0.03), transparent)}
+
+    .badge{display:inline-block;padding:6px 8px;border-radius:999px;font-weight:600;font-size:12px}
+    .badge.open{background:rgba(16,185,129,0.12);color:var(--success)}
+    .badge.closed{background:rgba(239,68,68,0.08);color:var(--danger)}
+    .muted{color:var(--muted)}
+
+    /* right column */
+    .chart-wrap{display:flex;flex-direction:column;gap:12px}
+    canvas{background:transparent}
+
+    /* modal */
+    .modal{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(2,6,23,0.4);z-index:60}
+    .modal .panel{width:720px;background:var(--card);border-radius:10px;padding:18px}
+    .close{float:right;border:none;background:transparent;cursor:pointer}
+
+    footer{margin-top:18px;color:var(--muted);font-size:13px}
+
+    @media (max-width:900px){.grid{grid-template-columns:1fr;}.chart-wrap{order:-1}}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <div class="logo">CJ</div>
+        <div>
+          <h1>CJR Trading — Dashboard</h1>
+          <div class="sub">Live view of received & placed orders</div>
+        </div>
+      </div>
+      <div class="sub" id="status">Connecting...</div>
+    </header>
+
+    <div class="grid">
+      <div>
+        <div class="card">
+          <div class="summary">
+            <div class="kpi">
+              <div class="label">Open positions</div>
+              <div class="value" id="openCount">—</div>
+            </div>
+            <div class="kpi">
+              <div class="label">Closed positions</div>
+              <div class="value" id="closedCount">—</div>
+            </div>
+            <div class="kpi">
+              <div class="label">Total</div>
+              <div class="value" id="totalCount">—</div>
+            </div>
+          </div>
+
+          <div class="controls" style="margin-top:14px">
+            <div class="search"><input id="q" type="text" placeholder="Search symbol, signal, id..." /></div>
+            <button class="btn ghost" id="refresh">Refresh</button>
+            <button class="btn" id="export">Export</button>
+          </div>
+
+          <div id="tableWrap">
+            <table>
+              <thead>
+                <tr><th>When</th><th>Symbol</th><th>Signal</th><th>Price</th><th>Status</th><th></th></tr>
+              </thead>
+              <tbody id="rows"></tbody>
+            </table>
+          </div>
+        </div>
+        <footer>Data shown from backend endpoint <code>/trades</code>. Live updates via <code>/ws</code>.</footer>
+      </div>
+
+      <div>
+        <div class="card chart-wrap">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div style="font-weight:700">Status Distribution</div>
+            <div class="muted">Live</div>
+          </div>
+          <canvas id="pie" height="260"></canvas>
+          <div style="font-size:13px;color:var(--muted)">Click a row to view details.</div>
+        </div>
+        <div style="height:18px"></div>
+        <div class="card">
+          <div style="font-weight:700;margin-bottom:8px">Recent events</div>
+          <div id="events" style="max-height:180px;overflow:auto"></div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- modal placeholder -->
+  <div id="modal" style="display:none"></div>
+
+  <script>
+    // Utilities
+    const el = id => document.getElementById(id);
+    const fmtTime = t => new Date(t*1000).toLocaleString();
+
+    // Mapping statuses into open/closed/other
+    function mapStatus(s){
+      if(!s) return 'other'
+      const v = s.toLowerCase();
+      if(v.includes('placed') || v.includes('received')) return 'open';
+      if(v.includes('filled') || v.includes('closed') || v.includes('rejected') || v.includes('error') || v.includes('ignored')) return 'closed';
+      return 'other';
+    }
+
+    // State
+    let items = [];
+
+    async function fetchTrades(){
+      try{
+        const resp = await fetch('/trades');
+        if(!resp.ok) throw new Error('Failed to load');
+        const data = await resp.json();
+        items = data.map(i => ({...i}));
+        render();
+      }catch(e){
+        console.error(e);
+      }
+    }
+
+    function render(){
+      const q = el('q').value.trim().toLowerCase();
+      const rows = el('rows'); rows.innerHTML = '';
+
+      const filtered = items.filter(it => {
+        if(!q) return true;
+        return (it.symbol||'').toLowerCase().includes(q) || (it.signal||'').toLowerCase().includes(q) || (it.id||'').toLowerCase().includes(q);
+      });
+
+      let open=0,closed=0,other=0;
+      filtered.forEach(it=>{
+        const m = mapStatus(it.status);
+        if(m==='open') open++;
+        else if(m==='closed') closed++;
+        else other++;
+
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="muted">${fmtTime(it.created_at)}</td>
+          <td><strong>${it.symbol||'-'}</strong><div class="muted" style="font-size:12px">${it.id ? it.id.slice(0,10):''}</div></td>
+          <td>${it.signal||''}</td>
+          <td>${it.price!=null? Number(it.price).toFixed(2):'-'}</td>
+          <td>${mapStatus(it.status)==='open'?'<span class="badge open">Open</span>': '<span class="badge closed">Closed</span>'}</td>
+          <td><button class="btn ghost" data-id="${it.id}">Details</button></td>
+        `;
+        rows.appendChild(tr);
+      });
+
+      el('openCount').innerText = open;
+      el('closedCount').innerText = closed;
+      el('totalCount').innerText = filtered.length;
+
+      // update chart
+      updateChart([open, closed, other]);
+    }
+
+    // events list
+    function pushEvent(html){
+      const wrap = el('events');
+      const d = document.createElement('div');
+      d.style.padding = '8px'; d.style.borderBottom = '1px solid #f1f5f9'; d.innerHTML = html;
+      wrap.prepend(d);
+      // keep max
+      while(wrap.children.length>50) wrap.removeChild(wrap.lastChild);
+    }
+
+    // details modal
+    function showDetails(id){
+      const it = items.find(x=>x.id===id);
+      if(!it) return;
+      const modal = el('modal'); modal.innerHTML = '';
+      modal.style.display = 'flex'; modal.className='modal';
+      const panel = document.createElement('div'); panel.className='panel';
+      panel.innerHTML = `
+        <button class="close" id="closeModal">${feather.icons['x'].toSvg()}</button>
+        <h3 style="margin-top:4px">Trade details</h3>
+        <div style="margin-top:8px"><strong>Id:</strong> ${it.id}</div>
+        <div><strong>Symbol:</strong> ${it.symbol}</div>
+        <div><strong>Signal:</strong> ${it.signal}</div>
+        <div><strong>Price:</strong> ${it.price}</div>
+        <div><strong>Status:</strong> ${it.status}</div>
+        <div style="margin-top:8px"><strong>Response:</strong><pre style="white-space:pre-wrap;background:#f8fafc;padding:8px;border-radius:6px">${it.response || ''}</pre></div>
+      `;
+      modal.appendChild(panel);
+      modal.querySelector('#closeModal').onclick = ()=>{ modal.style.display='none'; modal.innerHTML=''; };
+    }
+
+    // export CSV
+    function exportCSV(){
+      const cols = ['id','created_at','symbol','signal','price','status'];
+      const rows = [cols.join(',')].concat(items.map(it=>cols.map(c=>`"${(it[c]||'').toString().replace(/"/g,'""')}"`).join(',')));
+      const blob = new Blob([rows.join('\n')], {type:'text/csv'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href=url; a.download='trades.csv'; a.click(); URL.revokeObjectURL(url);
+    }
+
+    // Chart
+    let pieChart=null;
+    function initChart(){
+      const ctx = document.getElementById('pie').getContext('2d');
+      pieChart = new Chart(ctx, {
+        type:'doughnut',
+        data:{labels:['Open','Closed','Other'],datasets:[{data:[0,0,0],backgroundColor:['#10b981','#ef4444','#94a3b8'],borderWidth:0}]},
+        options:{plugins:{legend:{position:'bottom'}},maintainAspectRatio:false}
+      });
+    }
+    function updateChart(values){ if(!pieChart) return; pieChart.data.datasets[0].data = values; pieChart.update(); }
+
+    // initial wiring
+    document.addEventListener('DOMContentLoaded', ()=>{
+      initChart(); fetchTrades();
+      el('refresh').onclick = fetchTrades;
+      el('export').onclick = exportCSV;
+      el('q').addEventListener('input', render);
+
+      // click details
+      el('rows').addEventListener('click', e=>{
+        const btn = e.target.closest('button'); if(!btn) return; const id = btn.dataset.id; showDetails(id);
+      });
+
+      // WebSocket for live events
+      const wsProto = (location.protocol === 'https:') ? 'wss' : 'ws';
+      const wsUrl = wsProto + '://' + location.host + '/ws';
+      const ws = new WebSocket(wsUrl);
+      const st = el('status');
+      ws.onopen = () => { st.innerText = 'Connected'; pushEvent('<div style="color:var(--success)">WebSocket connected</div>'); };
+      ws.onclose = () => { st.innerText = 'Disconnected'; pushEvent('<div style="color:var(--muted)">WebSocket disconnected</div>'); };
+      ws.onmessage = (m)=>{
+        try{
+          const d = JSON.parse(m.data);
+          // push event message
+          pushEvent(`<div><strong>${d.type}</strong> <span class="muted">${d.id||''}</span></div><div class="muted" style="font-size:12px">${JSON.stringify(d)}</div>`);
+          // If the server broadcasted created/placed/error, refresh list (small optimization could merge)
+          if(['received','placed','error','ignored'].includes(d.type)){
+            // lightweight: just re-fetch to keep consistent
+            fetchTrades();
+          }
+        }catch(e){console.error(e)}
+      };
+
+      // feather icons
+      feather.replace();
+    });
+  </script>
+</body>
+</html>
