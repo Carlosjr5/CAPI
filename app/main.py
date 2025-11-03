@@ -232,14 +232,28 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
 
     # (live request path continues below)
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(url, headers=headers, content=body)
-        # Log response for easier debugging
+    # Ensure required credentials are present before making the live request
+    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE):
+        err = "Missing Bitget credentials (API key/secret/passphrase) required to send live orders"
+        print(f"[bitget][error] {err}")
+        return 400, json.dumps({"error": err})
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, headers=headers, content=body)
+            # Log response for easier debugging
+            try:
+                print(f"[bitget] response status={resp.status_code} text={resp.text}")
+            except Exception:
+                pass
+            return resp.status_code, resp.text
+    except Exception as e:
+        # Network / DNS / TLS / other transport error
         try:
-            print(f"[bitget] response status={resp.status_code} text={resp.text}")
+            print(f"[bitget][exception] request to {url} failed: {e}")
         except Exception:
             pass
-        return resp.status_code, resp.text
+        return 502, json.dumps({"error": str(e)})
 
 
 async def fetch_market_price(symbol: str):
