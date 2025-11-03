@@ -164,8 +164,11 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
                         raw = symbol.replace("BINANCE:", "").replace("/", "")
                         raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
                         raw_up = raw.upper()
+                        # For SUMCBL, add 'S' prefix before matching
+                        if BITGET_PRODUCT_TYPE == "SUMCBL":
+                            raw_up = "S" + raw_up
                         # base coin (e.g. BTC from BTCUSDT)
-                        base = raw_up.replace("USDT", "").replace("_", "")
+                        base = raw_up.replace("USDT", "").replace("_", "").replace("S", "")
                         for item in data:
                             if not isinstance(item, dict):
                                 continue
@@ -452,6 +455,14 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
             bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
         else:
             bitget_symbol = raw
+
+    # For SUMCBL (simulated contracts), Bitget expects symbols with 'S' prefix (e.g., SBTCSUSDT_SUMCBL)
+    if BITGET_PRODUCT_TYPE == "SUMCBL" and not bitget_symbol.startswith("S"):
+        # Extract base currency from symbol (e.g., BTC from BTCUSDT_SUMCBL)
+        base_match = re.match(r'([A-Z]+)USDT', bitget_symbol)
+        if base_match:
+            base = base_match.group(1)
+            bitget_symbol = f"S{base}USDT_SUMCBL"
 
     body_obj = {
         "productType": BITGET_PRODUCT_TYPE,
