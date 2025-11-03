@@ -205,8 +205,8 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
             body_obj["positionMode"] = BITGET_POSITION_MODE
 
     # Map the incoming generic side (buy/sell) to the Bitget API's expected
-    # values for the account's hold/position mode. For single/unilateral (one-way)
-    # accounts Bitget expects 'buy_single' / 'sell_single' (or similar). For other
+    # values for the account's hold/position mode. For unilateral (one-way)
+    # accounts Bitget expects 'buy' / 'sell' with positionSide 'long'/'short'. For other
     # account modes we keep the original simple mapping (buy/sell) to avoid
     # accidental mismatches.
     side_key = side.lower()
@@ -214,9 +214,8 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     pt = str(BITGET_POSITION_TYPE or "").lower()
     single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way", "oneway")
     if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way", "oneway")):
-        # Use the single-hold side enum
-        mapped = "buy_single" if side_key == "buy" else "sell_single"
-        body_obj["side"] = mapped
+        # Use simple buy/sell for unilateral mode
+        body_obj["side"] = side_key
     else:
         # default to the simple buy/sell mapping (keeps prior behaviour)
         body_obj["side"] = side_key
@@ -468,8 +467,8 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     pt = str(BITGET_POSITION_TYPE or "").lower()
     single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way", "oneway")
     if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way", "oneway")):
-        mapped = "buy_single" if side_key == "buy" else "sell_single"
-        body_obj["side"] = mapped
+        # Use simple buy/sell for unilateral mode
+        body_obj["side"] = side_key
     else:
         body_obj["side"] = side_key
 
