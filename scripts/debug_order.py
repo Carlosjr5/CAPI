@@ -6,13 +6,25 @@ import base64
 import json
 import httpx
 import asyncio
+from dotenv import load_dotenv
 
-# Load env vars
-BITGET_API_KEY = "bg_3990ce684aa84b5d0ba8de94f5ce18e0"
-BITGET_SECRET = "822382b6ec0b8fb9a5f2e49ca963dc8e64fc484aaba164fe47f2296e61e33b92"
-BITGET_PASSPHRASE = "2323232323"
-BITGET_BASE = "https://api.bitget.com"
-BITGET_PRODUCT_TYPE = "UMCBL"
+# Load environment from .env (project root) and OS environment
+load_dotenv()
+
+# Read Bitget credentials and settings from environment variables so this
+# script behaves the same way as the main app. Values default to empty string
+# (credentials) or reasonable defaults for base/product type.
+BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
+BITGET_SECRET = os.getenv("BITGET_SECRET", "")
+BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
+BITGET_BASE = os.getenv("BITGET_BASE", "https://api.bitget.com")
+BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "UMCBL")
+
+# Optional: paptrading flag used by the main app
+PAPTRADING = os.getenv("PAPTRADING", "1")
+
+# Friendly startup info (do not print secrets)
+print(f"[debug_order] BITGET_BASE={BITGET_BASE} BITGET_PRODUCT_TYPE={BITGET_PRODUCT_TYPE} has_api_key={bool(BITGET_API_KEY)}")
 
 def build_signature(timestamp: str, method: str, request_path: str, body: str, secret: str):
     payload = f"{timestamp}{method.upper()}{request_path}{body}"
