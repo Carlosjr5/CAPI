@@ -286,6 +286,71 @@ async def debug_payload(req: Request):
     constructed = construct_bitget_payload(symbol=symbol, side=side, size=computed_size if computed_size is not None else size)
     return {"payload": constructed}
 
+
+@app.post("/debug/place-test")
+async def debug_place_test(req: Request):
+    """Protected endpoint to place a small test/demo order using configured Bitget credentials.
+    Requires TRADINGVIEW_SECRET to be provided either in the Tradingview-Secret header or as `secret` in the JSON body.
+    For safety, this endpoint will refuse to place orders if BITGET_DRY_RUN is enabled. It returns the Bitget response.
+    """
+    # verify secret
+    header_secret = req.headers.get("tradingview-secret") or req.headers.get("tradingview_secret")
+    body_text = await req.body()
+    try:
+        payload = json.loads(body_text.decode()) if body_text else {}
+    except Exception:
+        raise HTTPException(status_code=400, detail="Payload must be JSON")
+
+    # header secret preferred
+    if header_secret:
+        if header_secret != TRADINGVIEW_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid tradingview secret header")
+    else:
+        if not payload.get("secret") or payload.get("secret") != TRADINGVIEW_SECRET:
+            raise HTTPException(status_code=403, detail="Missing or invalid secret")
+
+    # refuse to run if dry-run is enabled
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        raise HTTPException(status_code=400, detail="BITGET_DRY_RUN is enabled — disable it to place a real test order")
+
+    # extract order params (defaults useful small test)
+    signal = payload.get("signal") or payload.get("action") or "BUY"
+    symbol = payload.get("symbol") or payload.get("ticker") or "BTCUSDT"
+    price = payload.get("price") or None
+    size = payload.get("size")
+    size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
+
+    # determine side
+    if signal and str(signal).upper() in ("BUY", "LONG"):
+        side = "buy"
+    elif signal and str(signal).upper() in ("SELL", "SHORT"):
+        side = "sell"
+    else:
+        raise HTTPException(status_code=400, detail="Unknown signal; must be BUY or SELL")
+
+    # compute size from size_usd if provided
+    computed_size = None
+    if size is not None:
+        try:
+            computed_size = float(size)
+        except Exception:
+            computed_size = None
+    elif size_usd is not None:
+        try:
+            usd = float(size_usd)
+            p = float(price) if price else 1.0
+            if p and p != 0:
+                computed_size = usd / p
+        except Exception:
+            computed_size = None
+
+    # Place the order using the existing helper
+    try:
+        status_code, resp_text = await place_demo_order(symbol=symbol, side=side, price=price, size=computed_size)
+        return {"ok": True, "status_code": status_code, "response": resp_text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.on_event("startup")
 async def startup():
     await database.connect()
