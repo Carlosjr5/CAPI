@@ -8,6 +8,14 @@ export default function App(){
   const [trades, setTrades] = useState([])
   const [status, setStatus] = useState('Disconnected')
   const eventsRef = useRef(null)
+  // manual place-test form state
+  const [formSecret, setFormSecret] = useState('')
+  const [formSymbol, setFormSymbol] = useState('BTCUSDT')
+  const [formSide, setFormSide] = useState('BUY')
+  const [formSizeUsd, setFormSizeUsd] = useState('10')
+  const [placing, setPlacing] = useState(false)
+  const [lastOrderResult, setLastOrderResult] = useState(null)
+  const [lastOrderQuery, setLastOrderQuery] = useState(null)
 
   useEffect(()=>{ fetchTrades(); connectWS(); }, [])
 
@@ -44,6 +52,11 @@ export default function App(){
         if(['received','placed','error','ignored'].includes(d.type)) fetchTrades()
       }catch(e){ console.error(e) }
     }
+  }
+
+  function getApiBase(){
+    const usingDevFrontend = location.hostname === 'localhost' && (location.port === '5173' || location.port === '3000')
+    return usingDevFrontend ? 'http://127.0.0.1:8000' : ''
   }
 
   function pushEvent(msg){
@@ -87,11 +100,80 @@ export default function App(){
             <h3>Status distribution</h3>
             <Doughnut data={pieData} />
           </div>
-
+          
           <div className="card events">
             <h3>Events</h3>
             <div ref={eventsRef} className="eventsList"></div>
           </div>
+
+          <div className="card">
+            <h3>Manual demo order</h3>
+            <div style={{display:'flex',flexDirection:'column',gap:8}}>
+              <input placeholder="TradingView secret" type="password" value={formSecret} onChange={e=>setFormSecret(e.target.value)} />
+              <input placeholder="Symbol (e.g. BTCUSDT)" value={formSymbol} onChange={e=>setFormSymbol(e.target.value)} />
+              <select value={formSide} onChange={e=>setFormSide(e.target.value)}>
+                <option>BUY</option>
+                <option>SELL</option>
+              </select>
+              <input placeholder="Size (USD) e.g. 10" value={formSizeUsd} onChange={e=>setFormSizeUsd(e.target.value)} />
+              <div style={{display:'flex',gap:8}}>
+                <button disabled={placing} onClick={async ()=>{
+                  setPlacing(true)
+                  try{
+                    const apiBase = getApiBase()
+                    const body = { secret: formSecret, signal: formSide, symbol: formSymbol, size_usd: formSizeUsd }
+                    const headers = { 'Content-Type': 'application/json' }
+                    // Prefer header-based secret if provided (backend checks header first)
+                    if(formSecret) headers['Tradingview-Secret'] = formSecret
+                    const res = await fetch(apiBase + '/debug/place-test', { method: 'POST', headers, body: JSON.stringify(body) })
+                    let parsed = null
+                    try{ parsed = await res.json() }catch(e){ parsed = await res.text() }
+                    try{ pushEvent(`[place-test] status=${res.status} resp=${JSON.stringify(parsed)}`) }catch(e){ console.log(e) }
+                    setLastOrderResult({ status: res.status, body: parsed })
+                    if(res.ok){ fetchTrades() }
+                  }catch(e){ pushEvent(`[place-test] error ${e.message || e}`) }
+                  setPlacing(false)
+                }}>{placing ? 'Placing...' : 'Place demo order'}</button>
+                <button onClick={()=>{ setFormSecret(''); setFormSizeUsd('10'); setFormSymbol('BTCUSDT'); setFormSide('BUY') }}>Reset</button>
+              </div>
+            </div>
+          </div>
+          {lastOrderResult && (
+            <div className="card">
+              <h3>Last order result</h3>
+              <div className="muted">status: {lastOrderResult.status}</div>
+              <pre style={{maxHeight:140,overflow:'auto',whiteSpace:'pre-wrap'}}>{JSON.stringify(lastOrderResult.body,null,2)}</pre>
+              {lastOrderResult.body && lastOrderResult.body.orderId && (
+                <div style={{display:'flex',gap:8,marginTop:8}}>
+                  <div>OrderId: <strong>{lastOrderResult.body.orderId}</strong></div>
+                  <button onClick={()=>{ navigator.clipboard && navigator.clipboard.writeText(lastOrderResult.body.orderId) }}>Copy</button>
+                  <button onClick={async ()=>{
+                    // Query the backend for Bitget order details
+                    try{
+                      setLastOrderQuery({loading:true})
+                      const apiBase = getApiBase()
+                      const body = { secret: formSecret, orderId: lastOrderResult.body.orderId }
+                      const headers = { 'Content-Type': 'application/json' }
+                      if(formSecret) headers['Tradingview-Secret'] = formSecret
+                      const res = await fetch(apiBase + '/debug/order-status', { method: 'POST', headers, body: JSON.stringify(body) })
+                      let parsed = null
+                      try{ parsed = await res.json() }catch(e){ parsed = await res.text() }
+                      setLastOrderQuery({ loading:false, status: res.status, body: parsed })
+                    }catch(e){ setLastOrderQuery({ loading:false, error: String(e) }) }
+                  }}>Query Bitget</button>
+                </div>
+              )}
+              {lastOrderQuery && (
+                <div style={{marginTop:8}}>
+                  {lastOrderQuery.loading ? <div className="muted">Querying...</div> : (
+                    lastOrderQuery.error ? <div className="muted">Error: {lastOrderQuery.error}</div> : (
+                      <pre style={{maxHeight:160,overflow:'auto',whiteSpace:'pre-wrap'}}>{JSON.stringify(lastOrderQuery.body,null,2)}</pre>
+                    )
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </aside>
       </main>
     </div>

@@ -346,10 +346,107 @@ async def debug_place_test(req: Request):
 
     # Place the order using the existing helper
     try:
+        # Construct the payload for reporting back to the caller (helps debugging)
+        constructed_payload = construct_bitget_payload(symbol=symbol, side=side, size=computed_size)
+
         status_code, resp_text = await place_demo_order(symbol=symbol, side=side, price=price, size=computed_size)
-        return {"ok": True, "status_code": status_code, "response": resp_text}
+
+        # Normalize the Bitget response so the frontend can easily show whether
+        # a real order was sent and what the order id is.
+        parsed = None
+        order_id = None
+        sent_to_bitget = True
+        try:
+            parsed = json.loads(resp_text) if isinstance(resp_text, str) and resp_text else resp_text
+        except Exception:
+            parsed = resp_text
+
+        # Try to extract common order id locations
+        try:
+            if isinstance(parsed, dict):
+                # Bitget sometimes wraps data under 'data' or returns top-level 'orderId'
+                if parsed.get('orderId'):
+                    order_id = parsed.get('orderId')
+                elif parsed.get('data') and isinstance(parsed.get('data'), dict) and parsed.get('data').get('orderId'):
+                    order_id = parsed.get('data').get('orderId')
+                elif parsed.get('data') and isinstance(parsed.get('data'), dict) and parsed.get('data').get('order_id'):
+                    order_id = parsed.get('data').get('order_id')
+        except Exception:
+            pass
+
+        result = {
+            "ok": True,
+            "dry_run": False,
+            "sent_to_bitget": sent_to_bitget,
+            "status_code": status_code,
+            "orderId": order_id,
+            "response": parsed,
+            "payload": constructed_payload,
+        }
+
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/debug/order-status")
+async def debug_order_status(req: Request):
+    """Query Bitget for an order's details by orderId.
+    Accepts JSON { secret, orderId, symbol? } and returns Bitget's response.
+    The endpoint prefers the Tradingview-Secret header if provided.
+    """
+    header_secret = req.headers.get("tradingview-secret") or req.headers.get("tradingview_secret")
+    body_text = await req.body()
+    try:
+        payload = json.loads(body_text.decode()) if body_text else {}
+    except Exception:
+        raise HTTPException(status_code=400, detail="Payload must be JSON")
+
+    # auth
+    if header_secret:
+        if header_secret != TRADINGVIEW_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid tradingview secret header")
+    else:
+        if not payload.get("secret") or payload.get("secret") != TRADINGVIEW_SECRET:
+            raise HTTPException(status_code=403, detail="Missing or invalid secret")
+
+    order_id = payload.get("orderId") or payload.get("order_id") or payload.get("orderid")
+    if not order_id:
+        raise HTTPException(status_code=400, detail="Missing required field: 'orderId'")
+
+    symbol = payload.get("symbol")
+
+    # Build query payload (POST) — Bitget's exact order detail path may vary by API version.
+    request_path = "/api/v2/mix/order/get-order"
+    body_obj = {"orderId": order_id}
+    if symbol:
+        body_obj["symbol"] = symbol
+
+    body = json.dumps(body_obj, separators=(",", ":"))
+    timestamp = str(int(time.time() * 1000))
+    sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
+
+    headers = {
+        "ACCESS-KEY": BITGET_API_KEY,
+        "ACCESS-SIGN": sign,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+        "Content-Type": "application/json",
+        "paptrading": PAPTRADING,
+        "locale": "en-US",
+    }
+
+    # If dry-run is enabled, don't query live Bitget — return payload so user can run manually later.
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        return {"ok": False, "dry_run": True, "note": "BITGET_DRY_RUN is enabled — not querying live Bitget", "payload": body_obj}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+        try:
+            parsed = resp.json()
+        except Exception:
+            parsed = resp.text
+        return {"ok": True, "status_code": resp.status_code, "response": parsed}
 
 @app.on_event("startup")
 async def startup():
