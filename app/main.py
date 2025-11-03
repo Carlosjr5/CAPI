@@ -252,28 +252,10 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
         }
         return 200, json.dumps(fake_resp)
 
-    timestamp = str(int(time.time() * 1000))
-    sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
-
-    headers = {
-        "ACCESS-KEY": BITGET_API_KEY,
-        "ACCESS-SIGN": sign,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
-        "Content-Type": "application/json",
-        "paptrading": PAPTRADING,
-        "locale": "en-US",
-    }
-
-    # Debugging: log outgoing request (without sensitive secrets) to help diagnose API errors.
-    try:
-        print(f"[bitget] POST {url}")
-        print(f"[bitget] payload: {body}")
-        # Do not print headers that contain secrets; only log the non-secret keys for context
-        safe_headers = {k: v for k, v in headers.items() if k not in ("ACCESS-KEY", "ACCESS-SIGN", "ACCESS-PASSPHRASE")}
-        print(f"[bitget] safe-headers: {safe_headers}")
-    except Exception:
-        pass
+    # We'll compute the signature and headers for each candidate endpoint below so
+    # the requestPath (including query string) used to build the sign matches
+    # the actual URL we POST to. Some Bitget endpoints expect the query string
+    # to be part of the signed requestPath.
 
     # (live request path continues below)
 
@@ -295,12 +277,41 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     async with httpx.AsyncClient(timeout=10.0) as client:
         for u in candidates:
             try:
-                print(f"[bitget] trying POST {u}")
+                # Recompute the request path (path + optional query) for signing
+                parsed = urlparse(u)
+                request_path_for_sign = parsed.path
+                if parsed.query:
+                    request_path_for_sign = request_path_for_sign + "?" + parsed.query
+
+                # Build fresh timestamp and signature for this specific requestPath
+                ts = str(int(time.time() * 1000))
+                sign = build_signature(ts, "POST", request_path_for_sign, body, BITGET_SECRET)
+
+                headers = {
+                    "ACCESS-KEY": BITGET_API_KEY,
+                    "ACCESS-SIGN": sign,
+                    "ACCESS-TIMESTAMP": ts,
+                    "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+                    "Content-Type": "application/json",
+                    "paptrading": PAPTRADING,
+                    "locale": "en-US",
+                }
+
+                # Log the attempt (don't include secret-bearing headers in logs)
+                try:
+                    print(f"[bitget] trying POST {u}")
+                    print(f"[bitget] payload: {body}")
+                    safe_headers = {k: v for k, v in headers.items() if k not in ("ACCESS-KEY", "ACCESS-SIGN", "ACCESS-PASSPHRASE")}
+                    print(f"[bitget] safe-headers: {safe_headers} request_path_for_sign={request_path_for_sign}")
+                except Exception:
+                    pass
+
                 resp = await client.post(u, headers=headers, content=body)
                 try:
                     print(f"[bitget] response status={resp.status_code} text={resp.text}")
                 except Exception:
                     pass
+
                 # If endpoint not found, try next candidate
                 if resp.status_code == 404:
                     print(f"[bitget] endpoint {u} returned 404, trying next candidate")
