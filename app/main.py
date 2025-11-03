@@ -246,23 +246,91 @@ async def fetch_market_price(symbol: str):
     """Try to fetch a current market price for the given symbol from a public ticker (Binance).
     Returns a float price or None if it couldn't be fetched.
     """
-    # Normalize symbol for Binance (e.g., BTCUSDT)
+    # Normalize symbol (remove slashes, uppercase). Prefer plain symbol like BTCUSDT
     try:
         s = symbol.replace('/', '').upper()
     except Exception:
         s = symbol
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={s}"
+
+    # Prefer Binance public ticker (reliable public endpoint) then try Bitget
+    candidates = []
+    candidates.append(f"https://api.binance.com/api/v3/ticker/price?symbol={s}")
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(url)
-            if r.status_code == 200:
-                j = r.json()
-                p = j.get('price')
-                if p:
-                    return float(p)
+        # e.g. https://api.bitget.com/api/mix/v1/market/ticker?symbol=BTCUSDT
+        candidates.append(f"{BITGET_BASE}/api/mix/v1/market/ticker?symbol={s}")
+        candidates.append(f"{BITGET_BASE}/api/spot/v1/market/ticker?symbol={s}")
     except Exception:
         pass
+
+    for url in candidates:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(url)
+                if r.status_code != 200:
+                    continue
+                try:
+                    j = r.json()
+                except Exception:
+                    # Not JSON, skip
+                    continue
+
+                # Try to extract common fields from Bitget mix/spot or Binance responses
+                # Bitget mix may return {"code":0,"data":{"last":...}} or {"data":[{"last":...}]}
+                # Binance returns {"symbol":"BTCUSDT","price":"12345.67"}
+                p = None
+                # Binance style
+                if isinstance(j, dict) and j.get('price'):
+                    p = j.get('price')
+                # Bitget style: data may be dict or list
+                elif isinstance(j, dict) and j.get('data'):
+                    data = j.get('data')
+                    if isinstance(data, dict):
+                        # e.g., {'last': '12345.6'}
+                        if data.get('last'):
+                            p = data.get('last')
+                        elif data.get('price'):
+                            p = data.get('price')
+                    elif isinstance(data, list) and len(data) > 0:
+                        first = data[0]
+                        if isinstance(first, dict):
+                            if first.get('last'):
+                                p = first.get('last')
+                            elif first.get('price'):
+                                p = first.get('price')
+                # Some APIs nest a 'ticker' or 'tick' object
+                elif isinstance(j, dict) and j.get('ticker'):
+                    t = j.get('ticker')
+                    if isinstance(t, dict):
+                        p = t.get('last') or t.get('price')
+
+                if p:
+                    try:
+                        return float(p)
+                    except Exception:
+                        continue
+        except Exception:
+            # network/DNS error for this candidate — try next
+            continue
+
     return None
+
+
+async def get_market_price_with_retries(symbol: str, attempts: int = 3, backoff: float = 0.5):
+    """Try to fetch market price with a few retries and exponential backoff.
+    Returns a float price or None if all attempts fail.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            p = await fetch_market_price(symbol)
+            if p and p != 0:
+                return p
+            last = p
+        except Exception:
+            last = None
+        # small backoff
+        await asyncio.sleep(backoff * (2 ** i))
+    return last
 
 
 def construct_bitget_payload(symbol: str, side: str, size: float = None):
@@ -407,6 +475,7 @@ async def debug_place_test(req: Request):
 
     # compute size from size_usd if provided
     computed_size = None
+    fetched_price = None
     if size is not None:
         try:
             computed_size = float(size)
@@ -417,9 +486,11 @@ async def debug_place_test(req: Request):
             usd = float(size_usd)
             if price:
                 p = float(price)
+                fetched_price = p
             else:
                 # try to fetch market price when price not provided
-                p = await fetch_market_price(symbol)
+                p = await get_market_price_with_retries(symbol)
+                fetched_price = p
             if p and p != 0:
                 computed_size = usd / p
             else:
@@ -440,18 +511,38 @@ async def debug_place_test(req: Request):
         trade_id = str(uuid.uuid4())
         now = time.time()
         simulated_status = "placed"
+        # If caller did not provide an explicit price, use the fetched_price (if any)
+        # or attempt to fetch one now. If we cannot fetch a market price, return an error
+        # so the UI doesn't show 0.0 and the caller can retry.
+        price_for_db = price
+        if not price_for_db:
+            if fetched_price:
+                price_for_db = fetched_price
+            else:
+                # attempt to fetch a reliable market price now
+                price_for_db = await get_market_price_with_retries(symbol)
+                if not price_for_db:
+                    raise HTTPException(status_code=502, detail="Unable to fetch market price for symbol; try again")
+        try:
+            print(f"[debug/place-test] computed market price p={locals().get('p', None)} price={price} price_for_db={price_for_db}")
+        except Exception:
+            pass
         try:
             await database.execute(trades.insert().values(
                 id=trade_id,
                 signal=signal,
                 symbol=symbol,
-                price=price or 0.0,
+                price=float(price_for_db) if price_for_db is not None else 0.0,
                 status=simulated_status,
                 response=json.dumps(fake_resp),
                 created_at=now
             ))
+            try:
+                print(f"[debug/place-test] inserting trade id={trade_id} price={price_for_db}")
+            except Exception:
+                pass
             # Broadcast the simulated placed event to connected frontends
-            await broadcast({"type": "placed", "id": trade_id, "status_code": 200, "response": fake_resp})
+            await broadcast({"type": "placed", "id": trade_id, "status_code": 200, "response": fake_resp, "price": float(price_for_db) if price_for_db is not None else None})
         except Exception as e:
             # Fall back to returning simulated response even if DB write failed
             print(f"[debug/place-test] failed to write simulated trade to DB: {e}")
@@ -462,6 +553,7 @@ async def debug_place_test(req: Request):
             "note": "BITGET_DRY_RUN is enabled — simulated order created locally",
             "orderId": fake_resp["data"]["orderId"],
             "trade_id": trade_id,
+            "price": float(price_for_db) if price_for_db is not None else None,
             "response": fake_resp,
             "payload": constructed_payload,
         }
@@ -698,8 +790,10 @@ async def webhook(req: Request):
             usd = float(size_usd)
             if price:
                 p = float(price)
+                fetched_price = p
             else:
-                p = await fetch_market_price(symbol)
+                p = await get_market_price_with_retries(symbol)
+                fetched_price = p
             if p and p != 0:
                 # simple conversion: number of contracts = usd / price
                 computed_size = usd / p
@@ -708,13 +802,32 @@ async def webhook(req: Request):
         except Exception:
             computed_size = None
 
-    # Save incoming alert to DB as pending
+    # If we fetched a market price to compute size, prefer that for DB storage
+    price_for_db = price or (p if 'p' in locals() and p is not None else 0.0)
+    # If price still missing, attempt to fetch a market price (with retries).
+    if not price_for_db:
+        fetched = await get_market_price_with_retries(symbol)
+        if fetched:
+            price_for_db = fetched
+        else:
+            # Fail loudly so we don't store 0.0; caller can retry the webhook when network is ok
+            raise HTTPException(status_code=502, detail="Unable to fetch market price for symbol; try again")
+    try:
+        print(f"[webhook] computed market price p={locals().get('p', None)} price={price} price_for_db={price_for_db}")
+    except Exception:
+        pass
+
+    # Save incoming alert to DB as pending (use discovered price when available)
     trade_id = str(uuid.uuid4())
     now = time.time()
     await database.execute(trades.insert().values(
-        id=trade_id, signal=signal, symbol=symbol, price=price or 0.0,
+        id=trade_id, signal=signal, symbol=symbol, price=price_for_db,
         status="received", response="", created_at=now
     ))
+    try:
+        print(f"[webhook] inserted pending trade id={trade_id} price={price_for_db}")
+    except Exception:
+        pass
     # Broadcast received alert
     await broadcast({"type":"received","id":trade_id,"signal":signal,"symbol":symbol,"price":price, "at":now})
 
@@ -732,12 +845,23 @@ async def webhook(req: Request):
     try:
         # pass computed_size (or None) to place_demo_order; that function will fall back to "1" if None
         status_code, resp_text = await place_demo_order(symbol=symbol, side=side, price=price, size=computed_size)
+
+        # Update stored trade with the Bitget response
         await database.execute(trades.update().where(trades.c.id==trade_id).values(status="placed", response=resp_text))
-        await broadcast({"type":"placed","id":trade_id,"status_code":status_code,"response":json.loads(resp_text) if resp_text else resp_text})
+
+        # Include the price we persisted earlier so the frontend sees the market price
+        await broadcast({
+            "type": "placed",
+            "id": trade_id,
+            "status_code": status_code,
+            "response": json.loads(resp_text) if resp_text else resp_text,
+            "price": float(price_for_db) if 'price_for_db' in locals() and price_for_db is not None else None
+        })
+
         return {"ok": True, "id": trade_id, "status_code": status_code, "response": resp_text}
     except Exception as e:
         await database.execute(trades.update().where(trades.c.id==trade_id).values(status="error", response=str(e)))
-        await broadcast({"type":"error","id":trade_id,"error":str(e)})
+        await broadcast({"type": "error", "id": trade_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/trades")
