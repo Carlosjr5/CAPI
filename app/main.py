@@ -270,9 +270,9 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
 
     # Try several candidate endpoints in case the API path varies by environment
     candidates = [
-        BITGET_BASE + request_path,
-        BITGET_BASE + request_path + f"?productType={BITGET_PRODUCT_TYPE}",
         BITGET_BASE + "/api/v2/mix/order/place-order",
+        BITGET_BASE + request_path + f"?productType={BITGET_PRODUCT_TYPE}",
+        BITGET_BASE + request_path,
         BITGET_BASE + "/api/mix/v1/order/placeOrder",
     ]
 
