@@ -466,37 +466,35 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
     # remove dots and any characters except letters, digits and underscore
     raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
-    # If symbol already appears to include the product suffix, keep as-is
-    if BITGET_PRODUCT_TYPE and ("_" in raw and raw.upper().endswith(str(BITGET_PRODUCT_TYPE).upper())):
-        bitget_symbol = raw
-    else:
-        # append product type if not present
-        if BITGET_PRODUCT_TYPE:
-            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
-        else:
-            bitget_symbol = raw
-
-    # For SUMCBL/UMCBL (simulated/unilateral contracts), use plain symbols without suffix
-    if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
-        bitget_symbol = raw
-        if BITGET_PRODUCT_TYPE == "SUMCBL":
-            body_obj["productType"] = "UMCBL"  # Use UMCBL for SUMCBL orders
-    else:
-        # For other product types, append the product type if not present
-        if BITGET_PRODUCT_TYPE and not ("_" in raw and raw.upper().endswith(str(BITGET_PRODUCT_TYPE).upper())):
-            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
-        else:
-            bitget_symbol = raw
-
+    
+    # Initialize body_obj with default values
     body_obj = {
         "productType": BITGET_PRODUCT_TYPE,
-        "symbol": bitget_symbol,
+        "symbol": "",  # Will be set below
         "orderType": "market",
         "size": str(size) if size is not None else "1",
         "marginCoin": BITGET_MARGIN_COIN,
         "marginMode": "crossed",
         "clientOid": str(uuid.uuid4())
     }
+
+    # Determine the symbol
+    if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
+        bitget_symbol = raw
+        if BITGET_PRODUCT_TYPE == "SUMCBL":
+            body_obj["productType"] = "UMCBL"  # Use UMCBL for SUMCBL orders
+    else:
+        # For other product types, check if suffix is already present
+        if BITGET_PRODUCT_TYPE and ("_" in raw and raw.upper().endswith(str(BITGET_PRODUCT_TYPE).upper())):
+            bitget_symbol = raw
+        else:
+            # append product type if not present
+            if BITGET_PRODUCT_TYPE:
+                bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+            else:
+                bitget_symbol = raw
+    
+    body_obj["symbol"] = bitget_symbol
 
     # Map side for single/unilateral accounts when necessary
     side_key = side.lower()
