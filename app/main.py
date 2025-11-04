@@ -204,7 +204,16 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # Normalize symbol for Bitget - remove TradingView suffixes like .P
     normalized_symbol = symbol.replace('.P', '').replace('.p', '')
     use_symbol = mapped_symbol if mapped_symbol else normalized_symbol
-    body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size)
+    
+    # For UMCBL limit orders, fetch market price if not provided
+    order_price = price
+    if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL") and price is None:
+        try:
+            order_price = await get_market_price_with_retries(use_symbol)
+        except Exception:
+            order_price = None
+    
+    body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size, price=order_price)
 
     # For SUMCBL, the symbol construction is correct but the API rejects it.
     # Keep SUMCBL for now since that's what the user configured, but this may need to be changed
@@ -215,10 +224,7 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # set BITGET_POSITION_MODE in Railway (try 'single' or the value shown in Bitget docs) — this
     # will add a "positionMode" key to the order payload.
     if BITGET_POSITION_MODE:
-        if BITGET_POSITION_MODE.lower() == "single":
-            body_obj["positionMode"] = "one_way"
-        else:
-            body_obj["positionMode"] = BITGET_POSITION_MODE
+        body_obj["positionMode"] = BITGET_POSITION_MODE
 
     # Map the incoming generic side (buy/sell) to the Bitget API's expected
     # values for the account's hold/position mode. For unilateral (one-way)
@@ -449,7 +455,7 @@ async def get_market_price_with_retries(symbol: str, attempts: int = 3, backoff:
     return last
 
 
-def construct_bitget_payload(symbol: str, side: str, size: float = None):
+def construct_bitget_payload(symbol: str, side: str, size: float = None, price: float = None):
     """Construct the Bitget order payload dictionary without signing/sending.
     This mirrors the logic used by place_demo_order so it can be tested by
     the debug endpoint without making external calls.
@@ -471,12 +477,16 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     body_obj = {
         "productType": BITGET_PRODUCT_TYPE,
         "symbol": "",  # Will be set below
-        "orderType": "market",
+        "orderType": "limit" if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL") else "market",  # Use limit orders for unilateral positions
         "size": str(size) if size is not None else "1",
         "marginCoin": BITGET_MARGIN_COIN,
         "marginMode": "crossed",
         "clientOid": str(uuid.uuid4())
     }
+
+    # Add price for limit orders
+    if body_obj["orderType"] == "limit" and price is not None:
+        body_obj["price"] = str(price)
 
     # Determine the symbol
     if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
@@ -578,7 +588,7 @@ async def debug_payload(req: Request):
         raise HTTPException(status_code=400, detail="Unknown signal; must be BUY or SELL")
 
     # prefer computed_size (from size_usd) when provided so debug mirrors webhook
-    constructed = construct_bitget_payload(symbol=symbol, side=side, size=computed_size if computed_size is not None else size)
+    constructed = construct_bitget_payload(symbol=symbol, side=side, size=computed_size if computed_size is not None else size, price=price)
     return {"payload": constructed}
 
 
@@ -649,7 +659,7 @@ async def debug_place_test(req: Request):
     # If dry-run is enabled, simulate placing an order by inserting a DB row
     if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
         # Construct the payload for reporting and the simulated response
-        constructed_payload = construct_bitget_payload(symbol=symbol, side=side, size=computed_size)
+        constructed_payload = construct_bitget_payload(symbol=symbol, side=side, size=computed_size, price=price)
         fake_resp = {
             "code": "00000",
             "msg": "dry-run: simulated order placed",
@@ -710,7 +720,7 @@ async def debug_place_test(req: Request):
     # Place the order using the existing helper
     try:
         # Construct the payload for reporting back to the caller (helps debugging)
-        constructed_payload = construct_bitget_payload(symbol=symbol, side=side, size=computed_size)
+        constructed_payload = construct_bitget_payload(symbol=symbol, side=side, size=computed_size, price=price)
 
         status_code, resp_text = await place_demo_order(symbol=symbol, side=side, price=price, size=computed_size)
 
@@ -737,6 +747,31 @@ async def debug_place_test(req: Request):
         except Exception:
             pass
 
+        # Insert the trade into database regardless of success/failure
+        trade_id = str(uuid.uuid4())
+        trade_status = "placed" if status_code == 200 and not (parsed and parsed.get('code') and str(parsed.get('code')) != '00000') else "error"
+        try:
+            await database.execute(trades.insert().values(
+                id=trade_id,
+                signal=signal,
+                symbol=symbol,
+                price=float(price_for_db) if price_for_db is not None else 0.0,
+                size=computed_size if computed_size is not None else 1.0,
+                status=trade_status,
+                response=resp_text,
+                created_at=time.time()
+            ))
+            # Broadcast the placed event to connected frontends
+            await broadcast({
+                "type": "placed",
+                "id": trade_id,
+                "status_code": status_code,
+                "response": parsed,
+                "price": float(price_for_db) if price_for_db is not None else None
+            })
+        except Exception as e:
+            print(f"[debug/place-test] failed to write trade to DB: {e}")
+
         result = {
             "ok": True,
             "dry_run": False,
@@ -745,6 +780,7 @@ async def debug_place_test(req: Request):
             "orderId": order_id,
             "response": parsed,
             "payload": constructed_payload,
+            "trade_id": trade_id,
         }
 
         return result
