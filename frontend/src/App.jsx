@@ -16,8 +16,26 @@ export default function App(){
   const [lastOrderResult, setLastOrderResult] = useState(null)
   const [lastOrderQuery, setLastOrderQuery] = useState(null)
   const [currentPrices, setCurrentPrices] = useState({})
+  const priceIntervalRef = useRef(null)
 
-  useEffect(()=>{ fetchTrades(); connectWS(); }, [])
+  useEffect(()=>{ 
+    fetchTrades(); 
+    connectWS();
+    
+    // Start periodic price updates for open positions
+    if (priceIntervalRef.current) {
+      clearInterval(priceIntervalRef.current);
+    }
+    priceIntervalRef.current = setInterval(() => {
+      updatePricesOnly(trades);
+    }, 5000); // Update every 5 seconds
+
+    return () => {
+      if (priceIntervalRef.current) {
+        clearInterval(priceIntervalRef.current);
+      }
+    };
+  }, [trades])
 
   async function fetchTrades(){
     try{
@@ -32,9 +50,11 @@ export default function App(){
     }
   }
 
-  async function fetchPricesForOpenPositions(tradesData){
+  async function updatePricesOnly(tradesData){
     const openTrades = tradesData.filter(t => mapStatus(t.status) === 'open')
     const symbols = [...new Set(openTrades.map(t => t.symbol))]
+    
+    if(symbols.length === 0) return; // No open positions, skip
     
     const newPrices = {...currentPrices}
     for(const symbol of symbols){
@@ -82,7 +102,9 @@ export default function App(){
       try{
         const d = JSON.parse(m.data)
         pushEvent(JSON.stringify(d))
-        if(['received','placed','error','ignored'].includes(d.type)) fetchTrades()
+        if(['received','placed','error','ignored'].includes(d.type)) {
+          fetchTrades()
+        }
       }catch(e){ console.error(e) }
     }
   }

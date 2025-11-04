@@ -204,16 +204,7 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # Normalize symbol for Bitget - remove TradingView suffixes like .P
     normalized_symbol = symbol.replace('.P', '').replace('.p', '')
     use_symbol = mapped_symbol if mapped_symbol else normalized_symbol
-    
-    # For UMCBL limit orders, fetch market price if not provided
-    order_price = price
-    if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL") and price is None:
-        try:
-            order_price = await get_market_price_with_retries(use_symbol)
-        except Exception:
-            order_price = None
-    
-    body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size, price=order_price)
+    body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size)
 
     # For SUMCBL, the symbol construction is correct but the API rejects it.
     # Keep SUMCBL for now since that's what the user configured, but this may need to be changed
@@ -455,7 +446,7 @@ async def get_market_price_with_retries(symbol: str, attempts: int = 3, backoff:
     return last
 
 
-def construct_bitget_payload(symbol: str, side: str, size: float = None, price: float = None):
+def construct_bitget_payload(symbol: str, side: str, size: float = None):
     """Construct the Bitget order payload dictionary without signing/sending.
     This mirrors the logic used by place_demo_order so it can be tested by
     the debug endpoint without making external calls.
@@ -477,16 +468,16 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, price: 
     body_obj = {
         "productType": BITGET_PRODUCT_TYPE,
         "symbol": "",  # Will be set below
-        "orderType": "limit" if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL") else "market",  # Use limit orders for unilateral positions
+        "orderType": "market",  # Use market orders for all products
         "size": str(size) if size is not None else "1",
         "marginCoin": BITGET_MARGIN_COIN,
-        "marginMode": "crossed",
+        "marginMode": "isolated" if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL") else "crossed",  # Use isolated margin for unilateral positions
         "clientOid": str(uuid.uuid4())
     }
 
-    # Add price for limit orders
-    if body_obj["orderType"] == "limit" and price is not None:
-        body_obj["price"] = str(price)
+    # Add price for limit orders (not needed for market orders)
+    # if body_obj["orderType"] == "limit" and price is not None:
+    #     body_obj["price"] = str(price)
 
     # Determine the symbol
     if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
@@ -511,28 +502,29 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, price: 
     pm = str(BITGET_POSITION_MODE or "").lower()
     pt = str(BITGET_POSITION_TYPE or "").lower()
     single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way", "oneway")
-    if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way", "oneway")):
+    if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way", "oneway")) or BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
         # Use simple buy/sell for unilateral mode
         body_obj["side"] = side_key
     else:
         body_obj["side"] = side_key
 
-    # positionSide inference
-    if BITGET_POSITION_SIDE:
-        body_obj["positionSide"] = BITGET_POSITION_SIDE
-    else:
-        try:
-            inferred = "long" if side_key == "buy" else "short"
-            body_obj["positionSide"] = inferred
-        except Exception:
-            pass
+    # positionSide inference - skip for unilateral products
+    if BITGET_PRODUCT_TYPE not in ("SUMCBL", "UMCBL"):
+        if BITGET_POSITION_SIDE:
+            body_obj["positionSide"] = BITGET_POSITION_SIDE
+        else:
+            try:
+                inferred = "long" if side_key == "buy" else "short"
+                body_obj["positionSide"] = inferred
+            except Exception:
+                pass
 
     # Only include positionType if it's set and not the problematic 'unilateral' literal
     if BITGET_POSITION_TYPE and str(BITGET_POSITION_TYPE).lower() not in ("unilateral", "one-way"):
         body_obj["positionType"] = BITGET_POSITION_TYPE
 
-    # Optionally include positionMode if the environment variable is set
-    if BITGET_POSITION_MODE:
+    # Optionally include positionMode if the environment variable is set (skip for unilateral products)
+    if BITGET_POSITION_MODE and BITGET_PRODUCT_TYPE not in ("SUMCBL", "UMCBL"):
         body_obj["positionMode"] = BITGET_POSITION_MODE
 
     return body_obj
@@ -588,7 +580,7 @@ async def debug_payload(req: Request):
         raise HTTPException(status_code=400, detail="Unknown signal; must be BUY or SELL")
 
     # prefer computed_size (from size_usd) when provided so debug mirrors webhook
-    constructed = construct_bitget_payload(symbol=symbol, side=side, size=computed_size if computed_size is not None else size, price=price)
+    constructed = construct_bitget_payload(symbol=symbol, side=side, size=computed_size if computed_size is not None else size)
     return {"payload": constructed}
 
 
@@ -659,7 +651,7 @@ async def debug_place_test(req: Request):
     # If dry-run is enabled, simulate placing an order by inserting a DB row
     if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
         # Construct the payload for reporting and the simulated response
-        constructed_payload = construct_bitget_payload(symbol=symbol, side=side, size=computed_size, price=price)
+        constructed_payload = construct_bitget_payload(symbol=symbol, side=side, size=computed_size)
         fake_resp = {
             "code": "00000",
             "msg": "dry-run: simulated order placed",
@@ -720,7 +712,7 @@ async def debug_place_test(req: Request):
     # Place the order using the existing helper
     try:
         # Construct the payload for reporting back to the caller (helps debugging)
-        constructed_payload = construct_bitget_payload(symbol=symbol, side=side, size=computed_size, price=price)
+        constructed_payload = construct_bitget_payload(symbol=symbol, side=side, size=computed_size)
 
         status_code, resp_text = await place_demo_order(symbol=symbol, side=side, price=price, size=computed_size)
 
