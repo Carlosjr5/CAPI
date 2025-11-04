@@ -1035,6 +1035,25 @@ async def debug_check_creds():
 @app.on_event("startup")
 async def startup():
     await database.connect()
+    
+    # Check if database schema needs migration (simple check for size column)
+    try:
+        # Try to query with size column
+        await database.fetch_all(trades.select().limit(1))
+        schema_ok = True
+    except Exception as e:
+        if "no such column" in str(e).lower():
+            schema_ok = False
+            print("[startup] Database schema outdated, recreating tables...")
+            # Drop and recreate tables
+            async with database.connection() as conn:
+                await conn.execute("DROP TABLE IF EXISTS trades")
+            # Recreate tables with new schema
+            metadata.create_all(engine)
+            print("[startup] Database schema updated successfully")
+        else:
+            schema_ok = True  # Other errors are not schema issues
+    
     # Print important runtime info to help verify demo vs prod endpoints and dry-run
     try:
         print(f"[startup] BITGET_BASE={BITGET_BASE} BITGET_DRY_RUN={BITGET_DRY_RUN}")
@@ -1053,6 +1072,7 @@ async def startup():
     # One-way position system: ensure only one open position at a time
     # Close all but the most recent 'placed' trade
     try:
+        # Handle case where size column might not exist in older databases
         placed_trades = await database.fetch_all(trades.select().where(trades.c.status == "placed").order_by(trades.c.created_at.desc()))
         if len(placed_trades) > 1:
             # Close all except the first (most recent)
@@ -1060,7 +1080,11 @@ async def startup():
                 await database.execute(trades.update().where(trades.c.id == t.id).values(status="closed"))
             print(f"[startup] Closed {len(placed_trades)-1} old open positions to maintain one-way system")
     except Exception as e:
-        print(f"[startup] Error cleaning up positions: {e}")
+        # If there's a schema error (like missing size column), just log and continue
+        if "no such column" in str(e).lower():
+            print(f"[startup] Database schema outdated (missing columns), skipping position cleanup. Will be fixed on next restart.")
+        else:
+            print(f"[startup] Error cleaning up positions: {e}")
 
 @app.on_event("shutdown")
 async def shutdown():
