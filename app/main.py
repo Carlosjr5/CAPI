@@ -33,7 +33,7 @@ BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN")
 BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE")  # optional: e.g. 'single' for unilateral / one-way
 BITGET_POSITION_TYPE = os.getenv("BITGET_POSITION_TYPE")  # optional: try values like 'unilateral' or 'one-way' if Bitget expects 'positionType'
 BITGET_POSITION_SIDE = os.getenv("BITGET_POSITION_SIDE")  # optional: explicit position side e.g. 'long' or 'short'
-BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN")
+BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN", "1")
 
 # DB (sqlite)
 DATABASE_URL = "sqlite:///./trades.db"
@@ -144,62 +144,13 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     Place an order on Bitget demo futures (v2 mix order)
     We'll place a market order by default. Modify `orderType` to 'limit' if you want limit.
     """
-    # Use Bitget mix v1 place order endpoint (docs show simulated/demo trading on v1 paths)
-    request_path = "/api/mix/v1/order/placeOrder"
+    # Use Bitget v5 unified API for futures trading
+    request_path = "/api/v5/trade/order"
     url = BITGET_BASE + request_path
 
-    # Attempt to discover the exact Bitget contract symbol for the configured
-    # productType to avoid mismatches (e.g. TradingView 'BTCUSDT.P' or differing
-    # suffixes). If discovery fails we'll fall back to the simple mapping.
+    # For v5 API, we don't need contract discovery - just use the symbol directly
+    # For v5 API, we don't need contract discovery - just use the symbol directly
     mapped_symbol = None
-    try:
-        # Query Bitget's public contracts for the productType
-        product_type_for_query = "UMCBL" if BITGET_PRODUCT_TYPE == "SUMCBL" else BITGET_PRODUCT_TYPE
-        contracts_url = f"{BITGET_BASE}/api/mix/v1/market/contracts?productType={product_type_for_query}"
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(contracts_url)
-            if r.status_code == 200:
-                try:
-                    j = r.json()
-                    data = j.get("data") if isinstance(j, dict) else None
-                    if isinstance(data, list):
-                        raw = symbol.replace("BINANCE:", "").replace("/", "")
-                        raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
-                        raw_up = raw.upper()
-                        # For SUMCBL/UMCBL, add 'S' prefix before matching
-                        if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
-                            raw_up = "S" + raw_up
-                        # base coin (e.g. BTC from BTCUSDT)
-                        base = raw_up.replace("USDT", "").replace("_", "").replace("S", "")
-                        for item in data:
-                            if not isinstance(item, dict):
-                                continue
-                            s = (item.get("symbol") or "").upper()
-                            display = (item.get("symbolDisplayName") or "").upper()
-                            # For SUMCBL/UMCBL, require exact match
-                            if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
-                                if raw_up == s:
-                                    mapped_symbol = item.get("symbol")
-                                    break
-                            else:
-                                # direct match with symbol or display
-                                if raw_up == s or raw_up == display:
-                                    mapped_symbol = item.get("symbol")
-                                    break
-                                # substring match: raw contained in symbol/display
-                                if raw_up in s or raw_up in display:
-                                    mapped_symbol = item.get("symbol")
-                                    break
-                                # match by base coin presence (handles demo prefixes like 'SBTC')
-                                if base and (base in s or base in display):
-                                    # ensure it's a USDT pair (display contains USDT)
-                                    if "USDT" in s or "USDT" in display:
-                                        mapped_symbol = item.get("symbol")
-                                        break
-                except Exception:
-                    mapped_symbol = None
-    except Exception:
-        mapped_symbol = None
 
     # Normalize symbol for Bitget - remove TradingView suffixes like .P
     normalized_symbol = symbol.replace('.P', '').replace('.p', '')
@@ -210,45 +161,36 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # Keep SUMCBL for now since that's what the user configured, but this may need to be changed
     # if Bitget doesn't support live orders on SUMCBL product type
 
-    # Optional: include position mode if set via env. Bitget accounts can be one-way (unilateral)
-    # or hedged. If your account is in unilateral mode and Bitget expects a matching order field,
-    # set BITGET_POSITION_MODE in Railway (try 'single' or the value shown in Bitget docs) — this
-    # will add a "positionMode" key to the order payload.
-    if BITGET_POSITION_MODE:
-        body_obj["positionMode"] = BITGET_POSITION_MODE
-
-    # Map the incoming generic side (buy/sell) to the Bitget API's expected
-    # values for the account's hold/position mode. For unilateral (one-way)
-    # accounts Bitget expects 'buy' / 'sell' with positionSide 'long'/'short'. For other
-    # account modes we keep the original simple mapping (buy/sell) to avoid
-    # accidental mismatches.
+    # Set side for all products
     side_key = side.lower()
-    pm = str(BITGET_POSITION_MODE or "").lower()
-    pt = str(BITGET_POSITION_TYPE or "").lower()
-    single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way", "oneway")
-    if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way", "oneway")):
-        # Use simple buy/sell for unilateral mode
-        body_obj["side"] = side_key
-    else:
-        # default to the simple buy/sell mapping (keeps prior behaviour)
-        body_obj["side"] = side_key
+    body_obj["side"] = side_key
 
-    # Include a position side (long/short). Prefer explicit env var, otherwise map from order side.
-    if BITGET_POSITION_SIDE:
-        body_obj["positionSide"] = BITGET_POSITION_SIDE
-    else:
-        try:
-            inferred = "long" if side_key == "buy" else "short"
-            body_obj["positionSide"] = inferred
-        except Exception:
-            pass
+    # For unilateral products (UMCBL), don't add position-related fields at all
+    # This avoids the "unilateral position type" error
+    if BITGET_PRODUCT_TYPE not in ("SUMCBL", "UMCBL"):
+        # Optional: include position mode if set via env. Bitget accounts can be one-way (unilateral)
+        # or hedged. If your account is in unilateral mode and Bitget expects a matching order field,
+        # set BITGET_POSITION_MODE in Railway (try 'single' or the value shown in Bitget docs) — this
+        # will add a "positionMode" key to the order payload.
+        if BITGET_POSITION_MODE:
+            body_obj["positionMode"] = BITGET_POSITION_MODE
 
-    # Some Bitget APIs accept a 'positionType' field; however some accounts expect
-    # 'positionSide' + 'positionMode' instead. Only include positionType when it's
-    # explicitly set to a non-unilateral value to avoid sending 'unilateral' which
-    # some API versions reject as used here.
-    if BITGET_POSITION_TYPE and str(BITGET_POSITION_TYPE).lower() not in ("unilateral", "one-way"):
-        body_obj["positionType"] = BITGET_POSITION_TYPE
+        # Include a position side (long/short). Prefer explicit env var, otherwise map from order side.
+        if BITGET_POSITION_SIDE:
+            body_obj["positionSide"] = BITGET_POSITION_SIDE
+        else:
+            try:
+                inferred = "long" if side_key == "buy" else "short"
+                body_obj["positionSide"] = inferred
+            except Exception:
+                pass
+
+        # Some Bitget APIs accept a 'positionType' field; however some accounts expect
+        # 'positionSide' + 'positionMode' instead. Only include positionType when it's
+        # explicitly set to a non-unilateral value to avoid sending 'unilateral' which
+        # some API versions reject as used here.
+        if BITGET_POSITION_TYPE and str(BITGET_POSITION_TYPE).lower() not in ("unilateral", "one-way"):
+            body_obj["positionType"] = BITGET_POSITION_TYPE
 
     body = json.dumps(body_obj, separators=(',', ':'))  # compact body
     # If dry-run is enabled, don't call Bitget — return a simulated successful response
@@ -283,10 +225,9 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # For SUMCBL/UMCBL, use plain endpoints since they don't support productType suffixes
     if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
         candidates = [
-            BITGET_BASE + "/api/v2/mix/order/place-order",
-            BITGET_BASE + "/api/mix/v1/order/placeOrder",
-            BITGET_BASE + request_path,
             BITGET_BASE + "/api/strategy/v1/trading-view/callback",
+            BITGET_BASE + "/api/v2/mix/order/place-order",
+            BITGET_BASE + request_path,
         ]
     else:
         candidates = [
@@ -464,15 +405,15 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     # remove dots and any characters except letters, digits and underscore
     raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
     
-    # Initialize body_obj with default values
+    # Initialize body_obj with default values - use the working parameters from debug_order.py
     body_obj = {
         "productType": BITGET_PRODUCT_TYPE,
         "symbol": "",  # Will be set below
-        "orderType": "market",  # Use market orders for all products
-        "size": str(size) if size is not None else "1",
+        "orderType": "market",
+        "size": str(size) if size is not None else "0.001",  # Smaller default size like debug script
         "marginCoin": BITGET_MARGIN_COIN,
-        "marginMode": "isolated" if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL") else "crossed",  # Use isolated margin for unilateral positions
-        "clientOid": str(uuid.uuid4())
+        "marginMode": "crossed",  # Use crossed like the working debug script
+        "clientOid": "test123"  # Fixed clientOid like debug script
     }
 
     # Add price for limit orders (not needed for market orders)
@@ -503,29 +444,30 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     pt = str(BITGET_POSITION_TYPE or "").lower()
     single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way", "oneway")
     if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way", "oneway")) or BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
-        # Use simple buy/sell for unilateral mode
+        # Use buy/sell for unilateral mode - the positionMode handles the unilateral aspect
         body_obj["side"] = side_key
     else:
         body_obj["side"] = side_key
 
-    # positionSide inference - skip for unilateral products
-    if BITGET_PRODUCT_TYPE not in ("SUMCBL", "UMCBL"):
-        if BITGET_POSITION_SIDE:
-            body_obj["positionSide"] = BITGET_POSITION_SIDE
-        else:
-            try:
-                inferred = "long" if side_key == "buy" else "short"
-                body_obj["positionSide"] = inferred
-            except Exception:
-                pass
+    # positionSide inference - always include for unilateral products
+    if BITGET_POSITION_SIDE:
+        body_obj["positionSide"] = BITGET_POSITION_SIDE
+    else:
+        try:
+            inferred = "long" if side_key == "buy" else "short"
+            body_obj["positionSide"] = inferred
+        except Exception:
+            pass
 
-    # Only include positionType if it's set and not the problematic 'unilateral' literal
-    if BITGET_POSITION_TYPE and str(BITGET_POSITION_TYPE).lower() not in ("unilateral", "one-way"):
-        body_obj["positionType"] = BITGET_POSITION_TYPE
-
-    # Optionally include positionMode if the environment variable is set (skip for unilateral products)
-    if BITGET_POSITION_MODE and BITGET_PRODUCT_TYPE not in ("SUMCBL", "UMCBL"):
-        body_obj["positionMode"] = BITGET_POSITION_MODE
+    # Remove positionType and positionMode for unilateral products - they may be causing conflicts
+    # Let the API determine the correct position handling based on side and productType
+    if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
+        if "positionType" in body_obj:
+            del body_obj["positionType"]
+        if "positionMode" in body_obj:
+            del body_obj["positionMode"]
+        if "positionSide" in body_obj:
+            del body_obj["positionSide"]
 
     return body_obj
 
@@ -647,6 +589,16 @@ async def debug_place_test(req: Request):
                 raise HTTPException(status_code=400, detail="Missing price and unable to fetch market price; include price or try again")
         except Exception:
             computed_size = None
+
+    # Determine price for DB storage (early calculation for both live and dry-run paths)
+    price_for_db = price
+    if not price_for_db:
+        if fetched_price:
+            price_for_db = fetched_price
+        else:
+            price_for_db = await get_market_price_with_retries(symbol)
+            if not price_for_db:
+                raise HTTPException(status_code=400, detail="Unable to fetch market price for symbol; include price or try again")
 
     # If dry-run is enabled, simulate placing an order by inserting a DB row
     if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
