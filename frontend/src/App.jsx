@@ -11,10 +11,11 @@ export default function App(){
   const [formSecret, setFormSecret] = useState('')
   const [formSymbol, setFormSymbol] = useState('BTCUSDT')
   const [formSide, setFormSide] = useState('BUY')
-  const [formSizeUsd, setFormSizeUsd] = useState('10')
+  const [formSizeUsd, setFormSizeUsd] = useState('100')
   const [placing, setPlacing] = useState(false)
   const [lastOrderResult, setLastOrderResult] = useState(null)
   const [lastOrderQuery, setLastOrderQuery] = useState(null)
+  const [currentPrices, setCurrentPrices] = useState({})
 
   useEffect(()=>{ fetchTrades(); connectWS(); }, [])
 
@@ -24,16 +25,48 @@ export default function App(){
       const res = await fetch((apiBase || '') + '/trades')
       const data = await res.json()
       setTrades(data)
+      // Fetch prices for open positions
+      await fetchPricesForOpenPositions(data)
     }catch(e){
       console.error(e)
     }
   }
 
+  async function fetchPricesForOpenPositions(tradesData){
+    const openTrades = tradesData.filter(t => mapStatus(t.status) === 'open')
+    const symbols = [...new Set(openTrades.map(t => t.symbol))]
+    
+    const newPrices = {...currentPrices}
+    for(const symbol of symbols){
+      try{
+        const apiBase = getApiBase()
+        const res = await fetch((apiBase || '') + `/price/${symbol}`)
+        const data = await res.json()
+        if(data.price){
+          newPrices[symbol] = data.price
+        }
+      }catch(e){
+        console.error(`Failed to fetch price for ${symbol}:`, e)
+      }
+    }
+    setCurrentPrices(newPrices)
+  }
+
+  function calculatePnL(trade){
+    const currentPrice = currentPrices[trade.symbol]
+    if(!currentPrice || !trade.price || !trade.size) return null
+    
+    const entryPrice = trade.price
+    const multiplier = trade.signal.toUpperCase() === 'BUY' ? 1 : -1
+    const pnl = (currentPrice - entryPrice) * trade.size * multiplier
+    return pnl
+  }
+
   function mapStatus(s){
     if(!s) return 'other'
     const v = s.toLowerCase()
-    if(v.includes('placed') || v.includes('received')) return 'open'
-    if(v.includes('filled') || v.includes('closed') || v.includes('rejected') || v.includes('error') || v.includes('ignored')) return 'closed'
+    if(v === 'placed') return 'open'
+    if(v.includes('filled') || v.includes('closed') || v.includes('rejected') || v.includes('error') || v.includes('ignored') || v === 'signal') return 'closed'
     return 'other'
   }
 
@@ -99,6 +132,31 @@ export default function App(){
             <div className="kpi"><div className="label">Total</div><div className="value">{counts.total}</div></div>
           </div>
 
+          {counts.open > 0 && (
+            <div className="card">
+              <h3>Current Position</h3>
+              {trades.filter(t => mapStatus(t.status) === 'open').map(t => {
+                const pnl = calculatePnL(t)
+                const pnlColor = pnl > 0 ? '#10b981' : pnl < 0 ? '#ef4444' : '#94a3b8'
+                const pnlText = pnl !== null ? `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}` : 'Loading...'
+                return (
+                  <div key={t.id} style={{padding:8, border:'1px solid #ccc', marginBottom:4, borderRadius:4}}>
+                    <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                      <div>
+                        <strong>{t.signal}</strong> {t.symbol} at ${Number(t.price).toFixed(2)}
+                      </div>
+                      <div style={{color: pnlColor, fontWeight: 'bold', fontSize: '1.1em'}}>
+                        {pnlText}
+                      </div>
+                    </div>
+                    <div className="muted">Opened: {new Date(t.created_at*1000).toLocaleString()}</div>
+                    <div className="muted">ID: {t.id.slice(0,8)}...</div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
           <TradeTable items={trades} onRefresh={fetchTrades} />
         </section>
 
@@ -126,7 +184,7 @@ export default function App(){
                 <option>BUY</option>
                 <option>SELL</option>
               </select>
-              <input placeholder="Size (USD) e.g. 10" value={formSizeUsd} onChange={e=>setFormSizeUsd(e.target.value)} />
+              <input placeholder="Size (USD) e.g. 100" value={formSizeUsd} onChange={e=>setFormSizeUsd(e.target.value)} />
               <div style={{display:'flex',gap:8}}>
                 <button disabled={placing} onClick={async ()=>{
                   setPlacing(true)
@@ -145,7 +203,7 @@ export default function App(){
                   }catch(e){ pushEvent(`[place-test] error ${e.message || e}`) }
                   setPlacing(false)
                 }}>{placing ? 'Placing...' : 'Place demo order'}</button>
-                <button onClick={()=>{ setFormSecret(''); setFormSizeUsd('10'); setFormSymbol('BTCUSDT'); setFormSide('BUY') }}>Reset</button>
+                <button onClick={()=>{ setFormSecret(''); setFormSizeUsd('100'); setFormSymbol('BTCUSDT'); setFormSide('BUY') }}>Reset</button>
               </div>
             </div>
           </div>

@@ -44,5 +44,9 @@ button:hover{filter:brightness(1.05)}
 /* Table row hover */
 tr:hover td{background:linear-gradient(90deg, rgba(255,255,255,0.02), transparent)}
 
-/* Responsive */
-@media (max-width:900px){main{flex-direction:column}.right{width:100%}}
+/* Status colors */
+.status-open { color: #10b981; font-weight: 600 }
+.status-closed { color: #ef4444 }
+.status-signal { color: #f59e0b }
+.status-pending { color: #3b82f6 }
+.status-error { color: #dc2626 }

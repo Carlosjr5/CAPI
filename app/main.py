@@ -46,6 +46,7 @@ trades = sqlalchemy.Table(
     sqlalchemy.Column("signal", sqlalchemy.String),
     sqlalchemy.Column("symbol", sqlalchemy.String),
     sqlalchemy.Column("price", sqlalchemy.Float),
+    sqlalchemy.Column("size", sqlalchemy.Float),  # Add size column
     sqlalchemy.Column("status", sqlalchemy.String),  # placed, filled, rejected
     sqlalchemy.Column("response", sqlalchemy.Text),
     sqlalchemy.Column("created_at", sqlalchemy.Float),
@@ -153,7 +154,8 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     mapped_symbol = None
     try:
         # Query Bitget's public contracts for the productType
-        contracts_url = f"{BITGET_BASE}/api/mix/v1/market/contracts?productType={BITGET_PRODUCT_TYPE}"
+        product_type_for_query = "UMCBL" if BITGET_PRODUCT_TYPE == "SUMCBL" else BITGET_PRODUCT_TYPE
+        contracts_url = f"{BITGET_BASE}/api/mix/v1/market/contracts?productType={product_type_for_query}"
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get(contracts_url)
             if r.status_code == 200:
@@ -164,8 +166,8 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
                         raw = symbol.replace("BINANCE:", "").replace("/", "")
                         raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
                         raw_up = raw.upper()
-                        # For SUMCBL, add 'S' prefix before matching
-                        if BITGET_PRODUCT_TYPE == "SUMCBL":
+                        # For SUMCBL/UMCBL, add 'S' prefix before matching
+                        if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
                             raw_up = "S" + raw_up
                         # base coin (e.g. BTC from BTCUSDT)
                         base = raw_up.replace("USDT", "").replace("_", "").replace("S", "")
@@ -174,8 +176,8 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
                                 continue
                             s = (item.get("symbol") or "").upper()
                             display = (item.get("symbolDisplayName") or "").upper()
-                            # For SUMCBL, require exact match since ticker exists but orders might not
-                            if BITGET_PRODUCT_TYPE == "SUMCBL":
+                            # For SUMCBL/UMCBL, require exact match
+                            if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
                                 if raw_up == s:
                                     mapped_symbol = item.get("symbol")
                                     break
@@ -281,14 +283,11 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
         print(f"[bitget][error] {err}")
         return 400, json.dumps({"error": err})
 
-    # Try several candidate endpoints in case the API path varies by environment
-    # For SUMCBL, try different product types since SUMCBL may not support live orders
-    if BITGET_PRODUCT_TYPE == "SUMCBL":
-        # Try UMCBL for orders since SUMCBL exists for ticker but not for orders
+    # For SUMCBL/UMCBL, use plain endpoints since they don't support productType suffixes
+    if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
         candidates = [
             BITGET_BASE + "/api/v2/mix/order/place-order",
             BITGET_BASE + "/api/mix/v1/order/placeOrder",
-            BITGET_BASE + request_path + f"?productType={BITGET_PRODUCT_TYPE}",
             BITGET_BASE + request_path,
             BITGET_BASE + "/api/strategy/v1/trading-view/callback",
         ]
@@ -477,20 +476,17 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
         else:
             bitget_symbol = raw
 
-    # For SUMCBL (simulated contracts), Bitget expects symbols with 'S' prefix (e.g., SBTCSUSDT_SUMCBL)
-    # But for UMCBL orders, use regular symbols without 'S' prefix
-    if BITGET_PRODUCT_TYPE == "SUMCBL" and not bitget_symbol.startswith("S"):
-        # Extract base currency from symbol (e.g., BTC from BTCUSDT_SUMCBL)
-        base_match = re.match(r'([A-Z]+)USDT', bitget_symbol)
-        if base_match:
-            base = base_match.group(1)
-            bitget_symbol = f"S{base}USDT_SUMCBL"
+    # For SUMCBL/UMCBL (simulated/unilateral contracts), use plain symbols without suffix
+    if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
+        bitget_symbol = raw
+        if BITGET_PRODUCT_TYPE == "SUMCBL":
+            body_obj["productType"] = "UMCBL"  # Use UMCBL for SUMCBL orders
+    else:
+        # For other product types, append the product type if not present
+        if BITGET_PRODUCT_TYPE and not ("_" in raw and raw.upper().endswith(str(BITGET_PRODUCT_TYPE).upper())):
+            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
         else:
-            # Fallback: add 'S' prefix to the whole symbol before the suffix
-            if "_SUMCBL" in bitget_symbol:
-                bitget_symbol = bitget_symbol.replace("USDT_SUMCBL", "SUSDT_SUMCBL")
-            else:
-                bitget_symbol = f"S{bitget_symbol}"
+            bitget_symbol = raw
 
     body_obj = {
         "productType": BITGET_PRODUCT_TYPE,
@@ -687,6 +683,7 @@ async def debug_place_test(req: Request):
                 signal=signal,
                 symbol=symbol,
                 price=float(price_for_db) if price_for_db is not None else 0.0,
+                size=computed_size if computed_size is not None else 1.0,
                 status=simulated_status,
                 response=json.dumps(fake_resp),
                 created_at=now
@@ -1019,6 +1016,18 @@ async def startup():
     except Exception:
         pass
 
+    # One-way position system: ensure only one open position at a time
+    # Close all but the most recent 'placed' trade
+    try:
+        placed_trades = await database.fetch_all(trades.select().where(trades.c.status == "placed").order_by(trades.c.created_at.desc()))
+        if len(placed_trades) > 1:
+            # Close all except the first (most recent)
+            for t in placed_trades[1:]:
+                await database.execute(trades.update().where(trades.c.id == t.id).values(status="closed"))
+            print(f"[startup] Closed {len(placed_trades)-1} old open positions to maintain one-way system")
+    except Exception as e:
+        print(f"[startup] Error cleaning up positions: {e}")
+
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
@@ -1049,11 +1058,9 @@ async def webhook(req: Request):
             pass
         # else: allow anyway but note in logs (you can change this to reject)
     # Extract fields
+    event = payload.get("event")  # SIGNAL, ENTRY, EXIT
     signal = payload.get("signal") or payload.get("action") or ""
-    # If there's no explicit signal, fail loudly so misconfigured alerts are obvious.
-    if not signal:
-        # Return 400 so TradingView shows an error in the alert log and you can fix the alert message
-        raise HTTPException(status_code=400, detail="Missing required field: 'signal' (expected 'BUY' or 'SELL')")
+    trade_id_from_payload = payload.get("trade_id")
     symbol = payload.get("symbol") or payload.get("ticker") or ""
     price = payload.get("price")
 
@@ -1099,12 +1106,39 @@ async def webhook(req: Request):
     except Exception:
         pass
 
-    # Save incoming alert to DB as pending (use discovered price when available)
-    trade_id = str(uuid.uuid4())
     now = time.time()
+
+    if event == "SIGNAL":
+        # Just log the signal, no order placement
+        trade_id = trade_id_from_payload or str(uuid.uuid4())
+        await database.execute(trades.insert().values(
+            id=trade_id, signal=signal, symbol=symbol, price=price_for_db,
+            size=0.0, status="signal", response="", created_at=now
+        ))
+        await broadcast({"type":"signal","id":trade_id,"signal":signal,"symbol":symbol,"price":price, "at":now})
+        return {"ok": True, "id": trade_id, "note": "signal logged"}
+
+    elif event == "EXIT":
+        # Close the specific trade
+        if trade_id_from_payload:
+            await database.execute(trades.update().where(trades.c.id == trade_id_from_payload).values(status="closed"))
+            await broadcast({"type":"closed","id":trade_id_from_payload})
+        return {"ok": True, "note": "exit processed"}
+
+    # For ENTRY or default (backward compatibility)
+    # Close any existing open positions (one-way system)
+    await database.execute(trades.update().where(trades.c.status == "placed").values(status="closed"))
+
+    # If there's no explicit signal, fail loudly so misconfigured alerts are obvious.
+    if not signal:
+        # Return 400 so TradingView shows an error in the alert log and you can fix the alert message
+        raise HTTPException(status_code=400, detail="Missing required field: 'signal' (expected 'BUY' or 'SELL')")
+
+    # Save incoming alert to DB as pending (use discovered price when available)
+    trade_id = trade_id_from_payload or str(uuid.uuid4())
     await database.execute(trades.insert().values(
         id=trade_id, signal=signal, symbol=symbol, price=price_for_db,
-        status="received", response="", created_at=now
+        size=computed_size if computed_size is not None else 1.0, status="received", response="", created_at=now
     ))
     try:
         print(f"[webhook] inserted pending trade id={trade_id} price={price_for_db}")
@@ -1150,6 +1184,12 @@ async def webhook(req: Request):
 async def list_trades():
     rows = await database.fetch_all(trades.select().order_by(trades.c.created_at.desc()))
     return [dict(r) for r in rows]
+
+@app.get("/price/{symbol}")
+async def get_price(symbol: str):
+    """Get current market price for a symbol."""
+    price = await get_market_price_with_retries(symbol)
+    return {"symbol": symbol, "price": price}
 
 # Simple WebSocket endpoint for frontend live updates
 @app.websocket("/ws")
