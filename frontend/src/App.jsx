@@ -42,12 +42,17 @@ export default function App(){
       const apiBase = getApiBase()
       const res = await fetch((apiBase || '') + '/trades')
       const data = await res.json()
-      setTrades(data)
+      const sorted = Array.isArray(data) ? [...data].sort((a,b)=>((b?.created_at||0) - (a?.created_at||0))) : []
+      setTrades(sorted)
       // Fetch prices for open positions
-      await fetchPricesForOpenPositions(data)
+      await fetchPricesForOpenPositions(sorted)
     }catch(e){
       console.error(e)
     }
+  }
+
+  async function fetchPricesForOpenPositions(tradesData){
+    await updatePricesOnly(tradesData)
   }
 
   async function updatePricesOnly(tradesData){
@@ -133,6 +138,21 @@ export default function App(){
     while(el.children.length>50) el.removeChild(el.lastChild)
   }
 
+  const openTrades = trades.filter(t => mapStatus(t.status) === 'open')
+  const latestOpenTrade = openTrades.length ? openTrades[0] : null
+  const latestOpenIndex = trades.findIndex(t => mapStatus(t.status) === 'open')
+  let lastClosedTrade = null
+  if(latestOpenIndex !== -1){
+    for(let i = latestOpenIndex + 1; i < trades.length; i++){
+      if(mapStatus(trades[i].status) === 'closed'){
+        lastClosedTrade = trades[i]
+        break
+      }
+    }
+  }else{
+    lastClosedTrade = trades.find(t => mapStatus(t.status) === 'closed') || null
+  }
+
   const counts = trades.reduce((acc, t)=>{ const k = mapStatus(t.status); acc[k] = (acc[k]||0)+1; acc.total++; return acc }, {open:0, closed:0, other:0, total:0})
 
   const pieData = {
@@ -154,28 +174,46 @@ export default function App(){
             <div className="kpi"><div className="label">Total</div><div className="value">{counts.total}</div></div>
           </div>
 
-          {counts.open > 0 && (
+          {latestOpenTrade && (
             <div className="card">
               <h3>Current Position</h3>
-              {trades.filter(t => mapStatus(t.status) === 'open').map(t => {
-                const pnl = calculatePnL(t)
+              {(() => {
+                const pnl = calculatePnL(latestOpenTrade)
                 const pnlColor = pnl > 0 ? '#10b981' : pnl < 0 ? '#ef4444' : '#94a3b8'
                 const pnlText = pnl !== null ? `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}` : 'Loading...'
                 return (
-                  <div key={t.id} style={{padding:8, border:'1px solid #ccc', marginBottom:4, borderRadius:4}}>
+                  <div style={{padding:8, border:'1px solid #ccc', borderRadius:4}}>
                     <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
                       <div>
-                        <strong>{t.signal}</strong> {t.symbol} at ${Number(t.price).toFixed(2)}
+                        <strong>{latestOpenTrade.signal}</strong> {latestOpenTrade.symbol} at ${latestOpenTrade.price != null ? Number(latestOpenTrade.price).toFixed(2) : '-'}
                       </div>
                       <div style={{color: pnlColor, fontWeight: 'bold', fontSize: '1.1em'}}>
                         {pnlText}
                       </div>
                     </div>
-                    <div className="muted">Opened: {new Date(t.created_at*1000).toLocaleString()}</div>
-                    <div className="muted">ID: {t.id.slice(0,8)}...</div>
+                    <div className="muted">Opened: {new Date(latestOpenTrade.created_at*1000).toLocaleString()}</div>
+                    <div className="muted">ID: {latestOpenTrade.id.slice(0,8)}...</div>
                   </div>
                 )
-              })}
+              })()}
+            </div>
+          )}
+
+          {lastClosedTrade && (
+            <div className="card">
+              <h3>Previous Position</h3>
+              <div style={{padding:8, border:'1px solid #ccc', borderRadius:4}}>
+                <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                  <div>
+                    <strong>{lastClosedTrade.signal}</strong> {lastClosedTrade.symbol} at ${lastClosedTrade.price != null ? Number(lastClosedTrade.price).toFixed(2) : '-'}
+                  </div>
+                  <div style={{textTransform:'uppercase', color:'#94a3b8', fontWeight:700}}>
+                    {lastClosedTrade.status ? String(lastClosedTrade.status).toUpperCase() : 'UNKNOWN'}
+                  </div>
+                </div>
+                <div className="muted">Closed: {new Date(lastClosedTrade.created_at*1000).toLocaleString()}</div>
+                <div className="muted">ID: {lastClosedTrade.id.slice(0,8)}...</div>
+              </div>
             </div>
           )}
 

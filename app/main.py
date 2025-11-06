@@ -7,7 +7,7 @@ import base64
 import json
 import uuid
 import asyncio
-from typing import List
+from typing import List, Tuple, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -132,6 +132,56 @@ async def broadcast(event: dict):
     # refresh list
     connected_websockets[:] = living
 
+
+def normalize_signal_payload(payload: dict) -> Tuple[str, str, str, str]:
+    """Return (event, signal_label, order_side, side_hint) derived from payload."""
+    event = str(payload.get("event") or "").upper()
+    raw_signal = str(payload.get("signal") or payload.get("action") or "").upper()
+    side_hint = str(payload.get("side") or "").upper()
+
+    signal = raw_signal
+    if not signal:
+        if event in ("BUY", "SELL"):
+            signal = event
+        elif event in ("LONG", "SHORT"):
+            signal = "BUY" if event == "LONG" else "SELL"
+
+    if not signal:
+        if side_hint in ("LONG", "BUY"):
+            signal = "BUY"
+        elif side_hint in ("SHORT", "SELL"):
+            signal = "SELL"
+
+    order_side = ""
+    if signal == "BUY":
+        order_side = "buy"
+    elif signal == "SELL":
+        order_side = "sell"
+
+    return event, signal, order_side, side_hint
+
+
+def normalize_position_mode(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return value
+    v = str(value).strip().lower()
+    if v in ("single", "single_hold", "one-way", "one_way", "oneway", "unilateral"):
+        return "single"
+    if v in ("hedge", "double", "double_hold", "dual"):
+        return "hedge"
+    return value
+
+
+def normalize_position_type(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return value
+    v = str(value).strip().lower()
+    if v in ("single", "single_hold", "one-way", "one_way", "oneway", "unilateral"):
+        return "single_hold"
+    if v in ("hedge", "double", "double_hold", "dual"):
+        return "double_hold"
+    return value
+
 # Bitget signature (per docs): timestamp + method + requestPath + [ '?' + queryString ] + body
 def build_signature(timestamp: str, method: str, request_path: str, body: str, secret: str):
     payload = f"{timestamp}{method.upper()}{request_path}{body}"
@@ -165,32 +215,21 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     side_key = side.lower()
     body_obj["side"] = side_key
 
-    # For unilateral products (UMCBL), don't add position-related fields at all
-    # This avoids the "unilateral position type" error
-    if BITGET_PRODUCT_TYPE not in ("SUMCBL", "UMCBL"):
-        # Optional: include position mode if set via env. Bitget accounts can be one-way (unilateral)
-        # or hedged. If your account is in unilateral mode and Bitget expects a matching order field,
-        # set BITGET_POSITION_MODE in Railway (try 'single' or the value shown in Bitget docs) — this
-        # will add a "positionMode" key to the order payload.
-        if BITGET_POSITION_MODE:
-            body_obj["positionMode"] = BITGET_POSITION_MODE
+    # Optional: include position hints when configured. Respect any values set by construct_bitget_payload.
+    if BITGET_POSITION_MODE and "positionMode" not in body_obj:
+        body_obj["positionMode"] = normalize_position_mode(BITGET_POSITION_MODE)
 
-        # Include a position side (long/short). Prefer explicit env var, otherwise map from order side.
-        if BITGET_POSITION_SIDE:
-            body_obj["positionSide"] = BITGET_POSITION_SIDE
-        else:
-            try:
-                inferred = "long" if side_key == "buy" else "short"
-                body_obj["positionSide"] = inferred
-            except Exception:
-                pass
+    if BITGET_POSITION_SIDE and "positionSide" not in body_obj:
+        body_obj["positionSide"] = BITGET_POSITION_SIDE
+    elif "positionSide" not in body_obj:
+        try:
+            inferred = "long" if side_key == "buy" else "short"
+            body_obj["positionSide"] = inferred
+        except Exception:
+            pass
 
-        # Some Bitget APIs accept a 'positionType' field; however some accounts expect
-        # 'positionSide' + 'positionMode' instead. Only include positionType when it's
-        # explicitly set to a non-unilateral value to avoid sending 'unilateral' which
-        # some API versions reject as used here.
-        if BITGET_POSITION_TYPE and str(BITGET_POSITION_TYPE).lower() not in ("unilateral", "one-way"):
-            body_obj["positionType"] = BITGET_POSITION_TYPE
+    if BITGET_POSITION_TYPE and "positionType" not in body_obj:
+        body_obj["positionType"] = normalize_position_type(BITGET_POSITION_TYPE)
 
     body = json.dumps(body_obj, separators=(',', ':'))  # compact body
     # If dry-run is enabled, don't call Bitget — return a simulated successful response
@@ -225,9 +264,9 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # For SUMCBL/UMCBL, use plain endpoints since they don't support productType suffixes
     if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
         candidates = [
-            BITGET_BASE + "/api/strategy/v1/trading-view/callback",
-            BITGET_BASE + "/api/v2/mix/order/place-order",
             BITGET_BASE + request_path,
+            BITGET_BASE + "/api/v2/mix/order/place-order",
+            BITGET_BASE + "/api/strategy/v1/trading-view/callback",
         ]
     else:
         candidates = [
@@ -405,26 +444,59 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     # remove dots and any characters except letters, digits and underscore
     raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
     
+    # Resolve margin coin defaults per product type. Bitget demo markets expect
+    # USDT for UMCBL and SUSDT for SUMCBL unless explicitly overridden.
+    margin_coin_env = (BITGET_MARGIN_COIN or "").strip()
+    pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
+
+    # SUMCBL demo alerts ultimately trade on the UMCBL contract. Normalize both the
+    # product type and margin coin so Bitget accepts the order.
+    if pt_upper == "SUMCBL":
+        local_product = "UMCBL"
+    else:
+        local_product = pt_upper
+
+    use_margin_coin = margin_coin_env
+    if local_product == "UMCBL":
+        if not use_margin_coin or use_margin_coin.upper() != "USDT":
+            use_margin_coin = "USDT"
+    elif not use_margin_coin:
+        use_margin_coin = "USDT"
+
     # Initialize body_obj with default values - use the working parameters from debug_order.py
     body_obj = {
-        "productType": BITGET_PRODUCT_TYPE,
+    "productType": local_product or BITGET_PRODUCT_TYPE,
         "symbol": "",  # Will be set below
         "orderType": "market",
         "size": str(size) if size is not None else "0.001",  # Smaller default size like debug script
-        "marginCoin": BITGET_MARGIN_COIN,
+        "marginCoin": use_margin_coin,
         "marginMode": "crossed",  # Use crossed like the working debug script
         "clientOid": "test123"  # Fixed clientOid like debug script
     }
+
+    # Attach positional hints when available; Bitget expects explicit unilateral fields in
+    # one-way accounts. Provide sensible defaults for SUMCBL/UMCBL if env vars are missing.
+    default_position_type = normalize_position_type(BITGET_POSITION_TYPE)
+    if not default_position_type and BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
+        default_position_type = "single_hold"
+    if default_position_type:
+        body_obj["positionType"] = default_position_type
+
+    normalized_mode = normalize_position_mode(BITGET_POSITION_MODE)
+    if normalized_mode:
+        body_obj["positionMode"] = normalized_mode
+    elif BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
+        body_obj["positionMode"] = "single"
 
     # Add price for limit orders (not needed for market orders)
     # if body_obj["orderType"] == "limit" and price is not None:
     #     body_obj["price"] = str(price)
 
     # Determine the symbol
-    if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
+    if pt_upper in ("SUMCBL", "UMCBL"):
+        # Bitget expects plain symbol (e.g. BTCUSDT) with productType set separately for mix futures.
         bitget_symbol = raw
-        if BITGET_PRODUCT_TYPE == "SUMCBL":
-            body_obj["productType"] = "UMCBL"  # Use UMCBL for SUMCBL orders
+        body_obj["productType"] = local_product or "UMCBL"
     else:
         # For other product types, check if suffix is already present
         if BITGET_PRODUCT_TYPE and ("_" in raw and raw.upper().endswith(str(BITGET_PRODUCT_TYPE).upper())):
@@ -449,7 +521,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     else:
         body_obj["side"] = side_key
 
-    # positionSide inference - always include for unilateral products
+    # positionSide inference - include long/short hint unless explicitly overridden
     if BITGET_POSITION_SIDE:
         body_obj["positionSide"] = BITGET_POSITION_SIDE
     else:
@@ -459,15 +531,12 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
         except Exception:
             pass
 
-    # Remove positionType and positionMode for unilateral products - they may be causing conflicts
-    # Let the API determine the correct position handling based on side and productType
+    # Provide explicit Bitget one-way hints when dealing with SUMCBL/UMCBL contracts.
     if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
-        if "positionType" in body_obj:
-            del body_obj["positionType"]
-        if "positionMode" in body_obj:
-            del body_obj["positionMode"]
-        if "positionSide" in body_obj:
-            del body_obj["positionSide"]
+        if "posMode" not in body_obj:
+            body_obj["posMode"] = "single"
+        if "holdSide" not in body_obj:
+            body_obj["holdSide"] = "long" if side_key == "buy" else "short"
 
     return body_obj
 
@@ -484,7 +553,7 @@ async def debug_payload(req: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Payload must be JSON")
 
-    signal = payload.get("signal") or payload.get("action") or ""
+    _event, signal, side, _ = normalize_signal_payload(payload)
     symbol = payload.get("symbol") or payload.get("ticker") or ""
     price = payload.get("price")
     # support both explicit size and USD-based size (mirrors /webhook behavior)
@@ -514,11 +583,10 @@ async def debug_payload(req: Request):
             computed_size = None
 
     # Map signal to side
-    if signal and str(signal).upper() in ("BUY", "LONG"):
-        side = "buy"
-    elif signal and str(signal).upper() in ("SELL", "SHORT"):
-        side = "sell"
-    else:
+    if not signal:
+        raise HTTPException(status_code=400, detail="Unknown signal; must be BUY or SELL")
+
+    if not side:
         raise HTTPException(status_code=400, detail="Unknown signal; must be BUY or SELL")
 
     # prefer computed_size (from size_usd) when provided so debug mirrors webhook
@@ -551,18 +619,22 @@ async def debug_place_test(req: Request):
     
 
     # extract order params (defaults useful small test)
-    signal = payload.get("signal") or payload.get("action") or "BUY"
+    event, signal, side, _ = normalize_signal_payload(payload)
+    if not signal:
+        signal = "BUY"
     symbol = payload.get("symbol") or payload.get("ticker") or "BTCUSDT"
     price = payload.get("price") or None
     size = payload.get("size")
     size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
 
-    # determine side
-    if signal and str(signal).upper() in ("BUY", "LONG"):
-        side = "buy"
-    elif signal and str(signal).upper() in ("SELL", "SHORT"):
-        side = "sell"
-    else:
+    # determine side from normalized payload
+    if not side:
+        if signal and str(signal).upper() in ("BUY", "LONG"):
+            side = "buy"
+        elif signal and str(signal).upper() in ("SELL", "SHORT"):
+            side = "sell"
+
+    if not side:
         raise HTTPException(status_code=400, detail="Unknown signal; must be BUY or SELL")
 
     # compute size from size_usd if provided
@@ -693,7 +765,10 @@ async def debug_place_test(req: Request):
 
         # Insert the trade into database regardless of success/failure
         trade_id = str(uuid.uuid4())
-        trade_status = "placed" if status_code == 200 and not (parsed and parsed.get('code') and str(parsed.get('code')) != '00000') else "error"
+        bitget_code = None
+        if isinstance(parsed, dict):
+            bitget_code = parsed.get('code') or parsed.get('status')
+        trade_status = "placed" if status_code == 200 and not (bitget_code and str(bitget_code) != '00000') else "error"
         try:
             await database.execute(trades.insert().values(
                 id=trade_id,
@@ -707,7 +782,7 @@ async def debug_place_test(req: Request):
             ))
             # Broadcast the placed event to connected frontends
             await broadcast({
-                "type": "placed",
+                "type": "placed" if trade_status == "placed" else "error",
                 "id": trade_id,
                 "status_code": status_code,
                 "response": parsed,
@@ -1164,19 +1239,35 @@ async def webhook(req: Request):
         # pass computed_size (or None) to place_demo_order; that function will fall back to "1" if None
         status_code, resp_text = await place_demo_order(symbol=symbol, side=side, price=price, size=computed_size)
 
+        parsed_resp = None
+        try:
+            parsed_resp = json.loads(resp_text) if resp_text else None
+        except Exception:
+            parsed_resp = {"raw": resp_text}
+
+        bitget_code = None
+        if isinstance(parsed_resp, dict):
+            bitget_code = parsed_resp.get("code") or parsed_resp.get("status")
+
+        is_success = status_code == 200 and (not bitget_code or str(bitget_code) == "00000")
+        new_status = "placed" if is_success else "error"
+
         # Update stored trade with the Bitget response
-        await database.execute(trades.update().where(trades.c.id==trade_id).values(status="placed", response=resp_text))
+        await database.execute(trades.update().where(trades.c.id==trade_id).values(status=new_status, response=resp_text))
 
         # Include the price we persisted earlier so the frontend sees the market price
         await broadcast({
-            "type": "placed",
+            "type": "placed" if is_success else "error",
             "id": trade_id,
             "status_code": status_code,
-            "response": json.loads(resp_text) if resp_text else resp_text,
+            "response": parsed_resp,
             "price": float(price_for_db) if 'price_for_db' in locals() and price_for_db is not None else None
         })
 
-        return {"ok": True, "id": trade_id, "status_code": status_code, "response": resp_text}
+        if not is_success:
+            return {"ok": False, "id": trade_id, "status_code": status_code, "response": parsed_resp}
+
+        return {"ok": True, "id": trade_id, "status_code": status_code, "response": parsed_resp}
     except Exception as e:
         await database.execute(trades.update().where(trades.c.id==trade_id).values(status="error", response=str(e)))
         await broadcast({"type": "error", "id": trade_id, "error": str(e)})
