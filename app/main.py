@@ -7,9 +7,11 @@ import base64
 import json
 import uuid
 import asyncio
-from typing import List, Tuple, Optional
+import secrets
+from datetime import datetime, timedelta
+from typing import List, Tuple, Optional, Dict
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +20,11 @@ import re
 from urllib.parse import urlparse
 import httpx
 import sqlalchemy
+from sqlalchemy import text
 from databases import Database
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+import jwt
 
 load_dotenv()
 
@@ -35,6 +41,167 @@ BITGET_POSITION_TYPE = os.getenv("BITGET_POSITION_TYPE")  # optional: try values
 BITGET_POSITION_SIDE = os.getenv("BITGET_POSITION_SIDE")  # optional: explicit position side e.g. 'long' or 'short'
 BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN", "1")
 
+DEFAULT_LEVERAGE_RAW = os.getenv("DEFAULT_LEVERAGE")
+try:
+    DEFAULT_LEVERAGE = float(DEFAULT_LEVERAGE_RAW) if DEFAULT_LEVERAGE_RAW not in (None, "") else None
+except ValueError:
+    print(f"[startup] DEFAULT_LEVERAGE is not a number: {DEFAULT_LEVERAGE_RAW}")
+    DEFAULT_LEVERAGE = None
+
+# Authentication configuration
+AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY") or secrets.token_urlsafe(32)
+AUTH_ALGORITHM = "HS256"
+AUTH_TOKEN_EXPIRE_MINUTES = int(os.getenv("AUTH_TOKEN_EXPIRE_MINUTES", "1440"))
+
+USERS: Dict[str, Dict[str, str]] = {}
+raw_users = os.getenv("DASHBOARD_USERS")
+if raw_users:
+    try:
+        parsed_users = json.loads(raw_users)
+        if isinstance(parsed_users, dict):
+            for username, info in parsed_users.items():
+                if isinstance(info, dict) and "password" in info and "role" in info:
+                    USERS[username] = {"password": info["password"], "role": info["role"]}
+    except Exception as e:
+        print(f"[auth] Failed to parse DASHBOARD_USERS: {e}")
+
+admin_username = os.getenv("ADMIN_USERNAME")
+admin_password = os.getenv("ADMIN_PASSWORD")
+if admin_username and admin_password:
+    USERS[admin_username] = {"password": admin_password, "role": "admin"}
+
+user_username = os.getenv("USER_USERNAME")
+user_password = os.getenv("USER_PASSWORD")
+if user_username and user_password:
+    USERS[user_username] = {"password": user_password, "role": "user"}
+
+if not USERS:
+    print("[auth] Warning: no dashboard users configured. UI authentication will fail until users are defined.")
+
+security = HTTPBearer(auto_error=False)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    role: str
+    username: str
+
+
+class UserInfo(BaseModel):
+    username: str
+    role: str
+
+
+def safe_float(value) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_leverage_from_payload(payload: Optional[Dict[str, object]]) -> Optional[float]:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("leverage", "lev", "leverage_x", "leverageX", "leverageMultiplier"):
+        val = safe_float(payload.get(key)) if key in payload else None
+        if val is not None:
+            return val
+    return None
+
+
+def resolve_leverage(payload: Optional[Dict[str, object]]) -> Optional[float]:
+    payload_leverage = extract_leverage_from_payload(payload)
+    if payload_leverage is not None:
+        return payload_leverage
+    return DEFAULT_LEVERAGE
+
+
+def compute_size_usd(size_value: Optional[float], price_value: Optional[float], provided_size_usd: Optional[float]) -> Optional[float]:
+    provided = safe_float(provided_size_usd)
+    if provided is not None:
+        return provided
+    if size_value is not None and price_value is not None:
+        try:
+            return float(size_value) * float(price_value)
+        except Exception:
+            return None
+    return None
+
+
+def resolve_trade_dimensions(price_value, computed_size, explicit_size, provided_size_usd, payload):
+    size_value = computed_size if computed_size is not None else safe_float(explicit_size)
+    if size_value is None:
+        size_value = 0.0
+    price_numeric = safe_float(price_value)
+    leverage_value = resolve_leverage(payload)
+    size_usd_numeric = compute_size_usd(size_value, price_numeric, provided_size_usd)
+    return size_value, size_usd_numeric, leverage_value, price_numeric
+
+
+def verify_password(plain_password: str, stored_password: str) -> bool:
+    try:
+        return secrets.compare_digest(str(plain_password), str(stored_password))
+    except Exception:
+        return False
+
+
+def authenticate_user(username: str, password: str) -> Optional[Dict[str, str]]:
+    user = USERS.get(username)
+    if not user:
+        return None
+    if not verify_password(password, user.get("password", "")):
+        return None
+    return {"username": username, "role": user.get("role", "user")}
+
+
+def create_access_token(subject: str, role: str, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = {"sub": subject, "role": role}
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=AUTH_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, AUTH_SECRET_KEY, algorithm=AUTH_ALGORITHM)
+
+
+def decode_token(token: str) -> Dict[str, str]:
+    try:
+        payload = jwt.decode(token, AUTH_SECRET_KEY, algorithms=[AUTH_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, str]:
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = credentials.credentials
+    payload = decode_token(token)
+    username = payload.get("sub")
+    role = payload.get("role")
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    user = USERS.get(username)
+    if not user:
+        raise HTTPException(status_code=401, detail="User no longer exists")
+    return {"username": username, "role": role or user.get("role", "user")}
+
+
+def require_role(allowed_roles: List[str]):
+    async def checker(current_user: Dict[str, str] = Depends(get_current_user)) -> Dict[str, str]:
+        if current_user.get("role") not in allowed_roles:
+            raise HTTPException(status_code=403, detail="Insufficient permissions")
+        return current_user
+
+    return checker
+
 # DB (sqlite)
 DATABASE_URL = "sqlite:///./trades.db"
 database = Database(DATABASE_URL)
@@ -47,6 +214,8 @@ trades = sqlalchemy.Table(
     sqlalchemy.Column("symbol", sqlalchemy.String),
     sqlalchemy.Column("price", sqlalchemy.Float),
     sqlalchemy.Column("size", sqlalchemy.Float),  # Add size column
+    sqlalchemy.Column("size_usd", sqlalchemy.Float),
+    sqlalchemy.Column("leverage", sqlalchemy.Float),
     sqlalchemy.Column("status", sqlalchemy.String),  # placed, filled, rejected
     sqlalchemy.Column("response", sqlalchemy.Text),
     sqlalchemy.Column("created_at", sqlalchemy.Float),
@@ -55,6 +224,22 @@ engine = sqlalchemy.create_engine(
     DATABASE_URL, connect_args={"check_same_thread": False}
 )
 metadata.create_all(engine)
+
+
+def ensure_trade_table_columns():
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("PRAGMA table_info(trades)")).fetchall()
+            existing = {row[1] for row in rows}
+            if "size_usd" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN size_usd REAL"))
+            if "leverage" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN leverage REAL"))
+    except Exception as exc:
+        try:
+            print(f"[startup] failed to ensure trades table columns: {exc}")
+        except Exception:
+            pass
 
 app = FastAPI()
 # Allow CORS from local dev servers (React/Vite) and deployed frontend.
@@ -83,7 +268,21 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
-connected_websockets: List[WebSocket] = []
+connected_websockets: List[Dict[str, object]] = []
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+async def login(request: LoginRequest):
+    user = authenticate_user(request.username, request.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token(user["username"], user["role"])
+    return TokenResponse(access_token=token, role=user["role"], username=user["username"])
+
+
+@app.get("/auth/me", response_model=UserInfo)
+async def read_current_user(current_user: Dict[str, str] = Depends(get_current_user)):
+    return UserInfo(username=current_user["username"], role=current_user.get("role", "user"))
 
 # Serve the frontend from the `static` folder. Index is available at '/'.
 # Ensure the static directory exists at runtime so the app doesn't crash if the build
@@ -123,13 +322,15 @@ async def root_index():
 # helper: send message to all connected frontends
 async def broadcast(event: dict):
     living = []
-    for ws in connected_websockets:
+    for client in connected_websockets:
+        ws = client.get("ws")
+        if not ws:
+            continue
         try:
             await ws.send_text(json.dumps(event))
-            living.append(ws)
+            living.append(client)
         except Exception:
             pass
-    # refresh list
     connected_websockets[:] = living
 
 
@@ -544,7 +745,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
 
 
 @app.post("/debug/payload")
-async def debug_payload(req: Request):
+async def debug_payload(req: Request, _: Dict[str, str] = Depends(require_role(["admin"]))):
     """Return the Bitget payload that would be sent for a TradingView alert.
     Accepts the same JSON body as `/webhook` (signal, symbol, price, size).
     This endpoint never sends anything to Bitget.
@@ -597,7 +798,7 @@ async def debug_payload(req: Request):
 
 
 @app.post("/debug/place-test")
-async def debug_place_test(req: Request):
+async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_role(["admin"]))):
     """Protected endpoint to place a small test/demo order using configured Bitget credentials.
     Requires TRADINGVIEW_SECRET to be provided either in the Tradingview-Secret header or as `secret` in the JSON body.
     For safety, this endpoint will refuse to place orders if BITGET_DRY_RUN is enabled. It returns the Bitget response.
@@ -674,6 +875,16 @@ async def debug_place_test(req: Request):
             if not price_for_db:
                 raise HTTPException(status_code=400, detail="Unable to fetch market price for symbol; include price or try again")
 
+    trade_size_value, trade_size_usd_value, leverage_value, price_numeric = resolve_trade_dimensions(
+        price_for_db,
+        computed_size,
+        size,
+        size_usd,
+        payload,
+    )
+    if price_numeric is None:
+        price_numeric = safe_float(price_for_db)
+
     # If dry-run is enabled, simulate placing an order by inserting a DB row
     if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
         # Construct the payload for reporting and the simulated response
@@ -687,20 +898,8 @@ async def debug_place_test(req: Request):
         trade_id = str(uuid.uuid4())
         now = time.time()
         simulated_status = "placed"
-        # If caller did not provide an explicit price, use the fetched_price (if any)
-        # or attempt to fetch one now. If we cannot fetch a market price, return an error
-        # so the UI doesn't show 0.0 and the caller can retry.
-        price_for_db = price
-        if not price_for_db:
-            if fetched_price:
-                price_for_db = fetched_price
-            else:
-                # attempt to fetch a reliable market price now
-                price_for_db = await get_market_price_with_retries(symbol)
-                if not price_for_db:
-                    raise HTTPException(status_code=502, detail="Unable to fetch market price for symbol; try again")
         try:
-            print(f"[debug/place-test] computed market price p={locals().get('p', None)} price={price} price_for_db={price_for_db}")
+            print(f"[debug/place-test] resolved price price={price} resolved_price={price_numeric}")
         except Exception:
             pass
         try:
@@ -708,18 +907,29 @@ async def debug_place_test(req: Request):
                 id=trade_id,
                 signal=signal,
                 symbol=symbol,
-                price=float(price_for_db) if price_for_db is not None else 0.0,
-                size=computed_size if computed_size is not None else 1.0,
+                price=float(price_numeric) if price_numeric is not None else 0.0,
+                size=trade_size_value,
+                size_usd=trade_size_usd_value,
+                leverage=leverage_value,
                 status=simulated_status,
                 response=json.dumps(fake_resp),
                 created_at=now
             ))
             try:
-                print(f"[debug/place-test] inserting trade id={trade_id} price={price_for_db}")
+                print(f"[debug/place-test] inserting trade id={trade_id} price={price_numeric}")
             except Exception:
                 pass
             # Broadcast the simulated placed event to connected frontends
-            await broadcast({"type": "placed", "id": trade_id, "status_code": 200, "response": fake_resp, "price": float(price_for_db) if price_for_db is not None else None})
+            await broadcast({
+                "type": "placed",
+                "id": trade_id,
+                "status_code": 200,
+                "response": fake_resp,
+                "price": float(price_numeric) if price_numeric is not None else None,
+                "size": trade_size_value,
+                "size_usd": trade_size_usd_value,
+                "leverage": leverage_value,
+            })
         except Exception as e:
             # Fall back to returning simulated response even if DB write failed
             print(f"[debug/place-test] failed to write simulated trade to DB: {e}")
@@ -730,7 +940,7 @@ async def debug_place_test(req: Request):
             "note": "BITGET_DRY_RUN is enabled — simulated order created locally",
             "orderId": fake_resp["data"]["orderId"],
             "trade_id": trade_id,
-            "price": float(price_for_db) if price_for_db is not None else None,
+            "price": float(price_numeric) if price_numeric is not None else None,
             "response": fake_resp,
             "payload": constructed_payload,
         }
@@ -776,8 +986,10 @@ async def debug_place_test(req: Request):
                 id=trade_id,
                 signal=signal,
                 symbol=symbol,
-                price=float(price_for_db) if price_for_db is not None else 0.0,
-                size=computed_size if computed_size is not None else 1.0,
+                price=float(price_numeric) if price_numeric is not None else 0.0,
+                size=trade_size_value,
+                size_usd=trade_size_usd_value,
+                leverage=leverage_value,
                 status=trade_status,
                 response=resp_text,
                 created_at=time.time()
@@ -788,7 +1000,10 @@ async def debug_place_test(req: Request):
                 "id": trade_id,
                 "status_code": status_code,
                 "response": parsed,
-                "price": float(price_for_db) if price_for_db is not None else None
+                "price": float(price_numeric) if price_numeric is not None else None,
+                "size": trade_size_value,
+                "size_usd": trade_size_usd_value,
+                "leverage": leverage_value,
             })
         except Exception as e:
             print(f"[debug/place-test] failed to write trade to DB: {e}")
@@ -810,7 +1025,7 @@ async def debug_place_test(req: Request):
 
 
 @app.post("/debug/order-status")
-async def debug_order_status(req: Request):
+async def debug_order_status(req: Request, _: Dict[str, str] = Depends(require_role(["admin"]))):
     """Query Bitget for an order's details by orderId.
     Accepts JSON { secret, orderId, symbol? } and returns Bitget's response.
     The endpoint prefers the Tradingview-Secret header if provided.
@@ -1056,6 +1271,7 @@ async def debug_check_creds():
 @app.on_event("startup")
 async def startup():
     await database.connect()
+    ensure_trade_table_columns()
     
     # Check if database schema needs migration (simple check for size column)
     try:
@@ -1197,12 +1413,30 @@ async def webhook(req: Request):
 
     now = time.time()
 
+    trade_size_value, trade_size_usd_value, leverage_value, price_numeric = resolve_trade_dimensions(
+        price_for_db,
+        computed_size,
+        size,
+        size_usd,
+        payload,
+    )
+    if price_numeric is None:
+        price_numeric = safe_float(price_for_db)
+
     if event == "SIGNAL":
         # Just log the signal, no order placement
         trade_id = trade_id_from_payload or str(uuid.uuid4())
         await database.execute(trades.insert().values(
-            id=trade_id, signal=signal, symbol=symbol, price=price_for_db,
-            size=0.0, status="signal", response="", created_at=now
+            id=trade_id,
+            signal=signal,
+            symbol=symbol,
+            price=float(price_numeric) if price_numeric is not None else 0.0,
+            size=trade_size_value,
+            size_usd=trade_size_usd_value,
+            leverage=leverage_value,
+            status="signal",
+            response="",
+            created_at=now
         ))
         await broadcast({"type":"signal","id":trade_id,"signal":signal,"symbol":symbol,"price":price, "at":now})
         return {"ok": True, "id": trade_id, "note": "signal logged"}
@@ -1216,7 +1450,16 @@ async def webhook(req: Request):
 
     # For ENTRY or default (backward compatibility)
     # Close any existing open positions (one-way system)
+    try:
+        closing_rows = await database.fetch_all(sqlalchemy.select(trades.c.id).where(trades.c.status == "placed"))
+    except Exception:
+        closing_rows = []
     await database.execute(trades.update().where(trades.c.status == "placed").values(status="closed"))
+    for row in closing_rows:
+        try:
+            await broadcast({"type": "closed", "id": row["id"], "reason": "rotation"})
+        except Exception:
+            pass
 
     # If there's no explicit signal, fail loudly so misconfigured alerts are obvious.
     if not signal:
@@ -1226,15 +1469,33 @@ async def webhook(req: Request):
     # Save incoming alert to DB as pending (use discovered price when available)
     trade_id = trade_id_from_payload or str(uuid.uuid4())
     await database.execute(trades.insert().values(
-        id=trade_id, signal=signal, symbol=symbol, price=price_for_db,
-        size=computed_size if computed_size is not None else 1.0, status="received", response="", created_at=now
+        id=trade_id,
+        signal=signal,
+        symbol=symbol,
+        price=float(price_numeric) if price_numeric is not None else 0.0,
+        size=trade_size_value,
+        size_usd=trade_size_usd_value,
+        leverage=leverage_value,
+        status="received",
+        response="",
+        created_at=now
     ))
     try:
         print(f"[webhook] inserted pending trade id={trade_id} price={price_for_db}")
     except Exception:
         pass
     # Broadcast received alert
-    await broadcast({"type":"received","id":trade_id,"signal":signal,"symbol":symbol,"price":price, "at":now})
+    await broadcast({
+        "type": "received",
+        "id": trade_id,
+        "signal": signal,
+        "symbol": symbol,
+        "price": float(price_numeric) if price_numeric is not None else None,
+        "size": trade_size_value,
+        "size_usd": trade_size_usd_value,
+        "leverage": leverage_value,
+        "at": now,
+    })
 
     # Map signal to side
     if signal and signal.upper() in ("BUY","LONG"):
@@ -1273,7 +1534,10 @@ async def webhook(req: Request):
             "id": trade_id,
             "status_code": status_code,
             "response": parsed_resp,
-            "price": float(price_for_db) if 'price_for_db' in locals() and price_for_db is not None else None
+            "price": float(price_numeric) if price_numeric is not None else None,
+            "size": trade_size_value,
+            "size_usd": trade_size_usd_value,
+            "leverage": leverage_value,
         })
 
         if not is_success:
@@ -1286,12 +1550,12 @@ async def webhook(req: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/trades")
-async def list_trades():
+async def list_trades(current_user: Dict[str, str] = Depends(get_current_user)):
     rows = await database.fetch_all(trades.select().order_by(trades.c.created_at.desc()))
     return [dict(r) for r in rows]
 
 @app.get("/price/{symbol}")
-async def get_price(symbol: str):
+async def get_price(symbol: str, current_user: Dict[str, str] = Depends(get_current_user)):
     """Get current market price for a symbol."""
     price = await get_market_price_with_retries(symbol)
     return {"symbol": symbol, "price": price}
@@ -1299,14 +1563,29 @@ async def get_price(symbol: str):
 # Simple WebSocket endpoint for frontend live updates
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    token = ws.query_params.get("token")
+    if not token:
+        await ws.close(code=1008)
+        return
+    try:
+        payload = decode_token(token)
+    except HTTPException as e:
+        await ws.close(code=1008)
+        return
+    except Exception:
+        await ws.close(code=1011)
+        return
+
+    username = payload.get("sub")
+    role = payload.get("role", "user")
     await ws.accept()
-    connected_websockets.append(ws)
+    client = {"ws": ws, "username": username, "role": role}
+    connected_websockets.append(client)
     try:
         while True:
-            # just keep socket alive; frontend doesn't need to send messages
-            data = await ws.receive_text()
-            # Echo or ignore
-            await ws.send_text(json.dumps({"type":"pong","msg":"ok"}))
+            await ws.receive_text()
+            await ws.send_text(json.dumps({"type": "pong", "msg": "ok"}))
     except WebSocketDisconnect:
-        if ws in connected_websockets:
-            connected_websockets.remove(ws)
+        pass
+    finally:
+        connected_websockets[:] = [c for c in connected_websockets if c.get("ws") is not ws]
