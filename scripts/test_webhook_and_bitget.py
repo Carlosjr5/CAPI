@@ -34,6 +34,7 @@ if API_BASE.endswith('/webhook'):
     print('Note: trimmed API_BASE to', API_BASE)
 TRADINGVIEW_SECRET = os.getenv('TRADINGVIEW_SECRET')
 SYMBOL = os.getenv('SYMBOL', 'BTCUSDT')
+SIGNAL = os.getenv('SIGNAL', 'BUY').upper()
 SIZE_USD = os.getenv('SIZE_USD', '10')
 PRICE = os.getenv('PRICE')
 
@@ -66,126 +67,55 @@ def ensure_single_position_mode():
     if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE):
         raise RuntimeError('Missing Bitget API credentials in env; cannot enforce position mode')
 
-    # Prepare candidate payloads/endpoints; Bitget has multiple variants (v1/v2, posMode/holdMode).
     base = BITGET_BASE.rstrip('/')
     pap_value = os.getenv('PAPTRADING', '1')
-    target_mode = BITGET_POSITION_MODE
-    base_symbol = (SYMBOL or '').replace('_', '').upper() or 'BTCUSDT'
-    symbol_variants = []
     product_type = (BITGET_PRODUCT_TYPE or '').upper()
+    payload = {
+        'posMode': 'hedge' if BITGET_POSITION_MODE == 'double' else 'single',
+    }
+    if product_type:
+        payload['productType'] = product_type
+    if BITGET_MARGIN_COIN:
+        payload['marginCoin'] = BITGET_MARGIN_COIN
+    base_symbol = (SYMBOL or '').replace('_', '').upper()
     if base_symbol:
-        symbol_variants.append(base_symbol)
-    if base_symbol and product_type:
-        symbol_variants.append(f'{base_symbol}_{product_type}')
-        if product_type == 'SUMCBL':
-            symbol_variants.append(f'{base_symbol}_UMCBL')
-    # Deduplicate while preserving order
-    seen_symbols = set()
-    symbol_variants = [s for s in symbol_variants if not (s in seen_symbols or seen_symbols.add(s))]
-
-    if target_mode == 'double':
-        mode_aliases = [
-            ('posMode', 'double'),
-            ('posMode', 'hedge'),
-            ('holdMode', 'double_hold'),
-        ]
-        combo_payloads = [
-            {'posMode': 'hedge', 'holdMode': 'double_hold'},
-            {'posMode': 'double', 'holdMode': 'double_hold'},
-        ]
-    else:
-        mode_aliases = [
-            ('posMode', 'single'),
-            ('posMode', 'one_way'),
-            ('holdMode', 'single_hold'),
-        ]
-        combo_payloads = [
-            {'posMode': 'one_way', 'holdMode': 'single_hold'},
-            {'posMode': 'single', 'holdMode': 'single_hold'},
-        ]
-
-    endpoint_variants = [
-        '/api/mix/v1/account/setPositionMode',
-        '/api/v2/mix/account/set-position-mode',
-    ]
-
-    attempts = []
-    for field, value in mode_aliases:
-        base_payload = {field: value}
-        if product_type:
-            attempts.append((endpoint_variants[0], {**base_payload, 'productType': product_type}))
-            attempts.append((endpoint_variants[1], {**base_payload, 'productType': product_type}))
-        if symbol_variants:
-            for sym in symbol_variants:
-                attempts.append((endpoint_variants[0], {**base_payload, 'symbol': sym}))
-                attempts.append((endpoint_variants[0], {**base_payload, 'symbol': sym, 'productType': product_type}))
-                attempts.append((endpoint_variants[1], {**base_payload, 'symbol': sym}))
-                attempts.append((endpoint_variants[1], {**base_payload, 'symbol': sym, 'productType': product_type}))
+        if product_type in ('SUMCBL', 'UMCBL'):
+            payload['symbol'] = f'{base_symbol}_{product_type}'
         else:
-            attempts.append((endpoint_variants[0], base_payload))
-            attempts.append((endpoint_variants[1], base_payload))
+            payload['symbol'] = base_symbol
 
-    for combo in combo_payloads:
-        if product_type:
-            attempts.append((endpoint_variants[0], {**combo, 'productType': product_type}))
-            attempts.append((endpoint_variants[1], {**combo, 'productType': product_type}))
-        if symbol_variants:
-            for sym in symbol_variants:
-                attempts.append((endpoint_variants[0], {**combo, 'symbol': sym}))
-                attempts.append((endpoint_variants[0], {**combo, 'symbol': sym, 'productType': product_type}))
-                attempts.append((endpoint_variants[1], {**combo, 'symbol': sym}))
-                attempts.append((endpoint_variants[1], {**combo, 'symbol': sym, 'productType': product_type}))
-        else:
-            attempts.append((endpoint_variants[0], combo))
-            attempts.append((endpoint_variants[1], combo))
+    endpoint = '/api/v2/mix/account/set-position-mode'
+    body = json.dumps(payload, separators=(',', ':'))
+    timestamp = str(int(time.time() * 1000))
+    signature = sign_bitget_request(timestamp, 'POST', endpoint, body, BITGET_SECRET)
+    headers = {
+        'ACCESS-KEY': BITGET_API_KEY,
+        'ACCESS-SIGN': signature,
+        'ACCESS-TIMESTAMP': timestamp,
+        'ACCESS-PASSPHRASE': BITGET_PASSPHRASE,
+        'Content-Type': 'application/json',
+        'PAPTRADING': pap_value,
+    }
 
-    unique_attempts = []
-    seen = set()
-    for endpoint, payload in attempts:
-        clean_payload = {k: v for k, v in payload.items() if v}
-        if BITGET_MARGIN_COIN and 'marginCoin' not in clean_payload:
-            clean_payload['marginCoin'] = BITGET_MARGIN_COIN
-        key = (endpoint, tuple(sorted(clean_payload.items())))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_attempts.append((endpoint, clean_payload))
+    print(f'setPositionMode attempt {endpoint} payload={payload}')
+    resp = requests.post(base + endpoint, headers=headers, data=body, timeout=10)
+    try:
+        data = resp.json()
+    except Exception:
+        data = {'status_code': resp.status_code, 'body': resp.text}
+    print('setPositionMode response:', data)
 
-    last_data = None
-    for endpoint, payload in unique_attempts:
-        body = json.dumps(payload, separators=(',', ':'))
-        timestamp = str(int(time.time() * 1000))
-        signature = sign_bitget_request(timestamp, 'POST', endpoint, body, BITGET_SECRET)
-        headers = {
-            'ACCESS-KEY': BITGET_API_KEY,
-            'ACCESS-SIGN': signature,
-            'ACCESS-TIMESTAMP': timestamp,
-            'ACCESS-PASSPHRASE': BITGET_PASSPHRASE,
-            'Content-Type': 'application/json',
-            'PAPTRADING': pap_value,
-        }
-        try:
-            print(f'setPositionMode attempt {endpoint} payload={payload}')
-        except Exception:
-            pass
-        resp = requests.post(base + endpoint, headers=headers, data=body, timeout=10)
-        try:
-            data = resp.json()
-        except Exception:
-            data = {'status_code': resp.status_code, 'body': resp.text}
-        print('setPositionMode response:', data)
-        if resp.status_code == 200 and isinstance(data, dict) and data.get('code') == '00000':
-            print(f'setPositionMode succeeded via {endpoint}')
-            return
-        last_data = data
+    if resp.status_code == 200 and isinstance(data, dict) and data.get('code') == '00000':
+        print('setPositionMode succeeded.')
+        return
 
-    if isinstance(last_data, dict) and last_data.get('code') in {'400172', '400171'}:
+    if isinstance(data, dict) and data.get('code') in {'400172', '400171'}:
         print('Bitget API reported illegal/unchanged position mode; assuming account already in desired mode.')
         return
 
     raise RuntimeError(
         'Failed to set position mode automatically. '
-        f'Last response: {last_data}. '
+        f'Last response: {data}. '
         'Log in to Bitget (demo), open Futures -> Settings, switch Position Mode to One-way (single), then rerun.'
     )
 
@@ -227,7 +157,7 @@ def post_webhook():
             payload_size = None
 
     body = {
-        'signal': 'BUY',
+        'signal': SIGNAL,
         'symbol': SYMBOL,
         'size_usd': size_usd_val,
         'price': price_val,

@@ -464,14 +464,16 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
         use_margin_coin = "USDT"
 
     # Initialize body_obj with default values - use the working parameters from debug_order.py
+    client_oid = f"capi-{uuid.uuid4().hex[:20]}"
+
     body_obj = {
-    "productType": local_product or BITGET_PRODUCT_TYPE,
+        "productType": local_product or BITGET_PRODUCT_TYPE,
         "symbol": "",  # Will be set below
         "orderType": "market",
         "size": str(size) if size is not None else "0.001",  # Smaller default size like debug script
         "marginCoin": use_margin_coin,
         "marginMode": "crossed",  # Use crossed like the working debug script
-        "clientOid": "test123"  # Fixed clientOid like debug script
+        "clientOid": client_oid  # Unique per order to avoid Bitget duplicate errors
     }
 
     # Attach positional hints when available; Bitget expects explicit unilateral fields in
@@ -1137,6 +1139,8 @@ async def webhook(req: Request):
     # Extract fields
     event = payload.get("event")  # SIGNAL, ENTRY, EXIT
     signal = payload.get("signal") or payload.get("action") or ""
+    if not signal and event:
+        signal = str(event).upper()
     trade_id_from_payload = payload.get("trade_id")
     symbol = payload.get("symbol") or payload.get("ticker") or ""
     price = payload.get("price")
@@ -1167,6 +1171,14 @@ async def webhook(req: Request):
                 raise HTTPException(status_code=400, detail="Missing price and unable to fetch market price; include price in the webhook or try again")
         except Exception:
             computed_size = None
+
+    # Enforce Bitget's minimum contract size when we have a computed size.
+    if computed_size is not None:
+        try:
+            if computed_size < 0.001:
+                computed_size = 0.001
+        except Exception:
+            pass
 
     # If we fetched a market price to compute size, prefer that for DB storage
     price_for_db = price or (p if 'p' in locals() and p is not None else 0.0)
