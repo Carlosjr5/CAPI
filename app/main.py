@@ -56,14 +56,29 @@ AUTH_TOKEN_EXPIRE_MINUTES = int(os.getenv("AUTH_TOKEN_EXPIRE_MINUTES", "1440"))
 USERS: Dict[str, Dict[str, str]] = {}
 raw_users = os.getenv("DASHBOARD_USERS")
 if raw_users:
+    parsed_from_json = False
     try:
         parsed_users = json.loads(raw_users)
         if isinstance(parsed_users, dict):
             for username, info in parsed_users.items():
                 if isinstance(info, dict) and "password" in info and "role" in info:
                     USERS[username] = {"password": info["password"], "role": info["role"]}
+                    parsed_from_json = True
     except Exception as e:
-        print(f"[auth] Failed to parse DASHBOARD_USERS: {e}")
+        print(f"[auth] Failed to parse DASHBOARD_USERS as JSON: {e}")
+
+    if not parsed_from_json:
+        try:
+            entries = [item.strip() for item in raw_users.split(",") if item.strip()]
+            for entry in entries:
+                parts = [p.strip() for p in entry.split(":")]
+                if len(parts) >= 2 and parts[0] and parts[1]:
+                    role = parts[2] if len(parts) >= 3 and parts[2] else "user"
+                    USERS[parts[0]] = {"password": parts[1], "role": role}
+            if not USERS:
+                print("[auth] DASHBOARD_USERS fallback parse produced no valid users")
+        except Exception as e:
+            print(f"[auth] Failed to parse DASHBOARD_USERS fallback format: {e}")
 
 admin_username = os.getenv("ADMIN_USERNAME")
 admin_password = os.getenv("ADMIN_PASSWORD")
@@ -74,6 +89,15 @@ user_username = os.getenv("USER_USERNAME")
 user_password = os.getenv("USER_PASSWORD")
 if user_username and user_password:
     USERS[user_username] = {"password": user_password, "role": "user"}
+
+if not USERS:
+    ci_flag = ((os.getenv("GITHUB_ACTIONS") or "").lower() == "true") or ((os.getenv("CI") or "").lower() == "true")
+    if ci_flag:
+        fallback_user = os.getenv("GITHUB_ACTIONS_USER", "capi_ci")
+        fallback_password = os.getenv("GITHUB_ACTIONS_PASSWORD", "capi_ci_pass")
+        fallback_role = os.getenv("GITHUB_ACTIONS_ROLE", "admin")
+        USERS[fallback_user] = {"password": fallback_password, "role": fallback_role}
+        print(f"[auth] No users configured from env; created fallback CI user '{fallback_user}'.")
 
 if not USERS:
     print("[auth] Warning: no dashboard users configured. UI authentication will fail until users are defined.")
