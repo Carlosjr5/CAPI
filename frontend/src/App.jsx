@@ -29,10 +29,19 @@ const buildApiUrl = (endpoint) => {
   const defaultLocalApi = 'http://127.0.0.1:8000'
   const base = envBase || (isLocalDev() ? defaultLocalApi : window.location.origin)
   const normalizedBase = base.endsWith('/') ? base.slice(0, -1) : base
+  // Force Railway production URL if we're on Railway domain
+  if (window.location.hostname.includes('railway.app')) {
+    return `https://capi-production-7bf3.up.railway.app${endpoint}`
+  }
   return `${normalizedBase}${endpoint}`
 }
 
 const buildWsUrl = () => {
+  // Force Railway WebSocket URL if we're on Railway domain
+  if (window.location.hostname.includes('railway.app')) {
+    return `wss://capi-production-7bf3.up.railway.app/ws`
+  }
+
   const envWsBase = import.meta?.env?.VITE_WS_URL
   const envApiBase = import.meta?.env?.VITE_API_URL
   const defaultLocalApi = 'http://127.0.0.1:8000'
