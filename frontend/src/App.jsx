@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import TradeTable from './TradeTable'
 import TradingViewChart from './TradingViewChart'
 
@@ -70,12 +70,12 @@ const buildWsUrl = () => {
 
 const formatNumber = (value, decimals = 2) => {
   const num = Number(value)
-  return Number.isFinite(num) ? num.toFixed(decimals) : '—'
+  return Number.isFinite(num) ? num.toFixed(decimals) : EM_DASH
 }
 
 const formatLeverage = (value) => {
   const num = Number(value)
-  return Number.isFinite(num) && num > 0 ? `${num}x` : '—'
+  return Number.isFinite(num) && num > 0 ? `${num}x` : EM_DASH
 }
 
 const currencyFormatter = new Intl.NumberFormat('en-US', {
@@ -111,6 +111,8 @@ const WATCH_SYMBOLS = (() => {
 })()
 
 const normalizeSymbolKey = (value) => (value || '').replace(/[^A-Z0-9]/gi, '').toUpperCase()
+const EM_DASH = '\u2014'
+const BULLET = '\u2022'
 
 function App() {
   // State variables
@@ -147,6 +149,13 @@ function App() {
   const eventsRef = useRef(null)
 
   const isAdmin = role === 'admin'
+
+  const getBitgetSnapshot = useCallback((symbol) => {
+    if (!symbol) return null
+    const key = normalizeSymbolKey(symbol)
+    if (!key) return null
+    return bitgetPositions?.[key] ?? null
+  }, [bitgetPositions])
 
   const handleLogout = useCallback(() => {
     if (wsRef.current) {
@@ -186,22 +195,22 @@ function App() {
 
   const formatCurrency = useCallback((value) => {
     const num = Number(value)
-    return Number.isFinite(num) ? currencyFormatter.format(num) : '—'
+    return Number.isFinite(num) ? currencyFormatter.format(num) : EM_DASH
   }, [])
 
   const formatUsdt = useCallback((value) => {
     const num = Number(value)
-    return Number.isFinite(num) ? `${usdtFormatter.format(num)} USDT` : '—'
+    return Number.isFinite(num) ? `${usdtFormatter.format(num)} USDT` : EM_DASH
   }, [])
 
   const formatEur = useCallback((value) => {
     const num = Number(value)
-    return Number.isFinite(num) ? currencyFormatterEUR.format(num) : '—'
+    return Number.isFinite(num) ? currencyFormatterEUR.format(num) : EM_DASH
   }, [])
 
   const formatPercent = useCallback((value) => {
     const num = Number(value)
-    if (!Number.isFinite(num)) return '—'
+    if (!Number.isFinite(num)) return EM_DASH
     const normalized = Math.abs(num) < 0.005 && num !== 0 ? 0 : num
     return `${normalized.toFixed(2)}%`
   }, [])
@@ -353,9 +362,14 @@ function App() {
 
     const priceUpdates = {}
     const positionUpdates = {}
+    const normalizedKeysSet = new Set()
     let needsTradeRefresh = false
 
     for(const symbol of symbols){
+      const normalizedKey = normalizeSymbolKey(symbol)
+      if(normalizedKey){
+        normalizedKeysSet.add(normalizedKey)
+      }
       const encodedSymbol = encodeURIComponent(symbol)
       let markOverride
 
@@ -369,7 +383,13 @@ function App() {
           if(res.ok){
             const data = await res.json()
             if(data && data.found){
-              positionUpdates[symbol] = data
+              if(normalizedKey){
+                positionUpdates[normalizedKey] = {
+                  ...data,
+                  symbolKey: normalizedKey,
+                  requested_symbol: data.requested_symbol || symbol,
+                }
+              }
               console.log('[bitget] position data:', data)
               const markCandidate = Number(data.mark_price ?? data.markPrice)
               if(Number.isFinite(markCandidate)){
@@ -383,37 +403,59 @@ function App() {
             }else{
               console.log('[bitget] position not found or failed:', data)
               const failurePayload = data && typeof data === 'object' ? data : { found: false, reason: 'unavailable' }
-              positionUpdates[symbol] = { ...failurePayload, found: false }
-              if(failurePayload && (failurePayload.reason === 'dry_run' || failurePayload.reason === 'not_configured') && import.meta.env.MODE !== 'development'){
+              const failureReason = typeof failurePayload?.reason === 'string' ? failurePayload.reason : ''
+              if(normalizedKey){
+                positionUpdates[normalizedKey] = {
+                  ...failurePayload,
+                  found: false,
+                  symbolKey: normalizedKey,
+                  requested_symbol: failurePayload?.requested_symbol || symbol,
+                }
+              }
+              if(failureReason && (failureReason === 'dry_run' || failureReason === 'not_configured') && import.meta.env.MODE !== 'development'){
                 bitgetDisabledRef.current = true
-              } else if(failurePayload.reason !== 'dry_run' && failurePayload.reason !== 'not_configured'){
-                // Position not found in Bitget - mark as closed in our system
+              } else if(normalizedKey && (failureReason === 'not_found' || failureReason === 'empty')){
+                // Position absent on Bitget - mark as closed in our system
                 needsTradeRefresh = true
 
-                // Immediately close the trade in database if position no longer exists on Bitget
-                try {
-                  const closeRes = await fetch(buildApiUrl('/bitget/close-position'), {
-                    method: 'POST',
-                    headers: authHeaders({ 'Content-Type': 'application/json' }),
-                    body: JSON.stringify({
-                      trade_id: openTrades.find(t => t.symbol === symbol)?.id,
-                      reason: 'external_close'
+                const matchingTrade = openTrades.find((t) => normalizeSymbolKey(t.symbol) === normalizedKey)
+                if(matchingTrade?.id){
+                  try {
+                    const closeRes = await fetch(buildApiUrl('/bitget/close-position'), {
+                      method: 'POST',
+                      headers: authHeaders({ 'Content-Type': 'application/json' }),
+                      body: JSON.stringify({
+                        trade_id: matchingTrade.id,
+                        reason: 'external_close'
+                      })
                     })
-                  })
-                  if (closeRes.ok) {
-                    console.log(`[bitget] closed position for ${symbol} as it no longer exists on Bitget`)
+                    if (closeRes.ok) {
+                      console.log(`[bitget] closed position for ${symbol} as it no longer exists on Bitget`)
+                    }
+                  } catch (closeError) {
+                    console.error(`[bitget] failed to close position for ${symbol}:`, closeError)
                   }
-                } catch (closeError) {
-                  console.error(`[bitget] failed to close position for ${symbol}:`, closeError)
                 }
               }
             }
-          }else{
-            positionUpdates[symbol] = { found: false, reason: `http_${res.status}` }
+          }else if(normalizedKey){
+            positionUpdates[normalizedKey] = {
+              found: false,
+              reason: `http_${res.status}`,
+              symbolKey: normalizedKey,
+              requested_symbol: symbol,
+            }
           }
         }catch(error){
           console.error(`[bitget] position fetch failed for ${symbol}`, error)
-          positionUpdates[symbol] = { found: false, reason: 'network_error' }
+          if(normalizedKey){
+            positionUpdates[normalizedKey] = {
+              found: false,
+              reason: 'network_error',
+              symbolKey: normalizedKey,
+              requested_symbol: symbol,
+            }
+          }
         }
       }
 
@@ -440,6 +482,7 @@ function App() {
     }
 
     const openSet = new Set(symbols)
+    const normalizedKeys = Array.from(normalizedKeysSet)
 
     setCurrentPrices(prev => {
       const next = {}
@@ -458,13 +501,13 @@ function App() {
         return prev
       }
       const next = {}
-      for(const sym of openSet){
-        if(Object.prototype.hasOwnProperty.call(positionUpdates, sym)){
-          next[sym] = positionUpdates[sym]
-        }else if(Object.prototype.hasOwnProperty.call(prev, sym)){
-          next[sym] = prev[sym]
+      for(const key of normalizedKeys){
+        if(Object.prototype.hasOwnProperty.call(positionUpdates, key)){
+          next[key] = positionUpdates[key]
+        }else if(Object.prototype.hasOwnProperty.call(prev, key)){
+          next[key] = prev[key]
         }else{
-          next[sym] = null
+          next[key] = null
         }
       }
       return next
@@ -478,7 +521,7 @@ function App() {
 
   const calculatePnL = useCallback((trade) => {
     if (!trade) return null
-    const snapshot = trade.symbol ? bitgetPositions?.[trade.symbol] : null
+    const snapshot = getBitgetSnapshot(trade.symbol)
     if (snapshot && snapshot.found !== false) {
       const livePnLRaw = snapshot.unrealized_pnl ?? snapshot.unrealizedPnl ?? snapshot.upl
       const livePnL = Number(livePnLRaw)
@@ -487,7 +530,7 @@ function App() {
       }
     }
     return null
-  }, [bitgetPositions])
+  }, [getBitgetSnapshot])
 
   function mapStatus(s){
     if(!s) return 'other'
@@ -653,22 +696,24 @@ function App() {
   const positionMetrics = useMemo(() => {
     if (!latestOpenTrade) return null
 
-    const snapshot = latestOpenTrade.symbol ? bitgetPositions?.[latestOpenTrade.symbol] : undefined
+    const snapshot = getBitgetSnapshot(latestOpenTrade.symbol)
 
     const toNumber = (value) => {
       const num = Number(value)
       return Number.isFinite(num) ? num : null
     }
 
-    // Always get entry price from trade data as primary source
     const tradeEntryPrice = toNumber(latestOpenTrade.price)
     const tradeSize = toNumber(latestOpenTrade.size)
 
-    if (!snapshot || snapshot.found === false) {
+    const hasSnapshot = !!snapshot && snapshot.found !== false
+    const failureReason = hasSnapshot ? null : snapshot?.reason
+
+    if (!hasSnapshot) {
       return {
         snapshot: snapshot ?? null,
         hasSnapshot: false,
-        failureReason: snapshot?.reason,
+        failureReason,
         sizeValue: tradeSize,
         entryPrice: tradeEntryPrice,
         markPrice: null,
@@ -717,26 +762,26 @@ function App() {
       pnlRatio,
       unrealizedPnl,
     }
-  }, [latestOpenTrade, bitgetPositions])
+  }, [latestOpenTrade, getBitgetSnapshot])
 
   const positionOverview = useMemo(() => {
     if (!latestOpenTrade || !positionMetrics) return null
 
     const { hasSnapshot } = positionMetrics
-    const baseSymbol = (latestOpenTrade.symbol || '').split(/[_:.]/)[0] || latestOpenTrade.symbol || '—'
+    const baseSymbol = (latestOpenTrade.symbol || '').split(/[_:.]/)[0] || latestOpenTrade.symbol || EM_DASH
     const sizeDisplay = hasSnapshot && positionMetrics.sizeValue !== null
       ? `${formatNumber(positionMetrics.sizeValue, 4)} ${baseSymbol}`
-      : '—'
+      : EM_DASH
     const sizeUsdDisplay = hasSnapshot && positionMetrics.totalValue !== null
       ? formatUsdt(positionMetrics.totalValue)
       : hasSnapshot && positionMetrics.notional !== null && Number.isFinite(positionMetrics.notional)
         ? formatUsdt(positionMetrics.notional)
-        : '—'
-    const leverageDisplay = hasSnapshot ? formatLeverage(positionMetrics.leverage) : '—'
+        : EM_DASH
+    const leverageDisplay = hasSnapshot ? formatLeverage(positionMetrics.leverage) : EM_DASH
 
     const pnlValue = Number(positionPnL)
     const hasPnlValue = Number.isFinite(pnlValue)
-    const pnlDisplay = hasSnapshot && hasPnlValue ? formatUsdt(pnlValue) : '—'
+    const pnlDisplay = hasSnapshot && hasPnlValue ? formatUsdt(pnlValue) : EM_DASH
 
     let pnlPercent = null
     if (hasSnapshot && isFiniteNumber(positionMetrics.pnlRatio)) {
@@ -751,32 +796,60 @@ function App() {
         pnlPercent = (pnlValue / basisRaw) * 100
       }
     }
-    const pnlPercentDisplay = pnlPercent !== null && Number.isFinite(pnlPercent) ? formatPercent(pnlPercent) : '—'
+    const pnlPercentDisplay = pnlPercent !== null && Number.isFinite(pnlPercent) ? formatPercent(pnlPercent) : EM_DASH
 
     const pnlEur = hasSnapshot && hasPnlValue && Number.isFinite(usdToEurRate) ? pnlValue * usdToEurRate : null
-    const pnlEurDisplay = pnlEur !== null && Number.isFinite(pnlEur) ? formatEur(pnlEur) : '—'
+    const pnlEurDisplay = pnlEur !== null && Number.isFinite(pnlEur) ? formatEur(pnlEur) : EM_DASH
 
     const marginValue = hasSnapshot ? positionMetrics.margin : null
-    const marginDisplay = Number.isFinite(marginValue) ? formatUsdt(marginValue) : '—'
+    const marginDisplay = Number.isFinite(marginValue) ? formatUsdt(marginValue) : EM_DASH
     const marginEurDisplay = Number.isFinite(marginValue) && Number.isFinite(usdToEurRate)
       ? formatEur(marginValue * usdToEurRate)
-      : '—'
+      : EM_DASH
 
     const markPriceDisplay = hasSnapshot && positionMetrics.markPrice !== null && isFiniteNumber(positionMetrics.markPrice)
       ? formatCurrency(positionMetrics.markPrice)
-      : '—'
+      : EM_DASH
 
     const liquidationDisplay = hasSnapshot && positionMetrics.liquidationPrice !== null && isFiniteNumber(positionMetrics.liquidationPrice)
       ? formatCurrency(positionMetrics.liquidationPrice)
-      : '—'
+      : EM_DASH
 
     const pnlTone = hasSnapshot && hasPnlValue
       ? (pnlValue > 0 ? 'positive' : pnlValue < 0 ? 'negative' : 'neutral')
       : 'neutral'
 
+    const failureReason = positionMetrics.failureReason
+    const friendlyFailure = (() => {
+      switch (failureReason) {
+        case 'network_error':
+          return 'Network error reaching Bitget'
+        case 'http_403':
+          return 'Bitget returned HTTP 403 (check API credentials)'
+        case 'http_429':
+          return 'Rate limited by Bitget'
+        case 'not_found':
+          return 'Bitget reports no open position'
+        case 'empty':
+          return 'Bitget returned empty data'
+        case 'unavailable':
+          return 'Bitget service unavailable'
+        default:
+          return null
+      }
+    })()
+
+    const statusMessage = hasSnapshot
+      ? null
+      : failureReason
+        ? friendlyFailure
+          ? `Bitget data unavailable - ${friendlyFailure} (${failureReason})`
+          : `Bitget data unavailable (${failureReason})`
+        : 'Waiting for Bitget data...'
+
     return {
       hasSnapshot,
-      statusMessage: hasSnapshot ? null : (positionMetrics.failureReason ? `Bitget data unavailable (${positionMetrics.failureReason})` : 'Waiting for Bitget data…'),
+      statusMessage,
       sizeDisplay,
       sizeUsdDisplay,
       leverageDisplay,
@@ -822,14 +895,14 @@ function App() {
     return { unrealized, realized, hasUnrealized, hasRealized }
   }, [trades, calculatePnL])
 
-  const overallUnrealizedDisplay = overallPnL.hasUnrealized ? formatUsdt(overallPnL.unrealized) : '—'
-  const overallRealizedDisplay = overallPnL.hasRealized ? formatUsdt(overallPnL.realized) : '—'
+  const overallUnrealizedDisplay = overallPnL.hasUnrealized ? formatUsdt(overallPnL.unrealized) : EM_DASH
+  const overallRealizedDisplay = overallPnL.hasRealized ? formatUsdt(overallPnL.realized) : EM_DASH
   const overallUnrealizedEurDisplay = overallPnL.hasUnrealized && Number.isFinite(usdToEurRate)
     ? formatEur(overallPnL.unrealized * usdToEurRate)
-    : '—'
+    : EM_DASH
   const overallRealizedEurDisplay = overallPnL.hasRealized && Number.isFinite(usdToEurRate)
     ? formatEur(overallPnL.realized * usdToEurRate)
-    : '—'
+    : EM_DASH
   const overallUnrealizedTone = overallPnL.hasUnrealized
     ? (overallPnL.unrealized > 0 ? 'positive' : overallPnL.unrealized < 0 ? 'negative' : 'neutral')
     : 'neutral'
@@ -974,32 +1047,32 @@ function App() {
                       {(latestOpenTrade.signal || '').toUpperCase()}
                     </div>
                     <div className="hero-symbol">{latestOpenTrade.symbol}</div>
-                      <div className="hero-size">{positionOverview?.sizeDisplay ?? '—'}</div>
-                      <div className="hero-size hero-size-usd">{positionOverview?.sizeUsdDisplay ?? '—'}</div>
+                      <div className="hero-size">{positionOverview?.sizeDisplay ?? EM_DASH}</div>
+                      <div className="hero-size hero-size-usd">{positionOverview?.sizeUsdDisplay ?? EM_DASH}</div>
                   </div>
                   <div className="hero-stats">
                       <div className={`hero-stat ${positionOverview?.hasLeverage ? '' : 'stat-missing'}`}>
                       <span className="stat-label">Leverage</span>
-                      <span className="stat-value">{positionOverview?.leverageDisplay ?? '—'}</span>
+                      <span className="stat-value">{positionOverview?.leverageDisplay ?? EM_DASH}</span>
                     </div>
                     <div className={`hero-stat pnl ${positionOverview?.pnlTone || 'neutral'}`}>
                       <span className="stat-label">PnL</span>
-                      <span className="stat-value">{positionOverview?.pnlDisplay ?? '—'}</span>
-                      <span className="stat-subvalue">{positionOverview?.pnlPercentDisplay ?? '—'}</span>
-                      <span className="stat-subvalue muted">{positionOverview?.pnlEurDisplay ?? '—'}</span>
+                      <span className="stat-value">{positionOverview?.pnlDisplay ?? EM_DASH}</span>
+                      <span className="stat-subvalue">{positionOverview?.pnlPercentDisplay ?? EM_DASH}</span>
+                      <span className="stat-subvalue muted">{positionOverview?.pnlEurDisplay ?? EM_DASH}</span>
                     </div>
                     <div className="hero-stat">
                       <span className="stat-label">Margin</span>
-                      <span className="stat-value">{positionOverview?.marginDisplay ?? '—'}</span>
-                      <span className="stat-subvalue muted">{positionOverview?.marginEurDisplay ?? '—'}</span>
+                      <span className="stat-value">{positionOverview?.marginDisplay ?? EM_DASH}</span>
+                      <span className="stat-subvalue muted">{positionOverview?.marginEurDisplay ?? EM_DASH}</span>
                     </div>
                     <div className="hero-stat">
                       <span className="stat-label">Mark Price</span>
-                      <span className="stat-value">{positionOverview?.markPriceDisplay ?? '—'}</span>
+                      <span className="stat-value">{positionOverview?.markPriceDisplay ?? EM_DASH}</span>
                     </div>
                     <div className="hero-stat liquidation">
                       <span className="stat-label">Liq. Price</span>
-                      <span className="stat-value">{positionOverview?.liquidationDisplay ?? '—'}</span>
+                      <span className="stat-value">{positionOverview?.liquidationDisplay ?? EM_DASH}</span>
                     </div>
                   </div>
                 </div>
@@ -1015,7 +1088,7 @@ function App() {
           <div className="card graph-card">
             <div className="card-heading graph-heading">
               <h3>Market Graph</h3>
-              <span className="muted">BTCUSDT.P • Bitget</span>
+              <span className="muted">{`BTCUSDT.P ${BULLET} Bitget`}</span>
             </div>
             <div className="graph-body">
               <TradingViewChart
@@ -1219,3 +1292,10 @@ function App() {
 }
 
 export default App
+
+
+
+
+
+
+
