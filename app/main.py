@@ -304,6 +304,8 @@ default_frontend_origins = [
     "http://127.0.0.1:3000",
     # Railway frontend / deployed origin - adjust if you host frontend elsewhere
     "https://capi-production-7bf3.up.railway.app",
+    # WebSocket connections from Railway - needed for production WebSocket connections
+    "wss://capi-production-7bf3.up.railway.app",
 ]
 env_origins = os.getenv("FRONTEND_ORIGINS")
 if env_origins:
