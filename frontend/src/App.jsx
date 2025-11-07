@@ -742,16 +742,13 @@ function App() {
       : positionMetrics.notional !== null
         ? formatCurrency(positionMetrics.notional)
         : '—'
-    const totalDisplay = formatCurrency(positionMetrics.totalValue ?? positionMetrics.notional)
-    const markDisplay = formatCurrency(positionMetrics.markPrice ?? positionMetrics.currentPrice)
     const pnlDisplay = positionPnL !== null && isFiniteNumber(positionPnL) ? formatCurrency(positionPnL) : '—'
 
     return {
       hasSnapshot: positionMetrics.hasSnapshot,
       statusMessage: positionMetrics.hasSnapshot ? 'Live' : 'Offline',
       sizeDisplay,
-      totalDisplay,
-      markDisplay,
+      sizeUsdDisplay,
       pnlDisplay,
       sideDisplay: `${(latestOpenTrade.signal || '').toUpperCase()} ${baseSymbol}`,
       sideTone: latestOpenTrade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short',
@@ -862,10 +859,6 @@ function App() {
               <span className="metric-value">{counts.closed}</span>
             </div>
             <div className="metric-card">
-              <span className="metric-label">Other</span>
-              <span className="metric-value">{counts.other}</span>
-            </div>
-            <div className="metric-card">
               <span className="metric-label">Total</span>
               <span className="metric-value">{counts.total}</span>
             </div>
@@ -899,7 +892,7 @@ function App() {
                             headers: authHeaders()
                           })
                           if (res.ok) {
-                            pushEvent(`Position closed successfully`)
+                            pushEvent('Position closed successfully')
                             fetchTrades()
                           } else {
                             pushEvent(`Failed to close position: ${res.status}`)
@@ -913,30 +906,24 @@ function App() {
                     </button>
                   )}
                 </div>
-                <div className="position-hero">
+                {positionOverview && (
+                  <div className="position-hero">
                     <div className="position-hero-main">
-                    <div className={`side-badge badge-${positionOverview.sideTone || 'neutral'}`}>
-                      {(latestOpenTrade.signal || '').toUpperCase()}
-                    </div>
-                    <div className="hero-symbol">{latestOpenTrade.symbol}</div>
+                      <div className={`side-badge badge-${positionOverview.sideTone}`}>
+                        {(latestOpenTrade.signal || '').toUpperCase()}
+                      </div>
+                      <div className="hero-symbol">{latestOpenTrade.symbol}</div>
                       <div className="hero-size">{positionOverview.sizeDisplay}</div>
                       <div className="hero-size hero-size-usd">{positionOverview.sizeUsdDisplay}</div>
-                  </div>
-                  <div className="hero-stats">
-                    <div className={`hero-stat total ${positionOverview.pnlTone || 'neutral'}`}>
-                      <span className="stat-label">Total Value</span>
-                      <span className="stat-value">{positionOverview.totalDisplay}</span>
                     </div>
-                    <div className="hero-stat">
-                      <span className="stat-label">Mark</span>
-                      <span className="stat-value">{positionOverview.markDisplay}</span>
-                    </div>
-                    <div className={`hero-stat pnl ${positionOverview.pnlTone || 'neutral'}`}>
-                      <span className="stat-label">PnL</span>
-                      <span className="stat-value">{positionOverview.pnlDisplay}</span>
+                    <div className="hero-stats">
+                      <div className={`hero-stat pnl ${positionOverview.pnlTone || 'neutral'}`}>
+                        <span className="stat-label">PnL</span>
+                        <span className="stat-value">{positionOverview.pnlDisplay}</span>
+                      </div>
                     </div>
                   </div>
-                </div>
+                )}
               </div>
             ) : (
               <div className="empty-state">No open position. When a new TradingView alert arrives, the previous position is closed automatically and the latest trade appears here.</div>

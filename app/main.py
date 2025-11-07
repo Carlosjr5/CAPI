@@ -469,6 +469,13 @@ async def close_existing_bitget_position(trade_row):
         close_payload = construct_bitget_payload(symbol=symbol, side=close_side, size=size)
         close_payload["closePosition"] = True
 
+        # Ensure Bitget receives the correct leg to close; holdSide/positionSide must
+        # reflect the original position direction, not the side of the closing order.
+        original_side = str(signal or "").upper()
+        hold_side = "long" if original_side in ("BUY", "LONG") else "short"
+        close_payload["holdSide"] = hold_side
+        close_payload["positionSide"] = hold_side
+
         body = json.dumps(close_payload, separators=(',', ':'))
 
         if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
