@@ -1148,7 +1148,7 @@ function App() {
                         let parsedResponse = null
                         try{ parsedResponse = JSON.parse(text) }catch(error){ parsedResponse = { raw_response: text } }
                         try{ pushEvent(`[place-test] status=${res.status} resp=${JSON.stringify(parsedResponse)}`) }catch(error){ console.log(error) }
-                        setLastOrderResult({ status: res.status, body: parsed })
+                        setLastOrderResult({ status: res.status, body: parsedResponse })
                         if(res.ok){ fetchTrades() }
                       }catch(error){ pushEvent(`[place-test] error ${error.message || error}`) }
                       finally {
