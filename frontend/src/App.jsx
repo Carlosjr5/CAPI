@@ -151,6 +151,12 @@ function App() {
     if (typeof window === 'undefined') return null
     const { protocol, host } = window.location
     const wsProtocol = protocol === 'https:' ? 'wss:' : 'ws:'
+
+    // For Railway deployment, construct WebSocket URL properly
+    if (host.includes('railway.app')) {
+      return `${wsProtocol}//${host}/ws`
+    }
+
     return `${wsProtocol}//${host}`
   }, [])
 
@@ -507,17 +513,37 @@ function App() {
       return
     }
     try {
-      const socket = new WebSocket(`${wsBase}?token=${encodeURIComponent(token)}`)
+      // For Railway deployment, ensure we use the correct WebSocket path
+      const wsUrl = wsBase.includes('/ws') ? `${wsBase}?token=${encodeURIComponent(token)}` : `${wsBase}/ws?token=${encodeURIComponent(token)}`
+      console.log('[ws] Connecting to:', wsUrl)
+      const socket = new WebSocket(wsUrl)
       wsRef.current = socket
 
       socket.onopen = () => {
         setStatus('Connected')
         console.log('[ws] WebSocket connected')
+        // Start sending ping messages every 30 seconds to keep connection alive
+        const pingInterval = setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) {
+            try {
+              socket.send(JSON.stringify({ type: 'ping' }))
+            } catch (error) {
+              console.error('[ws] Failed to send ping:', error)
+            }
+          } else {
+            clearInterval(pingInterval)
+          }
+        }, 30000)
+        socket.pingInterval = pingInterval
       }
 
       socket.onclose = (event) => {
         console.log('[ws] WebSocket closed, code:', event.code, 'reason:', event.reason)
         setStatus('Disconnected')
+        if (socket.pingInterval) {
+          clearInterval(socket.pingInterval)
+          socket.pingInterval = null
+        }
         wsRef.current = null
         if(event && event.code === 1008){
           console.log('[ws] Authentication failed, logging out')
@@ -538,8 +564,11 @@ function App() {
         try{
           const payload = JSON.parse(event.data)
           console.log('[ws] Received message:', payload.type)
-          if(['received','placed','error','ignored','closed'].includes(payload.type)) {
-            fetchTrades()
+          if(['received','placed','error','ignored','closed', 'pong'].includes(payload.type)) {
+            // Handle pong or other messages, but pong doesn't trigger fetchTrades
+            if(['received','placed','error','ignored','closed'].includes(payload.type)) {
+              fetchTrades()
+            }
           }
         }catch(error){
           console.error('[ws] message parse error', error)
@@ -549,6 +578,10 @@ function App() {
       socket.onerror = (error) => {
         console.error('[ws] WebSocket error:', error)
         setStatus('Error')
+        if (socket.pingInterval) {
+          clearInterval(socket.pingInterval)
+          socket.pingInterval = null
+        }
       }
 
     } catch (error) {

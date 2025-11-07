@@ -2362,8 +2362,14 @@ async def websocket_endpoint(ws: WebSocket):
     connected_websockets.append(client)
     try:
         while True:
-            await ws.receive_text()
-            await ws.send_text(json.dumps({"type": "pong", "msg": "ok"}))
+            message = await ws.receive_text()
+            try:
+                data = json.loads(message)
+                if data.get("type") == "ping":
+                    await ws.send_text(json.dumps({"type": "pong", "msg": "ok"}))
+            except json.JSONDecodeError:
+                # If not JSON, treat as regular pong request
+                await ws.send_text(json.dumps({"type": "pong", "msg": "ok"}))
     except WebSocketDisconnect:
         pass
     finally:
