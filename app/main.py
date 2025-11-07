@@ -788,7 +788,7 @@ def normalize_bitget_position(requested_symbol: str, snapshot: Dict[str, Any]) -
         "liquidation_price": liquidation_price,
         "unrealized_pnl": unrealized,
         "realized_pnl": realized,
-    "pnl_ratio": pnl_ratio,
+        "pnl_ratio": pnl_ratio,
         "margin_ratio": margin_ratio,
         "notional": notional,
         "size_usd": size_usd,
@@ -2001,15 +2001,16 @@ async def websocket_endpoint(ws: WebSocket):
         return
     try:
         payload = decode_token(token)
-    except HTTPException as e:
-        await ws.close(code=1008)
-        return
     except Exception:
-        await ws.close(code=1011)
+        await ws.close(code=1008)
         return
 
     username = payload.get("sub")
     role = payload.get("role", "user")
+    if not username:
+        await ws.close(code=1008)
+        return
+    # Skip user existence check since token is already validated
     await ws.accept()
     client = {"ws": ws, "username": username, "role": role}
     connected_websockets.append(client)
