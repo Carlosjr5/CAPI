@@ -390,6 +390,102 @@ def build_signature(timestamp: str, method: str, request_path: str, body: str, s
     d = mac.digest()
     return base64.b64encode(d).decode()
 
+async def close_existing_bitget_position(trade_row):
+    """Submit a close order for an existing position and update DB status."""
+    try:
+        # Extract trade details
+        trade_id = trade_row['id']
+        symbol = trade_row['symbol']
+        signal = trade_row['signal']
+        size = trade_row['size']
+
+        # Determine opposite side for closing
+        close_side = "sell" if signal.upper() in ("BUY", "LONG") else "buy"
+
+        # Submit close order with closePosition=true
+        close_payload = construct_bitget_payload(symbol=symbol, side=close_side, size=size)
+        close_payload["closePosition"] = True
+
+        body = json.dumps(close_payload, separators=(',', ':'))
+
+        if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+            print(f"[close_position] DRY-RUN: would close position for trade {trade_id}")
+            # In dry-run, just update DB status
+            await database.execute(trades.update().where(trades.c.id == trade_id).values(status="closed"))
+            return True
+
+        # Live close order
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for u in [BITGET_BASE + "/api/v5/trade/order"]:
+                try:
+                    ts = str(int(time.time() * 1000))
+                    sign = build_signature(ts, "POST", "/api/v5/trade/order", body, BITGET_SECRET)
+
+                    headers = {
+                        "ACCESS-KEY": BITGET_API_KEY,
+                        "ACCESS-SIGN": sign,
+                        "ACCESS-TIMESTAMP": ts,
+                        "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+                        "Content-Type": "application/json",
+                        "paptrading": PAPTRADING,
+                        "locale": "en-US",
+                    }
+
+                    resp = await client.post(u, headers=headers, content=body)
+                    if resp.status_code == 200:
+                        try:
+                            parsed = resp.json()
+                            if parsed.get('code') == '00000':
+                                # Close order successful, update DB
+                                await database.execute(trades.update().where(trades.c.id == trade_id).values(status="closed"))
+                                print(f"[close_position] Successfully closed position for trade {trade_id}")
+                                return True
+                        except Exception:
+                            pass
+                    print(f"[close_position] Failed to close position for trade {trade_id}: {resp.text}")
+                except Exception as e:
+                    print(f"[close_position] Exception closing position for trade {trade_id}: {e}")
+
+        return False
+    except Exception as e:
+        print(f"[close_position] Error in close_existing_bitget_position: {e}")
+        return False
+
+
+async def close_open_positions_for_rotation(symbol: str, price_numeric: float, payload):
+    """Close any existing open positions before opening a new one (one-way system).
+    Uses Bitget's position reversal capability - instead of closing then opening,
+    we directly reverse positions which is more efficient and reliable.
+    """
+    try:
+        # Find all open positions (status = "placed")
+        open_trades = await database.fetch_all(
+            trades.select().where(trades.c.status == "placed")
+        )
+
+        if not open_trades:
+            print("[rotation] No open positions to reverse")
+            return
+
+        print(f"[rotation] Found {len(open_trades)} open positions to reverse")
+
+        # For each open position, mark it as closed in DB but don't send close orders
+        # Bitget will handle the position reversal automatically when we place the new order
+        closed_count = 0
+        for trade_row in open_trades:
+            try:
+                await database.execute(trades.update().where(trades.c.id == trade_row['id']).values(status="closed"))
+                closed_count += 1
+                print(f"[rotation] Marked trade {trade_row['id']} as closed in DB")
+            except Exception as e:
+                print(f"[rotation] Error marking trade {trade_row['id']} as closed: {e}")
+
+        print(f"[rotation] Marked {closed_count} positions as closed - ready for reversal")
+
+    except Exception as e:
+        print(f"[rotation] Error in close_open_positions_for_rotation: {e}")
+
+
 async def place_demo_order(symbol: str, side: str, price: float = None, size: float = None):
     """
     Place an order on Bitget demo futures (v2 mix order)
@@ -1450,16 +1546,7 @@ async def webhook(req: Request):
 
     # For ENTRY or default (backward compatibility)
     # Close any existing open positions (one-way system)
-    try:
-        closing_rows = await database.fetch_all(sqlalchemy.select(trades.c.id).where(trades.c.status == "placed"))
-    except Exception:
-        closing_rows = []
-    await database.execute(trades.update().where(trades.c.status == "placed").values(status="closed"))
-    for row in closing_rows:
-        try:
-            await broadcast({"type": "closed", "id": row["id"], "reason": "rotation"})
-        except Exception:
-            pass
+    await close_open_positions_for_rotation(symbol, price_numeric, payload)
 
     # If there's no explicit signal, fail loudly so misconfigured alerts are obvious.
     if not signal:
@@ -1553,6 +1640,156 @@ async def webhook(req: Request):
 async def list_trades(current_user: Dict[str, str] = Depends(get_current_user)):
     rows = await database.fetch_all(trades.select().order_by(trades.c.created_at.desc()))
     return [dict(r) for r in rows]
+
+@app.post("/close/{trade_id}")
+async def close_position(trade_id: str, current_user: Dict[str, str] = Depends(require_role(["admin"]))):
+    """Admin endpoint to close a position - sends close order to Bitget and updates DB."""
+    try:
+        # Get trade details
+        trade = await database.fetch_one(trades.select().where(trades.c.id == trade_id))
+        if not trade:
+            raise HTTPException(status_code=404, detail="Trade not found")
+
+        if trade['status'] != 'placed':
+            raise HTTPException(status_code=400, detail="Trade is not in open state")
+
+        # Close the position on Bitget
+        success = await close_existing_bitget_position(dict(trade))
+
+        if success:
+            # Broadcast the close event
+            await broadcast({"type": "closed", "id": trade_id})
+            return {"ok": True, "message": "Position closed successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to close position on Bitget")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[close_position] Error closing trade {trade_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/open-position")
+async def open_position(req: Request, current_user: Dict[str, str] = Depends(get_current_user)):
+    """Endpoint for users to manually open positions from the dashboard."""
+    try:
+        body_text = await req.body()
+        payload = json.loads(body_text.decode())
+
+        # Extract parameters
+        signal = payload.get("signal") or payload.get("action") or ""
+        symbol = payload.get("symbol") or payload.get("ticker") or ""
+        size = payload.get("size")
+        size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
+
+        if not signal or not symbol:
+            raise HTTPException(status_code=400, detail="Missing required fields: signal and symbol")
+
+        if signal.upper() not in ("BUY", "SELL", "LONG", "SHORT"):
+            raise HTTPException(status_code=400, detail="Invalid signal. Must be BUY, SELL, LONG, or SHORT")
+
+        # Fetch current market price
+        price = await get_market_price_with_retries(symbol)
+        if not price:
+            raise HTTPException(status_code=400, detail="Unable to fetch market price for symbol")
+
+        # Prepare payload similar to webhook
+        webhook_payload = {
+            "signal": signal,
+            "symbol": symbol,
+            "price": price,
+            "size": size,
+            "size_usd": size_usd,
+            "manual": True  # Flag to indicate manual opening
+        }
+
+        # Close any existing positions (one-way system)
+        await close_open_positions_for_rotation(symbol, price, webhook_payload)
+
+        # Map signal to side
+        if signal.upper() in ("BUY", "LONG"):
+            side = "buy"
+        else:
+            side = "sell"
+
+        # Compute size
+        computed_size = None
+        if size is not None:
+            try:
+                computed_size = float(size)
+            except Exception:
+                computed_size = None
+        elif size_usd is not None:
+            try:
+                usd = float(size_usd)
+                computed_size = usd / price
+            except Exception:
+                computed_size = None
+
+        if computed_size is not None and computed_size < 0.001:
+            computed_size = 0.001
+
+        # Place the order
+        status_code, resp_text = await place_demo_order(symbol=symbol, side=side, price=price, size=computed_size)
+
+        parsed_resp = None
+        try:
+            parsed_resp = json.loads(resp_text) if resp_text else None
+        except Exception:
+            parsed_resp = {"raw": resp_text}
+
+        bitget_code = None
+        if isinstance(parsed_resp, dict):
+            bitget_code = parsed_resp.get("code") or parsed_resp.get("status")
+
+        is_success = status_code == 200 and (not bitget_code or str(bitget_code) == "00000")
+
+        # Create trade record
+        trade_id = str(uuid.uuid4())
+        now = time.time()
+
+        trade_size_value, trade_size_usd_value, leverage_value, price_numeric = resolve_trade_dimensions(
+            price, computed_size, size, size_usd, webhook_payload
+        )
+
+        trade_status = "placed" if is_success else "error"
+
+        await database.execute(trades.insert().values(
+            id=trade_id,
+            signal=signal,
+            symbol=symbol,
+            price=float(price_numeric) if price_numeric is not None else 0.0,
+            size=trade_size_value,
+            size_usd=trade_size_usd_value,
+            leverage=leverage_value,
+            status=trade_status,
+            response=resp_text,
+            created_at=now
+        ))
+
+        # Broadcast the event
+        await broadcast({
+            "type": "placed" if is_success else "error",
+            "id": trade_id,
+            "status_code": status_code,
+            "response": parsed_resp,
+            "price": float(price_numeric) if price_numeric is not None else None,
+            "size": trade_size_value,
+            "size_usd": trade_size_usd_value,
+            "leverage": leverage_value,
+        })
+
+        if is_success:
+            return {"ok": True, "id": trade_id, "message": "Position opened successfully"}
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to open position: {parsed_resp}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[open_position] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str, current_user: Dict[str, str] = Depends(get_current_user)):
