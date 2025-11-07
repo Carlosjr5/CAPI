@@ -361,6 +361,7 @@ function App() {
             const data = await res.json()
             if(data && data.found){
               positionUpdates[symbol] = data
+              console.log('[bitget] position data:', data)
               const markCandidate = Number(data.mark_price ?? data.markPrice)
               if(Number.isFinite(markCandidate)){
                 markOverride = markCandidate
@@ -371,6 +372,7 @@ function App() {
                 }
               }
             }else{
+              console.log('[bitget] position not found or failed:', data)
               const failurePayload = data && typeof data === 'object' ? data : { found: false, reason: 'unavailable' }
               positionUpdates[symbol] = { ...failurePayload, found: false }
               if(failurePayload && (failurePayload.reason === 'dry_run' || failurePayload.reason === 'not_configured') && import.meta.env.MODE !== 'development'){
@@ -378,6 +380,23 @@ function App() {
               } else if(failurePayload.reason !== 'dry_run' && failurePayload.reason !== 'not_configured'){
                 // Position not found in Bitget - mark as closed in our system
                 needsTradeRefresh = true
+
+                // Immediately close the trade in database if position no longer exists on Bitget
+                try {
+                  const closeRes = await fetch(buildApiUrl('/bitget/close-position'), {
+                    method: 'POST',
+                    headers: authHeaders({ 'Content-Type': 'application/json' }),
+                    body: JSON.stringify({
+                      trade_id: openTrades.find(t => t.symbol === symbol)?.id,
+                      reason: 'external_close'
+                    })
+                  })
+                  if (closeRes.ok) {
+                    console.log(`[bitget] closed position for ${symbol} as it no longer exists on Bitget`)
+                  }
+                } catch (closeError) {
+                  console.error(`[bitget] failed to close position for ${symbol}:`, closeError)
+                }
               }
             }
           }else{
@@ -657,17 +676,18 @@ function App() {
     const sizeValue = toNumber(snapshot.size ?? snapshot.signed_size ?? snapshot.hold_vol ?? snapshot.holdVol) ?? tradeSize
     const entryPrice = toNumber(snapshot.avg_open_price ?? snapshot.avgOpenPrice ?? snapshot.entry_price ?? snapshot.entryPrice) ?? tradeEntryPrice
     const markPrice = toNumber(snapshot.mark_price ?? snapshot.markPrice ?? snapshot.index_price ?? snapshot.indexPrice)
-    const margin = toNumber(snapshot.margin ?? snapshot.margin_usd ?? snapshot.marginUsd)
-    const leverage = toNumber(snapshot.leverage ?? snapshot.leverageCross ?? snapshot.leverage_multi ?? snapshot.leverageMulti)
+    const margin = toNumber(snapshot.margin ?? snapshot.margin_usd ?? snapshot.marginUsd ?? snapshot.marginSize ?? snapshot.positionMargin)
+    const leverage = toNumber(snapshot.leverage ?? snapshot.leverageCross ?? snapshot.leverage_multi ?? snapshot.leverageMulti ?? snapshot.marginLeverage)
     const notional = (() => {
-      const explicit = toNumber(snapshot.notional ?? snapshot.size_usd ?? snapshot.sizeUsd)
+      const explicit = toNumber(snapshot.notional ?? snapshot.size_usd ?? snapshot.sizeUsd ?? snapshot.positionValue ?? snapshot.positionValueUsd)
       if (explicit !== null) return explicit
       if (sizeValue !== null && entryPrice !== null) return sizeValue * entryPrice
+      if (sizeValue !== null && markPrice !== null) return sizeValue * markPrice
       return null
     })()
-    const liquidationPrice = toNumber(snapshot.liquidation_price ?? snapshot.liquidationPrice ?? snapshot.liq_price ?? snapshot.liqPrice)
-    const pnlRatio = toNumber(snapshot.pnl_ratio ?? snapshot.pnlRatio ?? snapshot.uplRatio ?? snapshot.uplRate ?? snapshot.roe)
-    const unrealizedPnl = toNumber(snapshot.unrealized_pnl ?? snapshot.unrealizedPnl ?? snapshot.upl)
+    const liquidationPrice = toNumber(snapshot.liquidation_price ?? snapshot.liquidationPrice ?? snapshot.liq_price ?? snapshot.liqPrice ?? snapshot.liquidationPx)
+    const pnlRatio = toNumber(snapshot.pnl_ratio ?? snapshot.pnlRatio ?? snapshot.uplRatio ?? snapshot.uplRate ?? snapshot.roe ?? snapshot.unrealizedPLRatio)
+    const unrealizedPnl = toNumber(snapshot.unrealized_pnl ?? snapshot.unrealizedPnl ?? snapshot.upl ?? snapshot.unrealizedPL)
 
     const totalValue = notional !== null
       ? notional
@@ -1113,7 +1133,7 @@ function App() {
                         const headers = authHeaders({ 'Content-Type': 'application/json' })
                         if(formSecret) headers['Tradingview-Secret'] = formSecret
                         const res = await fetch(buildApiUrl('/debug/place-test'), { method: 'POST', headers, body: JSON.stringify(body) })
-                        if(res.status === 401 || res.status === 403){ handleLogout(); return }
+                        if(res.status === 401){ handleLogout(); return }
                         let parsed = null
                         const text = await res.text()
                         let parsedResponse = null
@@ -1156,7 +1176,7 @@ function App() {
                             const headers = authHeaders({ 'Content-Type': 'application/json' })
                             if(formSecret) headers['Tradingview-Secret'] = formSecret
                             const res = await fetch(buildApiUrl('/debug/order-status'), { method: 'POST', headers, body: JSON.stringify(body) })
-                            if(res.status === 401 || res.status === 403){ handleLogout(); return }
+                            if(res.status === 401){ handleLogout(); return }
                             const text = await res.text()
                             let parsed = null
                             try{ parsed = JSON.parse(text) }catch(error){ parsed = { raw_response: text } }

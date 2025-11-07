@@ -740,9 +740,22 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
             resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
             data = resp.json()
 
+            try:
+                print(f"[bitget][position] fetch response for {symbol}: status={resp.status_code} data={data}")
+            except Exception:
+                pass
+
         if not isinstance(data, dict):
+            try:
+                print(f"[bitget][position] invalid response type for {symbol}: {type(data)}")
+            except Exception:
+                pass
             return None
         if str(data.get("code")) != "00000":
+            try:
+                print(f"[bitget][position] API error for {symbol}: code={data.get('code')} msg={data.get('msg')}")
+            except Exception:
+                pass
             return None
 
         payload = data.get("data")
@@ -750,6 +763,12 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
             return payload
         if isinstance(payload, list) and payload:
             return payload[0]
+
+        try:
+            print(f"[bitget][position] no valid position data found for {symbol}: payload={payload}")
+        except Exception:
+            pass
+        return None
     except Exception as exc:
         try:
             print(f"[bitget][position] failed to fetch position for {symbol}: {exc}")
@@ -2117,15 +2136,16 @@ async def get_bitget_position(symbol: str, current_user: Dict[str, str] = Depend
     return normalized
 
 
-@app.post("/bitget/close-position", dependencies=[Depends(require_role(["admin"]))])
-async def close_position(request: Request):
-    """Close a position for a specific trade ID (admin only)."""
+@app.post("/bitget/close-position")
+async def close_position(request: Request, current_user: Dict[str, str] = Depends(get_current_user)):
+    """Close a position for a specific trade ID."""
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     trade_id = body.get("trade_id")
+    reason = body.get("reason", "manual_close")
     if not trade_id:
         raise HTTPException(status_code=400, detail="Missing required field: 'trade_id'")
 
@@ -2136,26 +2156,62 @@ async def close_position(request: Request):
 
     trade_row = dict(trade_row)
 
-    # Only allow closing if status is "placed"
-    if trade_row.get("status") != "placed":
+    # Allow closing if status is "placed" or if it's an external close (position disappeared from Bitget)
+    if trade_row.get("status") != "placed" and reason != "external_close":
         raise HTTPException(status_code=400, detail=f"Cannot close trade with status '{trade_row.get('status')}'")
 
-    # Attempt to close the position on Bitget
-    await close_existing_bitget_position(trade_row)
+    # Only attempt Bitget API close for manual closes, not for external closes
+    if reason != "external_close":
+        # Attempt to close the position on Bitget
+        await close_existing_bitget_position(trade_row)
 
-    # Get current market price for exit_price (since it's a market close)
-    symbol = trade_row.get("symbol", "")
-    exit_price = None
-    if symbol:
-        exit_price = await get_market_price_with_retries(symbol)
+        # Get current market price for exit_price (since it's a market close)
+        symbol = trade_row.get("symbol", "")
+        exit_price = None
+        if symbol:
+            exit_price = await get_market_price_with_retries(symbol)
 
-    # Calculate realized PnL if possible
-    entry_price = safe_float(trade_row.get("price"))
-    size_value = safe_float(trade_row.get("size"))
-    realized_pnl = None
-    if exit_price is not None and entry_price is not None and size_value is not None and size_value != 0:
-        direction = 1 if str(trade_row.get("signal") or "").upper() in ("BUY", "LONG") else -1
-        realized_pnl = float((exit_price - entry_price) * size_value * direction)
+        # Calculate realized PnL if possible
+        entry_price = safe_float(trade_row.get("price"))
+        size_value = safe_float(trade_row.get("size"))
+        realized_pnl = None
+        if exit_price is not None and entry_price is not None and size_value is not None and size_value != 0:
+            direction = 1 if str(trade_row.get("signal") or "").upper() in ("BUY", "LONG") else -1
+            realized_pnl = float((exit_price - entry_price) * size_value * direction)
+    else:
+        # For external closes, use current market price and calculate PnL
+        symbol = trade_row.get("symbol", "")
+        exit_price = None
+        realized_pnl = None
+        if symbol:
+            exit_price = await get_market_price_with_retries(symbol)
+
+            # Calculate realized PnL based on last known Bitget position data
+            try:
+                position_snapshot = await fetch_bitget_position(symbol)
+                if position_snapshot:
+                    unrealized = safe_float(position_snapshot.get("unrealizedPL") or position_snapshot.get("unrealized_pnl"))
+                    if unrealized is not None:
+                        realized_pnl = unrealized
+                    else:
+                        # Fallback to calculation
+                        entry_price = safe_float(trade_row.get("price"))
+                        size_value = safe_float(trade_row.get("size"))
+                        if exit_price is not None and entry_price is not None and size_value is not None and size_value != 0:
+                            direction = 1 if str(trade_row.get("signal") or "").upper() in ("BUY", "LONG") else -1
+                            realized_pnl = float((exit_price - entry_price) * size_value * direction)
+                else:
+                    # Fallback calculation if no position data
+                    entry_price = safe_float(trade_row.get("price"))
+                    size_value = safe_float(trade_row.get("size"))
+                    if exit_price is not None and entry_price is not None and size_value is not None and size_value != 0:
+                        direction = 1 if str(trade_row.get("signal") or "").upper() in ("BUY", "LONG") else -1
+                        realized_pnl = float((exit_price - entry_price) * size_value * direction)
+            except Exception as e:
+                try:
+                    print(f"[close-position] error calculating PnL for external close: {e}")
+                except Exception:
+                    pass
 
     # Update trade status and exit details
     update_values = {"status": "closed"}
@@ -2170,7 +2226,7 @@ async def close_position(request: Request):
     await broadcast({
         "type": "closed",
         "id": trade_id,
-        "reason": "manual_close",
+        "reason": reason,
         "exit_price": exit_price,
         "realized_pnl": realized_pnl,
     })
