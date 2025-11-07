@@ -711,19 +711,9 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
         return None
     if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
         return None
-    try:
-        raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
-        if "_" not in raw and BITGET_PRODUCT_TYPE:
-            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
-        else:
-            bitget_symbol = raw
 
-        body_obj = {"symbol": bitget_symbol}
-        if BITGET_MARGIN_COIN:
-            body_obj["marginCoin"] = BITGET_MARGIN_COIN
+    async def _post_bitget(request_path: str, body_obj: Dict[str, Any], label: str) -> Optional[Any]:
         body = json.dumps(body_obj, separators=(",", ":"))
-        request_path = "/api/mix/v1/position/singlePosition"
-
         timestamp = str(int(time.time() * 1000))
         sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
         headers = {
@@ -736,36 +726,109 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
             "locale": "en-US",
         }
 
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
-            data = resp.json()
-
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+                data = resp.json()
+        except Exception as exc:
             try:
-                print(f"[bitget][position] fetch response for {symbol}: status={resp.status_code} data={data}")
+                print(f"[bitget][position] request failure ({label}) for {symbol}: {exc}")
             except Exception:
                 pass
+            return None
+
+        try:
+            print(f"[bitget][position] response ({label}) for {symbol}: status={resp.status_code} data={data}")
+        except Exception:
+            pass
 
         if not isinstance(data, dict):
             try:
-                print(f"[bitget][position] invalid response type for {symbol}: {type(data)}")
+                print(f"[bitget][position] invalid response type ({label}) for {symbol}: {type(data)}")
             except Exception:
                 pass
             return None
+
         if str(data.get("code")) != "00000":
             try:
-                print(f"[bitget][position] API error for {symbol}: code={data.get('code')} msg={data.get('msg')}")
+                print(f"[bitget][position] API error ({label}) for {symbol}: code={data.get('code')} msg={data.get('msg')}")
             except Exception:
                 pass
             return None
 
-        payload = data.get("data")
+        return data.get("data")
+
+    def _pick_snapshot(payload: Optional[Any], desired_symbol: str) -> Optional[Dict[str, Any]]:
         if isinstance(payload, dict):
-            return payload
-        if isinstance(payload, list) and payload:
-            return payload[0]
+            return payload if payload else None
+        if isinstance(payload, list):
+            for entry in payload:
+                if not isinstance(entry, dict):
+                    continue
+                if not desired_symbol or entry.get("symbol") == desired_symbol:
+                    return entry
+            return payload[0] if payload and isinstance(payload[0], dict) else None
+        return None
+
+    try:
+        raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
+        if "_" not in raw and BITGET_PRODUCT_TYPE:
+            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+        else:
+            bitget_symbol = raw
+
+        primary_body: Dict[str, Any] = {"symbol": bitget_symbol}
+        if BITGET_MARGIN_COIN:
+            primary_body["marginCoin"] = BITGET_MARGIN_COIN
+        if BITGET_PRODUCT_TYPE:
+            primary_body.setdefault("productType", BITGET_PRODUCT_TYPE)
+        if BITGET_POSITION_SIDE:
+            primary_body["holdSide"] = BITGET_POSITION_SIDE
+
+        # 1) Primary request (single position with explicit parameters)
+        payload = await _post_bitget("/api/mix/v1/position/singlePosition", primary_body, "single")
+        snapshot = _pick_snapshot(payload, bitget_symbol)
+        if snapshot:
+            return snapshot
+
+        # 2) Retry without holdSide if it was provided (some accounts reject the extra field)
+        if "holdSide" in primary_body:
+            fallback_body = dict(primary_body)
+            fallback_body.pop("holdSide", None)
+            payload = await _post_bitget("/api/mix/v1/position/singlePosition", fallback_body, "single-no-holdSide")
+            snapshot = _pick_snapshot(payload, bitget_symbol)
+            if snapshot:
+                return snapshot
+
+        # 3) Retry without productType if the API rejected the narrower filter
+        if "productType" in primary_body:
+            fallback_body = {k: v for k, v in primary_body.items() if k != "productType"}
+            payload = await _post_bitget("/api/mix/v1/position/singlePosition", fallback_body, "single-no-productType")
+            snapshot = _pick_snapshot(payload, bitget_symbol)
+            if snapshot:
+                return snapshot
+
+        # 4) Fallback: fetch all positions for the product type and search for the symbol
+        all_body: Dict[str, Any] = {}
+        if BITGET_PRODUCT_TYPE:
+            all_body["productType"] = BITGET_PRODUCT_TYPE
+        if BITGET_MARGIN_COIN:
+            all_body["marginCoin"] = BITGET_MARGIN_COIN
+
+        payload = await _post_bitget("/api/mix/v1/position/allPosition", all_body, "all")
+        snapshot = _pick_snapshot(payload, bitget_symbol)
+        if snapshot:
+            return snapshot
+
+        # 5) As a final attempt, remove productType filter when searching all positions
+        if all_body:
+            payload = await _post_bitget("/api/mix/v1/position/allPosition", {}, "all-unfiltered")
+            snapshot = _pick_snapshot(payload, bitget_symbol)
+            if snapshot:
+                return snapshot
 
         try:
-            print(f"[bitget][position] no valid position data found for {symbol}: payload={payload}")
+            print(f"[bitget][position] no position snapshot found for {symbol} after fallbacks")
         except Exception:
             pass
         return None

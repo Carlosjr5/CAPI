@@ -146,6 +146,7 @@ function App() {
   const rateIntervalRef = useRef(null)
   const tradesRef = useRef([])
   const bitgetDisabledRef = useRef(false)
+  const bitgetPositionsRef = useRef({})
   const eventsRef = useRef(null)
 
   const isAdmin = role === 'admin'
@@ -154,8 +155,8 @@ function App() {
     if (!symbol) return null
     const key = normalizeSymbolKey(symbol)
     if (!key) return null
-    return bitgetPositions?.[key] ?? null
-  }, [bitgetPositions])
+    return bitgetPositionsRef.current?.[key] ?? null
+  }, [])
 
   const handleLogout = useCallback(() => {
     if (wsRef.current) {
@@ -177,6 +178,7 @@ function App() {
     tradesRef.current = []
     setCurrentPrices({})
     setBitgetPositions({})
+    bitgetPositionsRef.current = {}
     setUsdToEurRate(null)
     setLastOrderResult(null)
     setLastOrderQuery(null)
@@ -357,6 +359,7 @@ function App() {
     if(symbols.length === 0){
       setCurrentPrices({})
       setBitgetPositions({})
+      bitgetPositionsRef.current = {}
       return
     }
 
@@ -372,6 +375,7 @@ function App() {
       }
       const encodedSymbol = encodeURIComponent(symbol)
       let markOverride
+      const previousEntry = normalizedKey ? bitgetPositionsRef.current?.[normalizedKey] : undefined
 
       if(!bitgetDisabledRef.current){
         try{
@@ -415,26 +419,32 @@ function App() {
               if(failureReason && (failureReason === 'dry_run' || failureReason === 'not_configured') && import.meta.env.MODE !== 'development'){
                 bitgetDisabledRef.current = true
               } else if(normalizedKey && (failureReason === 'not_found' || failureReason === 'empty')){
-                // Position absent on Bitget - mark as closed in our system
-                needsTradeRefresh = true
+                const previouslyFound = previousEntry?.found !== false && previousEntry !== null && previousEntry !== undefined
+                if(previouslyFound){
+                  // Position was previously found but now missing - mark as closed in our system
+                  needsTradeRefresh = true
 
-                const matchingTrade = openTrades.find((t) => normalizeSymbolKey(t.symbol) === normalizedKey)
-                if(matchingTrade?.id){
-                  try {
-                    const closeRes = await fetch(buildApiUrl('/bitget/close-position'), {
-                      method: 'POST',
-                      headers: authHeaders({ 'Content-Type': 'application/json' }),
-                      body: JSON.stringify({
-                        trade_id: matchingTrade.id,
-                        reason: 'external_close'
+                  const matchingTrade = openTrades.find((t) => normalizeSymbolKey(t.symbol) === normalizedKey)
+                  if(matchingTrade?.id){
+                    try {
+                      const closeRes = await fetch(buildApiUrl('/bitget/close-position'), {
+                        method: 'POST',
+                        headers: authHeaders({ 'Content-Type': 'application/json' }),
+                        body: JSON.stringify({
+                          trade_id: matchingTrade.id,
+                          reason: 'external_close'
+                        })
                       })
-                    })
-                    if (closeRes.ok) {
-                      console.log(`[bitget] closed position for ${symbol} as it no longer exists on Bitget`)
+                      if (closeRes.ok) {
+                        console.log(`[bitget] closed position for ${symbol} after Bitget reported it missing`)
+                      }
+                    } catch (closeError) {
+                      console.error(`[bitget] failed to close position for ${symbol}:`, closeError)
                     }
-                  } catch (closeError) {
-                    console.error(`[bitget] failed to close position for ${symbol}:`, closeError)
                   }
+                } else {
+                  // Likely a fresh trade still being acknowledged by Bitget
+                  console.log(`[bitget] awaiting position availability for ${symbol} (Bitget returned ${failureReason})`)
                 }
               }
             }
@@ -498,6 +508,7 @@ function App() {
 
     setBitgetPositions(prev => {
       if(bitgetDisabledRef.current){
+        bitgetPositionsRef.current = prev
         return prev
       }
       const next = {}
@@ -510,6 +521,7 @@ function App() {
           next[key] = null
         }
       }
+      bitgetPositionsRef.current = next
       return next
     })
 
