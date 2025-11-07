@@ -1,6 +1,30 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import TradeTable from './TradeTable'
 
+const TradingViewChart = ({ latestOpenTrade }) => {
+  const symbol = latestOpenTrade && latestOpenTrade.symbol
+    ? `BINANCE:${latestOpenTrade.symbol.replace('USDT', 'USDT')}`
+    : 'BINANCE:BTCUSDT'
+
+  return (
+    <div className="card tradingview-card">
+      <div className="card-heading">
+        <h3>TradingView Chart</h3>
+      </div>
+      <div className="tradingview-chart-container">
+        <iframe
+          src={`https://www.tradingview.com/widgetembed/?frameElementId=tradingview-widget&symbol=${encodeURIComponent(symbol)}&interval=D&hidesidetoolbar=1&saveimage=0&toolbarbg=131722&studies=[]&theme=dark&style=1&timezone=Etc%2FUTC&withdateranges=1&showpopupbutton=0&studies_overrides={}&overrides={}&enabled_features=[]&disabled_features=[]&showpopupbutton=0&locale=en`}
+          frameBorder="0"
+          width="100%"
+          height="400"
+          title="TradingView Chart"
+          sandbox="allow-scripts allow-same-origin allow-popups allow-presentation"
+        />
+      </div>
+    </div>
+  )
+}
+
 const STORAGE_TOKEN_KEY = 'capi_token'
 const STORAGE_ROLE_KEY = 'capi_role'
 
@@ -18,9 +42,13 @@ const DEFAULT_LEVERAGE_FALLBACK = (() => {
 
 const currencyFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 })
 const numberFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 })
-const leverageFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 })
 
 const isFiniteNumber = (value) => Number.isFinite(Number(value))
+const getPnlTone = (value) => {
+  if (value > 0) return 'positive'
+  if (value < 0) return 'negative'
+  return 'neutral'
+}
 
 export default function App(){
   const [token, setToken] = useState(() => localStorage.getItem(STORAGE_TOKEN_KEY) || '')
@@ -90,12 +118,6 @@ export default function App(){
       return new Intl.NumberFormat('en-US', { maximumFractionDigits: digits }).format(num)
     }
     return numberFormatter.format(num)
-  }, [])
-
-  const formatLeverage = useCallback((value) => {
-    const num = Number(value)
-    if (!Number.isFinite(num) || num <= 0) return '—'
-    return `${leverageFormatter.format(num)}x`
   }, [])
 
   const isLocalFrontend = useCallback(() => {
@@ -251,8 +273,8 @@ export default function App(){
     }
   }
 
-  function calculatePnL(trade){
-    const currentPrice = Number(currentPrices[trade.symbol])
+  function calculatePnL(trade, prices = currentPrices){
+    const currentPrice = Number(prices[trade.symbol])
     const entryPrice = Number(trade.price)
     const sizeValue = Number(trade.size)
     if(!Number.isFinite(currentPrice) || !Number.isFinite(entryPrice) || !Number.isFinite(sizeValue)) return null
@@ -365,6 +387,21 @@ export default function App(){
   const { openTrades, latestOpenTrade, lastClosedTrade, counts } = tradeSummary
   const positionPnL = latestOpenTrade ? calculatePnL(latestOpenTrade) : null
 
+  // Calculate total PnL metrics
+  const totalUnrealizedPnL = trades
+    .filter(t => mapStatus(t.status) === 'open')
+    .map(t => calculatePnL(t))
+    .filter(pnl => pnl !== null)
+    .reduce((sum, pnl) => sum + pnl, 0)
+
+  const totalRealizedPnL = trades
+    .filter(t => mapStatus(t.status) === 'closed')
+    .map(t => calculatePnL(t))
+    .filter(pnl => pnl !== null)
+    .reduce((sum, pnl) => sum + pnl, 0)
+
+  const totalPnL = totalUnrealizedPnL + totalRealizedPnL
+
   const positionMetrics = useMemo(() => {
     if(!latestOpenTrade) return null
     const rawSize = Number(latestOpenTrade.size)
@@ -423,37 +460,20 @@ export default function App(){
       : positionMetrics.notional !== null
         ? formatCurrency(positionMetrics.notional)
         : '—'
-    const leverageDisplay = formatLeverage(positionMetrics.leverage)
     const totalDisplay = formatCurrency(positionMetrics.totalValue ?? positionMetrics.notional)
-    const marginDisplay = positionMetrics.margin !== null && isFiniteNumber(positionMetrics.margin)
-      ? formatCurrency(positionMetrics.margin)
-      : '—'
-    const entryDisplay = formatCurrency(positionMetrics.entryPrice)
     const markDisplay = formatCurrency(positionMetrics.currentPrice)
     const pnlDisplay = positionPnL !== null && isFiniteNumber(positionPnL) ? formatCurrency(positionPnL) : '—'
 
-    const liquidationDisplay = positionMetrics.liquidationPrice !== null && isFiniteNumber(positionMetrics.liquidationPrice)
-      ? formatCurrency(positionMetrics.liquidationPrice)
-      : '—'
-
     return {
       sizeDisplay,
-      leverageDisplay,
       totalDisplay,
-      marginDisplay,
-      entryDisplay,
       markDisplay,
       pnlDisplay,
-  sizeUsdDisplay,
-  liquidationDisplay,
-      hasMargin: positionMetrics.margin !== null && isFiniteNumber(positionMetrics.margin),
-      hasLeverage: !!positionMetrics.leverage,
-      hasTotal: positionMetrics.totalValue !== null,
       sideDisplay: `${(latestOpenTrade.signal || '').toUpperCase()} ${baseSymbol}`,
       sideTone: latestOpenTrade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short',
       pnlTone: positionPnL > 0 ? 'positive' : positionPnL < 0 ? 'negative' : 'neutral'
     }
-  }, [latestOpenTrade, positionMetrics, formatNumber, formatLeverage, formatCurrency, positionPnL])
+  }, [latestOpenTrade, positionMetrics, formatNumber, formatCurrency, positionPnL])
 
   async function handleLogin(e){
     e?.preventDefault?.()
@@ -537,6 +557,17 @@ export default function App(){
       </header>
       <main className="dashboard-layout">
         <section className="dashboard-primary">
+          <div className="metric-grid pnl-grid">
+            <div className="metric-card pnl-card">
+              <span className="metric-label">Total Unrealized</span>
+              <span className={`metric-value pnl-value ${getPnlTone(totalUnrealizedPnL)}`}>{formatCurrency(totalUnrealizedPnL)}</span>
+            </div>
+            <div className="metric-card pnl-card">
+              <span className="metric-label">Total Realized</span>
+              <span className={`metric-value pnl-value ${getPnlTone(totalRealizedPnL)}`}>{formatCurrency(totalRealizedPnL)}</span>
+            </div>
+          </div>
+
           <div className="metric-grid">
             <div className="metric-card">
               <span className="metric-label">Open</span>
@@ -588,18 +619,6 @@ export default function App(){
                       <span className="stat-label">Total Value</span>
                       <span className="stat-value">{positionOverview.totalDisplay}</span>
                     </div>
-                    <div className={`hero-stat ${positionOverview.hasLeverage ? '' : 'stat-missing'}`}>
-                      <span className="stat-label">Leverage</span>
-                      <span className="stat-value">{positionOverview.leverageDisplay}</span>
-                    </div>
-                    <div className={`hero-stat ${positionOverview.hasMargin ? '' : 'stat-missing'}`}>
-                      <span className="stat-label">Margin</span>
-                      <span className="stat-value">{positionOverview.marginDisplay}</span>
-                    </div>
-                    <div className="hero-stat">
-                      <span className="stat-label">Entry</span>
-                      <span className="stat-value">{positionOverview.entryDisplay}</span>
-                    </div>
                     <div className="hero-stat">
                       <span className="stat-label">Mark</span>
                       <span className="stat-value">{positionOverview.markDisplay}</span>
@@ -607,10 +626,6 @@ export default function App(){
                     <div className={`hero-stat pnl ${positionOverview.pnlTone}`}>
                       <span className="stat-label">PnL</span>
                       <span className="stat-value">{positionOverview.pnlDisplay}</span>
-                    </div>
-                    <div className="hero-stat liquidation">
-                      <span className="stat-label">Liq. Price</span>
-                      <span className="stat-value">{positionOverview.liquidationDisplay}</span>
                     </div>
                   </div>
                 </div>
@@ -645,7 +660,9 @@ export default function App(){
             </div>
           )}
 
-          <TradeTable items={trades} onRefresh={fetchTrades} />
+          <TradingViewChart latestOpenTrade={latestOpenTrade} />
+
+          <TradeTable items={trades} onRefresh={fetchTrades} calculatePnL={calculatePnL} formatCurrency={formatCurrency} currentPrices={currentPrices} />
         </section>
 
         <aside className="dashboard-secondary">

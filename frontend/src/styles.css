@@ -22,6 +22,9 @@ body{margin:0;background:#0f172a;color:#e2e8f0;-webkit-font-smoothing:antialiase
 .metric-card{background:linear-gradient(135deg,rgba(15,118,110,0.45),rgba(14,165,233,0.25));border:1px solid rgba(148,163,184,0.18);padding:16px 18px;border-radius:16px;box-shadow:0 16px 30px rgba(8,47,73,0.35);display:flex;flex-direction:column;gap:6px;width:100%;min-width:0}
 .metric-card .metric-label{font-size:13px;text-transform:uppercase;letter-spacing:1.8px;color:rgba(226,232,240,0.68)}
 .metric-card .metric-value{font-size:26px;font-weight:700;color:#f8fafc}
+.pnl-value.positive{color:#4ade80}
+.pnl-value.negative{color:#f87171}
+.pnl-value.neutral{color:#f8fafc}
 
 .card{background:rgba(15,23,42,0.78);border:1px solid rgba(148,163,184,0.16);border-radius:18px;padding:20px 22px;box-shadow:0 22px 32px rgba(8,15,35,0.4);display:flex;flex-direction:column;gap:14px;width:100%;max-width:100%;min-width:0}
 .card-heading{display:flex;justify-content:space-between;align-items:center;gap:10px}
@@ -123,6 +126,8 @@ button:disabled{opacity:0.6;cursor:not-allowed;filter:none;transform:none}
 .trades thead{background:rgba(148,163,184,0.12)}
 .trades th{padding:14px 16px;text-align:left;font-size:13px;text-transform:uppercase;letter-spacing:1.4px;color:rgba(226,232,240,0.7)}
 .trades td{padding:14px 16px;font-size:14px;color:#f8fafc;border-bottom:1px solid rgba(148,163,184,0.08)}
+.trades td.positive{color:#4ade80;font-weight:600}
+.trades td.negative{color:#f87171;font-weight:600}
 .table-card{overflow:hidden}
 .table-scroller{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}
 .table-scroller::-webkit-scrollbar{height:6px}
