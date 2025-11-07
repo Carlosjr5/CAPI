@@ -1,5 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import TradeTable from './TradeTable'
+import TradingViewChart from './TradingViewChart'
 
 const TradingViewChart = ({ latestOpenTrade }) => {
   const symbol = latestOpenTrade && latestOpenTrade.symbol
@@ -35,7 +36,6 @@ const DEFAULT_LEVERAGE_FALLBACK = (() => {
     const parsed = Number(raw)
     return Number.isFinite(parsed) ? parsed : null
   } catch (error) {
-    console.warn('[ui] unable to parse VITE_DEFAULT_LEVERAGE', error)
     return null
   }
 })()
@@ -50,23 +50,38 @@ const getPnlTone = (value) => {
   return 'neutral'
 }
 
-export default function App(){
-  const [token, setToken] = useState(() => localStorage.getItem(STORAGE_TOKEN_KEY) || '')
-  const [role, setRole] = useState(() => localStorage.getItem(STORAGE_ROLE_KEY) || '')
-  const [authChecked, setAuthChecked] = useState(false)
+const WATCH_SYMBOLS = (() => {
+  try {
+    const rawList = import.meta?.env?.VITE_WATCH_SYMBOLS || import.meta?.env?.VITE_DEFAULT_SYMBOL || ''
+    if (!rawList) return []
+    return rawList.split(',').map((item) => item.trim()).filter(Boolean)
+  } catch (error) {
+    return []
+  }
+})()
+
+const normalizeSymbolKey = (value) => (value || '').replace(/[^A-Z0-9]/gi, '').toUpperCase()
+const EM_DASH = '\u2014'
+const BULLET = '\u2022'
+
+function App() {
+  // State variables
   const [loginUsername, setLoginUsername] = useState('')
   const [loginPassword, setLoginPassword] = useState('')
   const [loginError, setLoginError] = useState('')
   const [loginLoading, setLoginLoading] = useState(false)
 
-  const [trades, setTrades] = useState([])
-  const tradesRef = useRef([])
-  const [status, setStatus] = useState('Disconnected')
-  const eventsRef = useRef(null)
-  const wsRef = useRef(null)
-  const priceIntervalRef = useRef(null)
-  const [currentPrices, setCurrentPrices] = useState({})
+  const [token, setToken] = useState(localStorage.getItem(STORAGE_TOKEN_KEY))
+  const [role, setRole] = useState(localStorage.getItem(STORAGE_ROLE_KEY))
+  const [authChecked, setAuthChecked] = useState(false)
 
+  const [trades, setTrades] = useState([])
+  const [status, setStatus] = useState('Disconnected')
+  const [currentPrices, setCurrentPrices] = useState({})
+  const [bitgetPositions, setBitgetPositions] = useState({})
+  const [usdToEurRate, setUsdToEurRate] = useState(null)
+
+  // Form states for admin
   const [formSecret, setFormSecret] = useState('')
   const [formSymbol, setFormSymbol] = useState('BTCUSDT')
   const [formSide, setFormSide] = useState('BUY')
@@ -75,7 +90,23 @@ export default function App(){
   const [lastOrderResult, setLastOrderResult] = useState(null)
   const [lastOrderQuery, setLastOrderQuery] = useState(null)
 
+  // Refs
+  const wsRef = useRef(null)
+  const priceIntervalRef = useRef(null)
+  const rateIntervalRef = useRef(null)
+  const tradesRef = useRef([])
+  const bitgetDisabledRef = useRef(false)
+  const bitgetPositionsRef = useRef({})
+  const eventsRef = useRef(null)
+
   const isAdmin = role === 'admin'
+
+  const getBitgetSnapshot = useCallback((symbol) => {
+    if (!symbol) return null
+    const key = normalizeSymbolKey(symbol)
+    if (!key) return null
+    return bitgetPositionsRef.current?.[key] ?? null
+  }, [])
 
   const handleLogout = useCallback(() => {
     if (wsRef.current) {
@@ -86,38 +117,42 @@ export default function App(){
       clearInterval(priceIntervalRef.current)
       priceIntervalRef.current = null
     }
-    setToken('')
-    setRole('')
+    if (rateIntervalRef.current) {
+      clearInterval(rateIntervalRef.current)
+      rateIntervalRef.current = null
+    }
+    bitgetDisabledRef.current = false
+
     setStatus('Disconnected')
     setTrades([])
     tradesRef.current = []
     setCurrentPrices({})
-    setFormSecret('')
-    setFormSymbol('BTCUSDT')
-    setFormSide('BUY')
-    setFormSizeUsd('100')
+    setBitgetPositions({})
+    bitgetPositionsRef.current = {}
+    setUsdToEurRate(null)
     setLastOrderResult(null)
     setLastOrderQuery(null)
+    setPlacing(false)
+
+    setToken('')
+    setRole('')
     setLoginUsername('')
     setLoginPassword('')
     setLoginError('')
+
     localStorage.removeItem(STORAGE_TOKEN_KEY)
     localStorage.removeItem(STORAGE_ROLE_KEY)
-    setAuthChecked(true)
+    setAuthChecked(false)
   }, [])
 
   const formatCurrency = useCallback((value) => {
     const num = Number(value)
-    return Number.isFinite(num) ? currencyFormatter.format(num) : '—'
+    return Number.isFinite(num) ? currencyFormatter.format(num) : EM_DASH
   }, [])
 
-  const formatNumber = useCallback((value, digits = 4) => {
+  const formatUsdt = useCallback((value) => {
     const num = Number(value)
-    if (!Number.isFinite(num)) return '—'
-    if (digits !== 4) {
-      return new Intl.NumberFormat('en-US', { maximumFractionDigits: digits }).format(num)
-    }
-    return numberFormatter.format(num)
+    return Number.isFinite(num) ? `${usdtFormatter.format(num)} USDT` : EM_DASH
   }, [])
 
   const isLocalFrontend = useCallback(() => {
@@ -129,77 +164,57 @@ export default function App(){
     return localHosts.includes(host) && (localPorts.includes(port) || port === '')
   }, [])
 
-  const getApiBase = useCallback(() => {
-    let viteBase = ''
-    try {
-      viteBase = import.meta?.env?.VITE_API_BASE || ''
-    } catch (error) {
-      console.warn('[ui] unable to read VITE_API_BASE', error)
-    }
-    const defaultLocalApi = 'http://127.0.0.1:8000'
-    if (isLocalFrontend()) {
-      return viteBase || defaultLocalApi
-    }
-    return ''
-  }, [isLocalFrontend])
-
-  const buildApiUrl = useCallback((path) => {
-    const base = getApiBase()
-    const normalizedBase = base ? base.replace(/\/$/, '') : ''
-    return `${normalizedBase}${path}`
-  }, [getApiBase])
-
-  const buildWsUrl = useCallback(() => {
-    const base = getApiBase()
-    if (base) {
-      try {
-        const parsed = new URL(base)
-        parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:'
-        parsed.pathname = '/ws'
-        parsed.search = ''
-        parsed.hash = ''
-        return parsed.toString()
-      } catch (error) {
-        const sanitized = base.replace(/\/+$/, '')
-        return sanitized.replace(/^http(s)?:/i, (_, secure) => (secure ? 'wss:' : 'ws:')) + '/ws'
-      }
-    }
-    if (typeof window === 'undefined') return ''
-    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-    return `${proto}://${window.location.host}/ws`
-  }, [getApiBase])
-
-  useEffect(() => {
-    const verifyToken = async () => {
-      if (!token) {
-        setAuthChecked(true)
-        return
-      }
-      try {
-        const res = await fetch(buildApiUrl('/auth/me'), {
-          headers: { Authorization: `Bearer ${token}` }
-        })
-        if (!res.ok) {
-          throw new Error('unauthorized')
-        }
-        const data = await res.json()
-        const newRole = data.role || 'user'
-        setRole(newRole)
-        localStorage.setItem(STORAGE_TOKEN_KEY, token)
-        localStorage.setItem(STORAGE_ROLE_KEY, newRole)
-        setAuthChecked(true)
-      } catch (error) {
-        console.error('Token verification failed', error)
-        handleLogout()
-      }
-    }
-    verifyToken()
-  }, [token, handleLogout, buildApiUrl])
-
-  useEffect(() => {
-    if (!authChecked || !token) {
+  const verifyToken = useCallback(async () => {
+    if (!token) {
+      setAuthChecked(true)
       return
     }
+    try {
+      const res = await fetch(buildApiUrl('/auth/me'), { headers: authHeaders() })
+      if (!res.ok) {
+        throw new Error('unauthorized')
+      }
+      const data = await res.json()
+      const userRole = data.role || 'user'
+      setRole(userRole)
+      localStorage.setItem(STORAGE_TOKEN_KEY, token)
+      localStorage.setItem(STORAGE_ROLE_KEY, userRole)
+      setAuthChecked(true)
+    } catch (error) {
+      console.error('[verify] error', error)
+      handleLogout()
+    }
+  }, [token, handleLogout])
+
+  const fetchUsdToEur = useCallback(async () => {
+    try {
+      const res = await fetch('https://api.exchangerate.host/latest?base=USD&symbols=EUR')
+      if (!res.ok) {
+        return
+      }
+      const data = await res.json()
+      const rate = Number(data?.rates?.EUR)
+      if (Number.isFinite(rate) && rate > 0) {
+        setUsdToEurRate(rate)
+      }
+    } catch (error) {
+      console.error('[usd to eur] fetch error', error)
+    }
+    verifyToken()
+  }, [verifyToken])
+
+  useEffect(() => {
+    // Check for existing token and verify it
+    if (!authChecked) {
+      if (token) {
+        verifyToken()
+      } else {
+        setAuthChecked(true)
+      }
+      return
+    }
+
+    if (!token) return
 
     fetchTrades()
     connectWS()
@@ -221,7 +236,26 @@ export default function App(){
         wsRef.current = null
       }
     }
-  }, [authChecked, token])
+  }, [authChecked, token, verifyToken])
+
+  useEffect(() => {
+    if (!authChecked || !token) {
+      return
+    }
+
+    fetchUsdToEur()
+    if (rateIntervalRef.current) {
+      clearInterval(rateIntervalRef.current)
+    }
+    rateIntervalRef.current = setInterval(fetchUsdToEur, 15 * 60 * 1000)
+
+    return () => {
+      if (rateIntervalRef.current) {
+        clearInterval(rateIntervalRef.current)
+        rateIntervalRef.current = null
+      }
+    }
+  }, [authChecked, token, fetchUsdToEur])
 
   async function fetchTrades(){
     if (!token) return
@@ -231,6 +265,16 @@ export default function App(){
         handleLogout()
         return
       }
+      if (!res.ok) {
+        // If we get HTML instead of JSON, log it but don't crash
+        const text = await res.text()
+        if (text.includes('<!doctype') || text.includes('<html')) {
+          console.error('[trades] Server returned HTML instead of JSON, likely a backend error')
+          setTrades([])
+          return
+        }
+        throw new Error(`HTTP ${res.status}: ${text}`)
+      }
       const data = await res.json()
       const sorted = Array.isArray(data) ? [...data].sort((a,b)=>((b?.created_at||0) - (a?.created_at||0))) : []
       setTrades(sorted)
@@ -238,6 +282,7 @@ export default function App(){
       await fetchPricesForOpenPositions(sorted)
     }catch(error){
       console.error('[trades] fetch error', error)
+      setTrades([])
     }
   }
 
@@ -249,27 +294,187 @@ export default function App(){
     if (!token) return
     const source = Array.isArray(tradesData) ? tradesData : (Array.isArray(tradesRef.current) ? tradesRef.current : [])
     const openTrades = source.filter(t => mapStatus(t.status) === 'open')
-    const symbols = [...new Set(openTrades.map(t => t.symbol))]
-    if(symbols.length === 0) return
+    const openSymbols = openTrades.map(t => t.symbol).filter(Boolean)
+    const historicalSymbols = source.map(t => t.symbol).filter(Boolean)
 
-    const updates = {}
+    const symbolSet = new Set()
+    for (const sym of openSymbols) symbolSet.add(sym)
+    for (const sym of historicalSymbols) symbolSet.add(sym)
+    for (const sym of WATCH_SYMBOLS) symbolSet.add(sym)
+
+    const symbols = Array.from(symbolSet).filter(Boolean)
+    if(symbols.length === 0){
+      setCurrentPrices({})
+      setBitgetPositions({})
+      bitgetPositionsRef.current = {}
+      return
+    }
+
+    const priceUpdates = {}
+    const positionUpdates = {}
+    const normalizedKeysSet = new Set()
+    let needsTradeRefresh = false
+
     for(const symbol of symbols){
-      try{
-        const res = await fetch(buildApiUrl(`/price/${symbol}`), { headers: authHeaders() })
-        if(res.status === 401 || res.status === 403){
-          handleLogout()
-          return
+      const normalizedKey = normalizeSymbolKey(symbol)
+      if(normalizedKey){
+        normalizedKeysSet.add(normalizedKey)
+      }
+      const encodedSymbol = encodeURIComponent(symbol)
+      let markOverride
+      const previousEntry = normalizedKey ? bitgetPositionsRef.current?.[normalizedKey] : undefined
+
+      if(!bitgetDisabledRef.current){
+        try{
+          const res = await fetch(buildApiUrl(`/bitget/position/${encodedSymbol}`), { headers: authHeaders() })
+          if(res.status === 401 || res.status === 403){
+            handleLogout()
+            return
+          }
+          if(res.ok){
+            const data = await res.json()
+            if(data && data.found){
+              if(normalizedKey){
+                positionUpdates[normalizedKey] = {
+                  ...data,
+                  symbolKey: normalizedKey,
+                  requested_symbol: data.requested_symbol || symbol,
+                }
+              }
+              console.log('[bitget] position data:', data)
+              const markCandidate = Number(data.mark_price ?? data.markPrice)
+              if(Number.isFinite(markCandidate)){
+                markOverride = markCandidate
+              } else {
+                const markFallback = Number(data.index_price ?? data.indexPrice)
+                if(Number.isFinite(markFallback)){
+                  markOverride = markFallback
+                }
+              }
+            }else{
+              console.log('[bitget] position not found or failed:', data)
+              const failurePayload = data && typeof data === 'object' ? data : { found: false, reason: 'unavailable' }
+              const failureReason = typeof failurePayload?.reason === 'string' ? failurePayload.reason : ''
+              if(normalizedKey){
+                positionUpdates[normalizedKey] = {
+                  ...failurePayload,
+                  found: false,
+                  symbolKey: normalizedKey,
+                  requested_symbol: failurePayload?.requested_symbol || symbol,
+                }
+              }
+              if(failureReason && (failureReason === 'dry_run' || failureReason === 'not_configured') && import.meta.env.MODE !== 'development'){
+                bitgetDisabledRef.current = true
+              } else if(normalizedKey && (failureReason === 'not_found' || failureReason === 'empty')){
+                const previouslyFound = previousEntry?.found !== false && previousEntry !== null && previousEntry !== undefined
+                if(previouslyFound){
+                  // Position was previously found but now missing - mark as closed in our system
+                  needsTradeRefresh = true
+
+                  const matchingTrade = openTrades.find((t) => normalizeSymbolKey(t.symbol) === normalizedKey)
+                  if(matchingTrade?.id){
+                    try {
+                      const closeRes = await fetch(buildApiUrl('/bitget/close-position'), {
+                        method: 'POST',
+                        headers: authHeaders({ 'Content-Type': 'application/json' }),
+                        body: JSON.stringify({
+                          trade_id: matchingTrade.id,
+                          reason: 'external_close'
+                        })
+                      })
+                      if (closeRes.ok) {
+                        console.log(`[bitget] closed position for ${symbol} after Bitget reported it missing`)
+                      }
+                    } catch (closeError) {
+                      console.error(`[bitget] failed to close position for ${symbol}:`, closeError)
+                    }
+                  }
+                } else {
+                  // Likely a fresh trade still being acknowledged by Bitget
+                  console.log(`[bitget] awaiting position availability for ${symbol} (Bitget returned ${failureReason})`)
+                }
+              }
+            }
+          }else if(normalizedKey){
+            positionUpdates[normalizedKey] = {
+              found: false,
+              reason: `http_${res.status}`,
+              symbolKey: normalizedKey,
+              requested_symbol: symbol,
+            }
+          }
+        }catch(error){
+          console.error(`[bitget] position fetch failed for ${symbol}`, error)
+          if(normalizedKey){
+            positionUpdates[normalizedKey] = {
+              found: false,
+              reason: 'network_error',
+              symbolKey: normalizedKey,
+              requested_symbol: symbol,
+            }
+          }
         }
-        const data = await res.json()
-        if(data && data.price){
-          updates[symbol] = data.price
+      }
+
+      if(!Number.isFinite(markOverride)){
+        try{
+          const res = await fetch(buildApiUrl(`/price/${encodedSymbol}`), { headers: authHeaders() })
+          if(res.status === 401 || res.status === 403){
+            handleLogout()
+            return
+          }
+          const data = await res.json()
+          if(data && data.price !== undefined && data.price !== null){
+            const priceValue = Number(data.price)
+            if(Number.isFinite(priceValue)){
+              priceUpdates[symbol] = priceValue
+            }
+          }
+        }catch(error){
+          console.error(`[price] failed for ${symbol}`, error)
         }
-      }catch(error){
-        console.error(`[price] failed for ${symbol}`, error)
+      }else{
+        priceUpdates[symbol] = markOverride
       }
     }
-    if(Object.keys(updates).length){
-      setCurrentPrices(prev => ({ ...prev, ...updates }))
+
+    const openSet = new Set(symbols)
+    const normalizedKeys = Array.from(normalizedKeysSet)
+
+    setCurrentPrices(prev => {
+      const next = {}
+      for(const sym of openSet){
+        if(Object.prototype.hasOwnProperty.call(priceUpdates, sym)){
+          next[sym] = priceUpdates[sym]
+        }else if(prev[sym] !== undefined){
+          next[sym] = prev[sym]
+        }
+      }
+      return next
+    })
+
+    setBitgetPositions(prev => {
+      if(bitgetDisabledRef.current){
+        bitgetPositionsRef.current = prev
+        return prev
+      }
+      const next = {}
+      for(const key of normalizedKeys){
+        if(Object.prototype.hasOwnProperty.call(positionUpdates, key)){
+          next[key] = positionUpdates[key]
+        }else if(Object.prototype.hasOwnProperty.call(prev, key)){
+          next[key] = prev[key]
+        }else{
+          next[key] = null
+        }
+      }
+      bitgetPositionsRef.current = next
+      return next
+    })
+
+    // If positions were closed externally, refresh trades to update status
+    if(needsTradeRefresh){
+      setTimeout(() => fetchTrades(), 1000)
     }
   }
 
@@ -299,34 +504,57 @@ export default function App(){
     const wsBase = buildWsUrl()
     if (!wsBase){
       console.warn('[ws] unable to determine websocket base URL')
+      setStatus('Disconnected')
       return
     }
-    const socket = new WebSocket(`${wsBase}?token=${encodeURIComponent(token)}`)
-    wsRef.current = socket
-    socket.onopen = ()=>{ setStatus('Connected'); pushEvent('WebSocket connected') }
-    socket.onclose = (event)=>{
-      setStatus('Disconnected')
-      pushEvent('WebSocket disconnected')
-      wsRef.current = null
-      if(event && event.code === 1008){
-        pushEvent('WebSocket authentication failed; logging out.')
-        handleLogout()
-      }else if(token){
-        setTimeout(()=>{
-          if(token && !wsRef.current){
-            connectWS()
-          }
-        }, 3000)
+    try {
+      const socket = new WebSocket(`${wsBase}?token=${encodeURIComponent(token)}`)
+      wsRef.current = socket
+
+      socket.onopen = () => {
+        setStatus('Connected')
+        console.log('[ws] WebSocket connected')
       }
-    }
-    socket.onmessage = (event)=>{
-      try{
-        const payload = JSON.parse(event.data)
-        pushEvent(JSON.stringify(payload))
-        if(['received','placed','error','ignored','closed'].includes(payload.type)) {
-          fetchTrades()
+
+      socket.onclose = (event) => {
+        console.log('[ws] WebSocket closed, code:', event.code, 'reason:', event.reason)
+        setStatus('Disconnected')
+        wsRef.current = null
+        if(event && event.code === 1008){
+          console.log('[ws] Authentication failed, logging out')
+          pushEvent('WebSocket authentication failed; logging out.')
+          handleLogout()
+        }else if(token){
+          // Auto-reconnect after delay
+          setTimeout(()=>{
+            if(token && !wsRef.current){
+              console.log('[ws] Attempting reconnection')
+              connectWS()
+            }
+          }, 3000)
         }
-      }catch(error){ console.error('[ws] message parse error', error) }
+      }
+
+      socket.onmessage = (event)=>{
+        try{
+          const payload = JSON.parse(event.data)
+          console.log('[ws] Received message:', payload.type)
+          if(['received','placed','error','ignored','closed'].includes(payload.type)) {
+            fetchTrades()
+          }
+        }catch(error){
+          console.error('[ws] message parse error', error)
+        }
+      }
+
+      socket.onerror = (error) => {
+        console.error('[ws] WebSocket error:', error)
+        setStatus('Error')
+      }
+
+    } catch (error) {
+      console.error('[ws] Failed to create WebSocket:', error)
+      setStatus('Error')
     }
   }
 
@@ -403,53 +631,75 @@ export default function App(){
   const totalPnL = totalUnrealizedPnL + totalRealizedPnL
 
   const positionMetrics = useMemo(() => {
-    if(!latestOpenTrade) return null
-    const rawSize = Number(latestOpenTrade.size)
-    const rawEntryPrice = Number(latestOpenTrade.price)
-    const livePrice = Number(currentPrices[latestOpenTrade.symbol])
-    const storedSizeUsd = Number(latestOpenTrade.size_usd)
-    const storedLeverage = Number(latestOpenTrade.leverage)
+    if (!latestOpenTrade) return null
 
-    const sizeValue = Number.isFinite(rawSize) ? rawSize : null
-    const entryPrice = Number.isFinite(rawEntryPrice) ? rawEntryPrice : null
-    const currentPrice = Number.isFinite(livePrice) && livePrice > 0 ? livePrice : entryPrice
-    const notionalFromDb = Number.isFinite(storedSizeUsd) ? storedSizeUsd : null
-    const derivedNotional = sizeValue !== null && entryPrice !== null ? sizeValue * entryPrice : null
-    const notional = notionalFromDb !== null ? notionalFromDb : derivedNotional
+    const snapshot = getBitgetSnapshot(latestOpenTrade.symbol)
 
-    const leverageFromTrade = Number.isFinite(storedLeverage) && storedLeverage > 0 ? storedLeverage : null
-    const leverageFallback = Number.isFinite(DEFAULT_LEVERAGE_FALLBACK) && DEFAULT_LEVERAGE_FALLBACK > 0 ? DEFAULT_LEVERAGE_FALLBACK : null
-    const leverageValue = leverageFromTrade ?? leverageFallback ?? null
-
-    let margin = null
-    if (isFiniteNumber(latestOpenTrade.margin)) {
-      margin = Number(latestOpenTrade.margin)
-    } else if (notional !== null && leverageValue) {
-      margin = notional / leverageValue
+    const toNumber = (value) => {
+      const num = Number(value)
+      return Number.isFinite(num) ? num : null
     }
 
-    const totalValue = (sizeValue !== null && currentPrice !== null)
-      ? sizeValue * currentPrice
-      : (notional !== null ? notional : null)
+    const tradeEntryPrice = toNumber(latestOpenTrade.price)
+    const tradeSize = toNumber(latestOpenTrade.size)
 
-    let liquidationPrice = null
-    if (isFiniteNumber(latestOpenTrade.liquidation_price)) {
-      liquidationPrice = Number(latestOpenTrade.liquidation_price)
-    } else if (isFiniteNumber(latestOpenTrade.liquidationPrice)) {
-      liquidationPrice = Number(latestOpenTrade.liquidationPrice)
+    const hasSnapshot = !!snapshot && snapshot.found !== false
+    const failureReason = hasSnapshot ? null : snapshot?.reason
+
+    if (!hasSnapshot) {
+      return {
+        snapshot: snapshot ?? null,
+        hasSnapshot: false,
+        failureReason,
+        sizeValue: tradeSize,
+        entryPrice: tradeEntryPrice,
+        markPrice: null,
+        totalValue: null,
+        leverage: null,
+        margin: null,
+        notional: null,
+        liquidationPrice: null,
+        pnlRatio: null,
+        unrealizedPnl: null,
+      }
     }
+
+    const sizeValue = toNumber(snapshot.size ?? snapshot.signed_size ?? snapshot.hold_vol ?? snapshot.holdVol) ?? tradeSize
+    const entryPrice = toNumber(snapshot.avg_open_price ?? snapshot.avgOpenPrice ?? snapshot.entry_price ?? snapshot.entryPrice) ?? tradeEntryPrice
+    const markPrice = toNumber(snapshot.mark_price ?? snapshot.markPrice ?? snapshot.index_price ?? snapshot.indexPrice)
+    const margin = toNumber(snapshot.margin ?? snapshot.margin_usd ?? snapshot.marginUsd ?? snapshot.marginSize ?? snapshot.positionMargin)
+    const leverage = toNumber(snapshot.leverage ?? snapshot.leverageCross ?? snapshot.leverage_multi ?? snapshot.leverageMulti ?? snapshot.marginLeverage)
+    const notional = (() => {
+      const explicit = toNumber(snapshot.notional ?? snapshot.size_usd ?? snapshot.sizeUsd ?? snapshot.positionValue ?? snapshot.positionValueUsd)
+      if (explicit !== null) return explicit
+      if (sizeValue !== null && entryPrice !== null) return sizeValue * entryPrice
+      if (sizeValue !== null && markPrice !== null) return sizeValue * markPrice
+      return null
+    })()
+    const liquidationPrice = toNumber(snapshot.liquidation_price ?? snapshot.liquidationPrice ?? snapshot.liq_price ?? snapshot.liqPrice ?? snapshot.liquidationPx)
+    const pnlRatio = toNumber(snapshot.pnl_ratio ?? snapshot.pnlRatio ?? snapshot.uplRatio ?? snapshot.uplRate ?? snapshot.roe ?? snapshot.unrealizedPLRatio)
+    const unrealizedPnl = toNumber(snapshot.unrealized_pnl ?? snapshot.unrealizedPnl ?? snapshot.upl ?? snapshot.unrealizedPL)
+
+    const totalValue = notional !== null
+      ? notional
+      : (sizeValue !== null && markPrice !== null ? sizeValue * markPrice : null)
 
     return {
+      snapshot,
+      hasSnapshot: true,
+      failureReason: null,
       sizeValue,
       entryPrice,
-      currentPrice,
+      markPrice,
       totalValue,
-      leverage: leverageValue,
+      leverage,
       margin,
       notional,
-      liquidationPrice
+      liquidationPrice,
+      pnlRatio,
+      unrealizedPnl,
     }
-  }, [latestOpenTrade, currentPrices])
+  }, [latestOpenTrade, getBitgetSnapshot])
 
   const positionOverview = useMemo(() => {
     if (!latestOpenTrade || !positionMetrics) return []
@@ -465,6 +715,8 @@ export default function App(){
     const pnlDisplay = positionPnL !== null && isFiniteNumber(positionPnL) ? formatCurrency(positionPnL) : '—'
 
     return {
+      hasSnapshot,
+      statusMessage,
       sizeDisplay,
       totalDisplay,
       markDisplay,
@@ -730,11 +982,13 @@ export default function App(){
                         const headers = authHeaders({ 'Content-Type': 'application/json' })
                         if(formSecret) headers['Tradingview-Secret'] = formSecret
                         const res = await fetch(buildApiUrl('/debug/place-test'), { method: 'POST', headers, body: JSON.stringify(body) })
-                        if(res.status === 401 || res.status === 403){ handleLogout(); return }
+                        if(res.status === 401){ handleLogout(); return }
                         let parsed = null
-                        try{ parsed = await res.json() }catch(error){ parsed = await res.text() }
-                        try{ pushEvent(`[place-test] status=${res.status} resp=${JSON.stringify(parsed)}`) }catch(error){ console.log(error) }
-                        setLastOrderResult({ status: res.status, body: parsed })
+                        const text = await res.text()
+                        let parsedResponse = null
+                        try{ parsedResponse = JSON.parse(text) }catch(error){ parsedResponse = { raw_response: text } }
+                        try{ pushEvent(`[place-test] status=${res.status} resp=${JSON.stringify(parsedResponse)}`) }catch(error){ console.log(error) }
+                        setLastOrderResult({ status: res.status, body: parsedResponse })
                         if(res.ok){ fetchTrades() }
                       }catch(error){ pushEvent(`[place-test] error ${error.message || error}`) }
                       finally {
@@ -771,9 +1025,10 @@ export default function App(){
                             const headers = authHeaders({ 'Content-Type': 'application/json' })
                             if(formSecret) headers['Tradingview-Secret'] = formSecret
                             const res = await fetch(buildApiUrl('/debug/order-status'), { method: 'POST', headers, body: JSON.stringify(body) })
-                            if(res.status === 401 || res.status === 403){ handleLogout(); return }
+                            if(res.status === 401){ handleLogout(); return }
+                            const text = await res.text()
                             let parsed = null
-                            try{ parsed = await res.json() }catch(error){ parsed = await res.text() }
+                            try{ parsed = JSON.parse(text) }catch(error){ parsed = { raw_response: text } }
                             setLastOrderQuery({ loading:false, status: res.status, body: parsed })
                           }catch(error){ setLastOrderQuery({ loading:false, error: String(error) }) }
                         }}
@@ -802,3 +1057,12 @@ export default function App(){
     </div>
   )
 }
+
+export default App
+
+
+
+
+
+
+

@@ -9,7 +9,7 @@ import uuid
 import asyncio
 import secrets
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.staticfiles import StaticFiles
@@ -39,7 +39,7 @@ BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN")
 BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE")  # optional: e.g. 'single' for unilateral / one-way
 BITGET_POSITION_TYPE = os.getenv("BITGET_POSITION_TYPE")  # optional: try values like 'unilateral' or 'one-way' if Bitget expects 'positionType'
 BITGET_POSITION_SIDE = os.getenv("BITGET_POSITION_SIDE")  # optional: explicit position side e.g. 'long' or 'short'
-BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN", "1")
+BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN")
 
 DEFAULT_LEVERAGE_RAW = os.getenv("DEFAULT_LEVERAGE")
 try:
@@ -54,16 +54,34 @@ AUTH_ALGORITHM = "HS256"
 AUTH_TOKEN_EXPIRE_MINUTES = int(os.getenv("AUTH_TOKEN_EXPIRE_MINUTES", "1440"))
 
 USERS: Dict[str, Dict[str, str]] = {}
+CI_FALLBACK_USER: Optional[str] = None
+CI_FALLBACK_ROLE: Optional[str] = None
+CI_FALLBACK_ACTIVE: bool = False
 raw_users = os.getenv("DASHBOARD_USERS")
 if raw_users:
+    parsed_from_json = False
     try:
         parsed_users = json.loads(raw_users)
         if isinstance(parsed_users, dict):
             for username, info in parsed_users.items():
                 if isinstance(info, dict) and "password" in info and "role" in info:
                     USERS[username] = {"password": info["password"], "role": info["role"]}
+                    parsed_from_json = True
     except Exception as e:
-        print(f"[auth] Failed to parse DASHBOARD_USERS: {e}")
+        print(f"[auth] Failed to parse DASHBOARD_USERS as JSON: {e}")
+
+    if not parsed_from_json:
+        try:
+            entries = [item.strip() for item in raw_users.split(",") if item.strip()]
+            for entry in entries:
+                parts = [p.strip() for p in entry.split(":")]
+                if len(parts) >= 2 and parts[0] and parts[1]:
+                    role = parts[2] if len(parts) >= 3 and parts[2] else "user"
+                    USERS[parts[0]] = {"password": parts[1], "role": role}
+            if not USERS:
+                print("[auth] DASHBOARD_USERS fallback parse produced no valid users")
+        except Exception as e:
+            print(f"[auth] Failed to parse DASHBOARD_USERS fallback format: {e}")
 
 admin_username = os.getenv("ADMIN_USERNAME")
 admin_password = os.getenv("ADMIN_PASSWORD")
@@ -74,6 +92,18 @@ user_username = os.getenv("USER_USERNAME")
 user_password = os.getenv("USER_PASSWORD")
 if user_username and user_password:
     USERS[user_username] = {"password": user_password, "role": "user"}
+
+if not USERS:
+    ci_flag = ((os.getenv("GITHUB_ACTIONS") or "").lower() == "true") or ((os.getenv("CI") or "").lower() == "true")
+    if ci_flag:
+        fallback_user = os.getenv("GITHUB_ACTIONS_USER", "capi_ci")
+        fallback_password = os.getenv("GITHUB_ACTIONS_PASSWORD", "capi_ci_pass")
+        fallback_role = os.getenv("GITHUB_ACTIONS_ROLE", "admin")
+        USERS[fallback_user] = {"password": fallback_password, "role": fallback_role}
+        CI_FALLBACK_USER = fallback_user
+        CI_FALLBACK_ROLE = fallback_role
+        CI_FALLBACK_ACTIVE = True
+        print(f"[auth] No users configured from env; created fallback CI user '{fallback_user}'.")
 
 if not USERS:
     print("[auth] Warning: no dashboard users configured. UI authentication will fail until users are defined.")
@@ -105,6 +135,15 @@ def safe_float(value) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def extract_numeric_field(payload: Dict[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        if key in payload:
+            candidate = safe_float(payload.get(key))
+            if candidate is not None:
+                return candidate
+    return None
 
 
 def extract_leverage_from_payload(payload: Optional[Dict[str, object]]) -> Optional[float]:
@@ -181,6 +220,8 @@ def decode_token(token: str) -> Dict[str, str]:
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, str]:
     if credentials is None:
+        if CI_FALLBACK_ACTIVE and CI_FALLBACK_USER:
+            return {"username": CI_FALLBACK_USER, "role": CI_FALLBACK_ROLE or "admin"}
         raise HTTPException(status_code=401, detail="Not authenticated")
     token = credentials.credentials
     payload = decode_token(token)
@@ -216,6 +257,10 @@ trades = sqlalchemy.Table(
     sqlalchemy.Column("size", sqlalchemy.Float),  # Add size column
     sqlalchemy.Column("size_usd", sqlalchemy.Float),
     sqlalchemy.Column("leverage", sqlalchemy.Float),
+    sqlalchemy.Column("margin", sqlalchemy.Float),
+    sqlalchemy.Column("liquidation_price", sqlalchemy.Float),
+    sqlalchemy.Column("exit_price", sqlalchemy.Float),
+    sqlalchemy.Column("realized_pnl", sqlalchemy.Float),
     sqlalchemy.Column("status", sqlalchemy.String),  # placed, filled, rejected
     sqlalchemy.Column("response", sqlalchemy.Text),
     sqlalchemy.Column("created_at", sqlalchemy.Float),
@@ -235,6 +280,14 @@ def ensure_trade_table_columns():
                 conn.execute(text("ALTER TABLE trades ADD COLUMN size_usd REAL"))
             if "leverage" not in existing:
                 conn.execute(text("ALTER TABLE trades ADD COLUMN leverage REAL"))
+            if "margin" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN margin REAL"))
+            if "liquidation_price" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN liquidation_price REAL"))
+            if "exit_price" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN exit_price REAL"))
+            if "realized_pnl" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN realized_pnl REAL"))
     except Exception as exc:
         try:
             print(f"[startup] failed to ensure trades table columns: {exc}")
@@ -251,6 +304,8 @@ default_frontend_origins = [
     "http://127.0.0.1:3000",
     # Railway frontend / deployed origin - adjust if you host frontend elsewhere
     "https://capi-production-7bf3.up.railway.app",
+    # WebSocket connections from Railway - needed for production WebSocket connections
+    "wss://capi-production-7bf3.up.railway.app",
 ]
 env_origins = os.getenv("FRONTEND_ORIGINS")
 if env_origins:
@@ -502,7 +557,7 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # Normalize symbol for Bitget - remove TradingView suffixes like .P
     normalized_symbol = symbol.replace('.P', '').replace('.p', '')
     use_symbol = mapped_symbol if mapped_symbol else normalized_symbol
-    body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size)
+    body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size, reduce_only=reduce_only, close_position=close_position, extra_fields=extra_fields)
 
     # For SUMCBL, the symbol construction is correct but the API rejects it.
     # Keep SUMCBL for now since that's what the user configured, but this may need to be changed
@@ -632,6 +687,441 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     return 502, json.dumps({"error": "all candidate endpoints returned 404"})
 
 
+async def close_existing_bitget_position(trade_row: Dict[str, Any]):
+    """Attempt to close an existing Bitget position using a reduce-only market order."""
+    try:
+        symbol = trade_row.get("symbol") if trade_row else None
+        signal = (trade_row.get("signal") or "").upper() if trade_row else ""
+        if not symbol or signal not in ("BUY", "SELL", "LONG", "SHORT"):
+            return
+
+        closing_side = "sell" if signal in ("BUY", "LONG") else "buy"
+
+        size_value = safe_float(trade_row.get("size")) if trade_row else None
+        if not size_value or size_value <= 0:
+            size_usd_value = safe_float(trade_row.get("size_usd")) if trade_row else None
+            price_value = safe_float(trade_row.get("price")) if trade_row else None
+            if size_usd_value is not None and price_value and price_value != 0:
+                try:
+                    size_value = float(size_usd_value) / float(price_value)
+                except Exception:
+                    size_value = None
+
+        if not size_value or size_value <= 0:
+            try:
+                print(f"[bitget][close] unable to determine position size for trade {trade_row.get('id')} — skipping reduce-only close")
+            except Exception:
+                pass
+            return
+
+        # First, cancel any hanging orders for this symbol
+        try:
+            await cancel_orders_for_symbol(symbol)
+            try:
+                print(f"[bitget][close] cancelled hanging orders for {symbol}")
+            except Exception:
+                pass
+        except Exception as cancel_exc:
+            try:
+                print(f"[bitget][close] failed to cancel orders for {symbol}: {cancel_exc}")
+            except Exception:
+                pass
+
+        # Wait a moment for order cancellation to process
+        await asyncio.sleep(1.0)
+
+        # For closing positions, use a simple market order with reduce_only to close the entire position
+        # Don't use close_position as it can cause parameter conflicts in different API versions
+        status_code, resp_text = await place_demo_order(
+            symbol=symbol,
+            side=closing_side,
+            size=size_value,
+            reduce_only=True,
+            close_position=False,
+        )
+        try:
+            print(f"[bitget][close] reduce-only order status={status_code} trade_id={trade_row.get('id')} resp={resp_text}")
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            print(f"[bitget][close] failed to submit reduce-only order for trade {trade_row.get('id') if trade_row else 'unknown'}: {exc}")
+        except Exception:
+            pass
+
+
+async def cancel_orders_for_symbol(symbol: str):
+    """Cancel all open orders for a symbol."""
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        return
+
+    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
+        return
+
+    try:
+        # Normalize symbol for Bitget
+        raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
+        if "_" not in raw and BITGET_PRODUCT_TYPE:
+            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+        else:
+            bitget_symbol = raw
+
+        # Cancel all orders for the symbol
+        request_path = "/api/mix/v1/order/cancel-all-orders"
+        body_obj = {"symbol": bitget_symbol, "marginCoin": BITGET_MARGIN_COIN}
+
+        body = json.dumps(body_obj, separators=(",", ":"))
+        timestamp = str(int(time.time() * 1000))
+        sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
+
+        headers = {
+            "ACCESS-KEY": BITGET_API_KEY,
+            "ACCESS-SIGN": sign,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+            "Content-Type": "application/json",
+            "paptrading": PAPTRADING,
+            "locale": "en-US",
+        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+            data = resp.json()
+
+            # Log the cancellation result
+            try:
+                print(f"[bitget][cancel] cancelled orders for {symbol}: status={resp.status_code} resp={data}")
+            except Exception:
+                pass
+
+    except Exception as e:
+        try:
+            print(f"[bitget][cancel] failed to cancel orders for {symbol}: {e}")
+        except Exception:
+            pass
+
+
+async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
+    """Fetch current Bitget position details to enrich leverage/margin data."""
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        return None
+    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
+        return None
+
+    async def _post_bitget(request_path: str, body_obj: Dict[str, Any], label: str) -> Optional[Any]:
+        body = json.dumps(body_obj, separators=(",", ":"))
+        timestamp = str(int(time.time() * 1000))
+        sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
+        headers = {
+            "ACCESS-KEY": BITGET_API_KEY,
+            "ACCESS-SIGN": sign,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+            "Content-Type": "application/json",
+            "paptrading": PAPTRADING,
+            "locale": "en-US",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+                data = resp.json()
+        except Exception as exc:
+            try:
+                print(f"[bitget][position] request failure ({label}) for {symbol}: {exc}")
+            except Exception:
+                pass
+            return None
+
+        try:
+            print(f"[bitget][position] response ({label}) for {symbol}: status={resp.status_code} data={data}")
+        except Exception:
+            pass
+
+        if not isinstance(data, dict):
+            try:
+                print(f"[bitget][position] invalid response type ({label}) for {symbol}: {type(data)}")
+            except Exception:
+                pass
+            return None
+
+        if str(data.get("code")) != "00000":
+            try:
+                print(f"[bitget][position] API error ({label}) for {symbol}: code={data.get('code')} msg={data.get('msg')}")
+            except Exception:
+                pass
+            return None
+
+        return data.get("data")
+
+    def _pick_snapshot(payload: Optional[Any], desired_symbol: str) -> Optional[Dict[str, Any]]:
+        if isinstance(payload, dict):
+            return payload if payload else None
+        if isinstance(payload, list):
+            for entry in payload:
+                if not isinstance(entry, dict):
+                    continue
+                if not desired_symbol or entry.get("symbol") == desired_symbol:
+                    return entry
+            return payload[0] if payload and isinstance(payload[0], dict) else None
+        return None
+
+    try:
+        raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
+        if "_" not in raw and BITGET_PRODUCT_TYPE:
+            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+        else:
+            bitget_symbol = raw
+
+        primary_body: Dict[str, Any] = {"symbol": bitget_symbol}
+        if BITGET_MARGIN_COIN:
+            primary_body["marginCoin"] = BITGET_MARGIN_COIN
+        if BITGET_PRODUCT_TYPE:
+            primary_body.setdefault("productType", BITGET_PRODUCT_TYPE)
+        if BITGET_POSITION_SIDE:
+            primary_body["holdSide"] = BITGET_POSITION_SIDE
+
+        # 1) Primary request (single position with explicit parameters)
+        payload = await _post_bitget("/api/mix/v1/position/singlePosition", primary_body, "single")
+        snapshot = _pick_snapshot(payload, bitget_symbol)
+        if snapshot:
+            return snapshot
+
+        # 2) Retry without holdSide if it was provided (some accounts reject the extra field)
+        if "holdSide" in primary_body:
+            fallback_body = dict(primary_body)
+            fallback_body.pop("holdSide", None)
+            payload = await _post_bitget("/api/mix/v1/position/singlePosition", fallback_body, "single-no-holdSide")
+            snapshot = _pick_snapshot(payload, bitget_symbol)
+            if snapshot:
+                return snapshot
+
+        # 3) Retry without productType if the API rejected the narrower filter
+        if "productType" in primary_body:
+            fallback_body = {k: v for k, v in primary_body.items() if k != "productType"}
+            payload = await _post_bitget("/api/mix/v1/position/singlePosition", fallback_body, "single-no-productType")
+            snapshot = _pick_snapshot(payload, bitget_symbol)
+            if snapshot:
+                return snapshot
+
+        # 4) Fallback: fetch all positions for the product type and search for the symbol
+        all_body: Dict[str, Any] = {}
+        if BITGET_PRODUCT_TYPE:
+            all_body["productType"] = BITGET_PRODUCT_TYPE
+        if BITGET_MARGIN_COIN:
+            all_body["marginCoin"] = BITGET_MARGIN_COIN
+
+        payload = await _post_bitget("/api/mix/v1/position/allPosition", all_body, "all")
+        snapshot = _pick_snapshot(payload, bitget_symbol)
+        if snapshot:
+            return snapshot
+
+        # 5) As a final attempt, remove productType filter when searching all positions
+        if all_body:
+            payload = await _post_bitget("/api/mix/v1/position/allPosition", {}, "all-unfiltered")
+            snapshot = _pick_snapshot(payload, bitget_symbol)
+            if snapshot:
+                return snapshot
+
+        try:
+            print(f"[bitget][position] no position snapshot found for {symbol} after fallbacks")
+        except Exception:
+            pass
+        return None
+    except Exception as exc:
+        try:
+            print(f"[bitget][position] failed to fetch position for {symbol}: {exc}")
+        except Exception:
+            pass
+    return None
+
+
+def normalize_bitget_position(requested_symbol: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize Bitget position payload into consistent keys for the UI."""
+    if not isinstance(snapshot, dict):
+        return None
+
+    def pick_float(*keys: str) -> Optional[float]:
+        for key in keys:
+            if key in snapshot:
+                candidate = safe_float(snapshot.get(key))
+                if candidate is not None:
+                    return candidate
+        return None
+
+    def pick_str(*keys: str) -> Optional[str]:
+        for key in keys:
+            if key in snapshot:
+                value = snapshot.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    stripped = value.strip()
+                    if stripped:
+                        return stripped
+                else:
+                    return str(value)
+        return None
+
+    side_raw = pick_str("holdSide", "side", "positionSide", "direction")
+    side = side_raw.lower() if isinstance(side_raw, str) else None
+
+    size = pick_float(
+        "total",
+        "holdAmount",
+        "holdSize",
+        "position",
+        "size",
+        "pos",
+        "baseSize",
+        "available",
+        "quantity",
+    )
+
+    if size is None:
+        long_hold = pick_float("longTotal", "longHold", "longQty")
+        short_hold = pick_float("shortTotal", "shortHold", "shortQty")
+        if side in ("long", "buy") and long_hold is not None:
+            size = long_hold
+        elif side in ("short", "sell") and short_hold is not None:
+            size = short_hold
+        elif long_hold is not None and short_hold is None:
+            size = long_hold
+        elif short_hold is not None and long_hold is None:
+            size = short_hold
+
+    avg_open_price = pick_float("openAvgPrice", "avgOpenPrice", "avgPrice", "averagePrice", "entry_price", "entryPrice")
+    mark_price = pick_float("markPrice", "marketPrice", "currentPrice", "lastPrice", "mark", "markPx")
+    index_price = pick_float("indexPrice", "indexPx")
+    margin = pick_float("margin", "marginSize", "positionMargin", "fixedMargin", "marginValue", "marginBalance")
+    leverage = pick_float("leverage", "lever", "marginLeverage")
+    liquidation_price = pick_float("liquidationPrice", "liqPrice", "liqPx", "liqprice")
+    unrealized = pick_float("unrealizedPL", "unrealizedPnl", "unrealizedProfit")
+    realized = pick_float("realizedPL", "realizedPnl", "realizedProfit")
+    pnl_ratio = pick_float("uplRatio", "uplRate", "unrealizedPLRatio", "pnlRatio", "profitRate", "unrealizedPnlRate")
+    margin_ratio = pick_float("marginRatio", "keepMarginRate", "maintMarginRate", "maintenanceMarginRate")
+    timestamp = pick_float("uTime", "updateTime", "timestamp", "ts", "cTime")
+    margin_coin = pick_str("marginCoin", "margin_coin")
+
+    notional = pick_float("notionalUsd", "positionValue", "quoteSize", "value", "positionValueUsd")
+    size_usd = pick_float("notionalUsd", "positionUsd", "totalValue", "valueUsd")
+
+    if notional is None and size is not None and avg_open_price is not None:
+        notional = size * avg_open_price
+    if notional is None and size is not None and mark_price is not None:
+        notional = size * mark_price
+
+    if size_usd is None:
+        size_usd = notional
+
+    signed_size = None
+    if size is not None:
+        signed_size = size
+        if side in ("short", "sell"):
+            signed_size = -abs(size)
+        elif side in ("long", "buy"):
+            signed_size = abs(size)
+
+    normalized = {
+        "requested_symbol": requested_symbol,
+        "bitget_symbol": pick_str("symbol", "instId"),
+        "margin_coin": margin_coin,
+        "side": side,
+        "size": size,
+        "signed_size": signed_size,
+        "avg_open_price": avg_open_price,
+        "mark_price": mark_price,
+        "index_price": index_price,
+        "margin": margin,
+        "leverage": leverage,
+        "liquidation_price": liquidation_price,
+        "unrealized_pnl": unrealized,
+        "realized_pnl": realized,
+        "pnl_ratio": pnl_ratio,
+        "margin_ratio": margin_ratio,
+        "notional": notional,
+        "size_usd": size_usd,
+        "timestamp": timestamp,
+    }
+
+    cleaned = {key: value for key, value in normalized.items() if value is not None}
+    if "size" not in cleaned and "size_usd" not in cleaned and "unrealized_pnl" not in cleaned:
+        # Nothing meaningful extracted; treat as missing.
+        return None
+    return cleaned
+
+
+async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_price: Optional[float], payload: Optional[Dict[str, Any]] = None):
+    """Close existing trades marked as placed before opening a new one.
+
+    Attempts to submit reduce-only Bitget orders and records exit price / realized PnL."""
+    try:
+        fetched_rows = await database.fetch_all(trades.select().where(trades.c.status == "placed"))
+        closing_rows = [dict(row) for row in fetched_rows]
+    except Exception:
+        closing_rows = []
+
+    if not closing_rows:
+        return
+
+    payload_dict = payload if isinstance(payload, dict) else {}
+    price_cache: Dict[str, Optional[float]] = {}
+
+    for row in closing_rows:
+        await close_existing_bitget_position(row)
+
+        symbol_for_row = (row.get("symbol") or "").strip()
+        closing_price = None
+        if symbol_for_row and new_symbol and symbol_for_row == new_symbol and fallback_price is not None:
+            closing_price = fallback_price
+
+        if closing_price is None:
+            candidate = safe_float(payload_dict.get("price"))
+            if candidate is not None:
+                closing_price = candidate
+
+        if closing_price is None and symbol_for_row:
+            if symbol_for_row not in price_cache:
+                price_cache[symbol_for_row] = await get_market_price_with_retries(symbol_for_row)
+            closing_price = price_cache.get(symbol_for_row)
+
+        entry_price = safe_float(row.get("price"))
+        size_value = safe_float(row.get("size"))
+        if (not size_value or size_value <= 0) and entry_price:
+            size_usd_val = safe_float(row.get("size_usd"))
+            if size_usd_val is not None and entry_price not in (None, 0):
+                try:
+                    size_value = float(size_usd_val) / float(entry_price)
+                except Exception:
+                    size_value = None
+
+        exit_price = None
+        realized_pnl = None
+        if closing_price is not None and entry_price is not None and size_value is not None and size_value != 0:
+            direction = 1 if str(row.get("signal") or "").upper() in ("BUY", "LONG") else -1
+            exit_price = float(closing_price)
+            realized_pnl = float((closing_price - entry_price) * size_value * direction)
+
+        update_values = {"status": "closed"}
+        if exit_price is not None:
+            update_values["exit_price"] = exit_price
+        if realized_pnl is not None:
+            update_values["realized_pnl"] = realized_pnl
+
+        await database.execute(trades.update().where(trades.c.id == row["id"]).values(**update_values))
+
+        try:
+            await broadcast({
+                "type": "closed",
+                "id": row.get("id"),
+                "reason": "rotation",
+                "exit_price": exit_price,
+                "realized_pnl": realized_pnl,
+            })
+        except Exception:
+            pass
+
+
 async def fetch_market_price(symbol: str):
     """Try to fetch a current market price for the given symbol from a public ticker (Binance).
     Returns a float price or None if it couldn't be fetched.
@@ -723,7 +1213,7 @@ async def get_market_price_with_retries(symbol: str, attempts: int = 3, backoff:
     return last
 
 
-def construct_bitget_payload(symbol: str, side: str, size: float = None):
+def construct_bitget_payload(symbol: str, side: str, size: float = None, *, reduce_only: bool = False, close_position: bool = False, extra_fields: Optional[Dict[str, Any]] = None):
     """Construct the Bitget order payload dictionary without signing/sending.
     This mirrors the logic used by place_demo_order so it can be tested by
     the debug endpoint without making external calls.
@@ -787,9 +1277,14 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     elif BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
         body_obj["positionMode"] = "single"
 
-    # Add price for limit orders (not needed for market orders)
-    # if body_obj["orderType"] == "limit" and price is not None:
-    #     body_obj["price"] = str(price)
+    # reduceOnly/closePosition signals from caller if provided
+    if reduce_only:
+        body_obj["reduceOnly"] = "true"
+    if close_position:
+        body_obj["closePosition"] = "true"
+    if extra_fields:
+        for key, value in extra_fields.items():
+            body_obj[key] = value
 
     # Determine the symbol
     if pt_upper in ("SUMCBL", "UMCBL"):
@@ -981,6 +1476,27 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
     if price_numeric is None:
         price_numeric = safe_float(price_for_db)
 
+    margin_value = safe_float(payload.get("margin") if isinstance(payload, dict) else None)
+    if margin_value is None and isinstance(payload, dict):
+        margin_value = safe_float(payload.get("margin_required") or payload.get("marginRequired"))
+    if margin_value is None and trade_size_usd_value is not None and leverage_value:
+        try:
+            margin_value = float(trade_size_usd_value) / float(leverage_value)
+        except Exception:
+            margin_value = None
+
+    liquidation_price_value = None
+    if isinstance(payload, dict):
+        liquidation_price_value = safe_float(
+            payload.get("liquidation_price")
+            or payload.get("liquidationPrice")
+            or payload.get("liq_price")
+            or payload.get("liqPrice")
+            or payload.get("liquidation")
+        )
+
+    await close_open_positions_for_rotation(symbol, price_numeric, payload)
+
     # If dry-run is enabled, simulate placing an order by inserting a DB row
     if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
         # Construct the payload for reporting and the simulated response
@@ -1007,6 +1523,10 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
                 size=trade_size_value,
                 size_usd=trade_size_usd_value,
                 leverage=leverage_value,
+                margin=margin_value,
+                liquidation_price=liquidation_price_value,
+                exit_price=None,
+                realized_pnl=None,
                 status=simulated_status,
                 response=json.dumps(fake_resp),
                 created_at=now
@@ -1025,6 +1545,8 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
                 "size": trade_size_value,
                 "size_usd": trade_size_usd_value,
                 "leverage": leverage_value,
+                "margin": margin_value,
+                "liquidation_price": liquidation_price_value,
             })
         except Exception as e:
             # Fall back to returning simulated response even if DB write failed
@@ -1039,6 +1561,8 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
             "price": float(price_numeric) if price_numeric is not None else None,
             "response": fake_resp,
             "payload": constructed_payload,
+            "margin": margin_value,
+            "liquidation_price": liquidation_price_value,
         }
 
     # Place the order using the existing helper
@@ -1077,6 +1601,27 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
         if isinstance(parsed, dict):
             bitget_code = parsed.get('code') or parsed.get('status')
         trade_status = "placed" if status_code == 200 and not (bitget_code and str(bitget_code) != '00000') else "error"
+
+        if trade_status == "placed":
+            need_margin = margin_value is None
+            need_leverage = leverage_value is None or leverage_value <= 0
+            need_liq = liquidation_price_value is None
+            if not str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on") and (need_margin or need_leverage or need_liq):
+                position_snapshot = await fetch_bitget_position(symbol)
+                if position_snapshot:
+                    if need_margin:
+                        margin_candidate = extract_numeric_field(position_snapshot, "margin", "marginSize", "marginValue", "positionMargin", "fixedMargin", "marginBalance")
+                        if margin_candidate is not None:
+                            margin_value = margin_candidate
+                    if need_leverage:
+                        leverage_candidate = extract_numeric_field(position_snapshot, "leverage", "lever", "marginLeverage")
+                        if leverage_candidate is not None and leverage_candidate > 0:
+                            leverage_value = leverage_candidate
+                    if need_liq:
+                        liq_candidate = extract_numeric_field(position_snapshot, "liquidationPrice", "liqPrice", "liqPx", "liqprice")
+                        if liq_candidate is not None:
+                            liquidation_price_value = liq_candidate
+
         try:
             await database.execute(trades.insert().values(
                 id=trade_id,
@@ -1086,10 +1631,23 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
                 size=trade_size_value,
                 size_usd=trade_size_usd_value,
                 leverage=leverage_value,
+                margin=margin_value,
+                liquidation_price=liquidation_price_value,
+                exit_price=None,
+                realized_pnl=None,
                 status=trade_status,
                 response=resp_text,
                 created_at=time.time()
             ))
+            updates = {}
+            if margin_value is not None:
+                updates["margin"] = margin_value
+            if leverage_value is not None:
+                updates["leverage"] = leverage_value
+            if liquidation_price_value is not None:
+                updates["liquidation_price"] = liquidation_price_value
+            if updates:
+                await database.execute(trades.update().where(trades.c.id == trade_id).values(**updates))
             # Broadcast the placed event to connected frontends
             await broadcast({
                 "type": "placed" if trade_status == "placed" else "error",
@@ -1100,6 +1658,8 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
                 "size": trade_size_value,
                 "size_usd": trade_size_usd_value,
                 "leverage": leverage_value,
+                "margin": margin_value,
+                "liquidation_price": liquidation_price_value,
             })
         except Exception as e:
             print(f"[debug/place-test] failed to write trade to DB: {e}")
@@ -1113,6 +1673,9 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
             "response": parsed,
             "payload": constructed_payload,
             "trade_id": trade_id,
+            "margin": margin_value,
+            "leverage": leverage_value,
+            "liquidation_price": liquidation_price_value,
         }
 
         return result
@@ -1519,6 +2082,25 @@ async def webhook(req: Request):
     if price_numeric is None:
         price_numeric = safe_float(price_for_db)
 
+    margin_value = safe_float(payload.get("margin") if isinstance(payload, dict) else None)
+    if margin_value is None and isinstance(payload, dict):
+        margin_value = safe_float(payload.get("margin_required") or payload.get("marginRequired"))
+    if margin_value is None and trade_size_usd_value is not None and leverage_value:
+        try:
+            margin_value = float(trade_size_usd_value) / float(leverage_value)
+        except Exception:
+            margin_value = None
+
+    liquidation_price_value = None
+    if isinstance(payload, dict):
+        liquidation_price_value = safe_float(
+            payload.get("liquidation_price")
+            or payload.get("liquidationPrice")
+            or payload.get("liq_price")
+            or payload.get("liqPrice")
+            or payload.get("liquidation")
+        )
+
     if event == "SIGNAL":
         # Just log the signal, no order placement
         trade_id = trade_id_from_payload or str(uuid.uuid4())
@@ -1530,6 +2112,10 @@ async def webhook(req: Request):
             size=trade_size_value,
             size_usd=trade_size_usd_value,
             leverage=leverage_value,
+            margin=margin_value,
+            liquidation_price=liquidation_price_value,
+            exit_price=None,
+            realized_pnl=None,
             status="signal",
             response="",
             created_at=now
@@ -1563,6 +2149,10 @@ async def webhook(req: Request):
         size=trade_size_value,
         size_usd=trade_size_usd_value,
         leverage=leverage_value,
+        margin=margin_value,
+        liquidation_price=liquidation_price_value,
+        exit_price=None,
+        realized_pnl=None,
         status="received",
         response="",
         created_at=now
@@ -1581,6 +2171,8 @@ async def webhook(req: Request):
         "size": trade_size_value,
         "size_usd": trade_size_usd_value,
         "leverage": leverage_value,
+        "margin": margin_value,
+        "liquidation_price": liquidation_price_value,
         "at": now,
     })
 
@@ -1625,6 +2217,8 @@ async def webhook(req: Request):
             "size": trade_size_value,
             "size_usd": trade_size_usd_value,
             "leverage": leverage_value,
+            "margin": margin_value,
+            "liquidation_price": liquidation_price_value,
         })
 
         if not is_success:
@@ -1806,15 +2400,16 @@ async def websocket_endpoint(ws: WebSocket):
         return
     try:
         payload = decode_token(token)
-    except HTTPException as e:
-        await ws.close(code=1008)
-        return
     except Exception:
-        await ws.close(code=1011)
+        await ws.close(code=1008)
         return
 
     username = payload.get("sub")
     role = payload.get("role", "user")
+    if not username:
+        await ws.close(code=1008)
+        return
+    # Skip user existence check since token is already validated
     await ws.accept()
     client = {"ws": ws, "username": username, "role": role}
     connected_websockets.append(client)
@@ -1826,3 +2421,178 @@ async def websocket_endpoint(ws: WebSocket):
         pass
     finally:
         connected_websockets[:] = [c for c in connected_websockets if c.get("ws") is not ws]
+
+
+@app.get("/bitget/position/{symbol}")
+async def get_bitget_position(symbol: str, current_user: Dict[str, str] = Depends(get_current_user)):
+    dry_run = str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on")
+    if dry_run:
+        return {"found": False, "requested_symbol": symbol, "reason": "dry_run"}
+
+    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
+        return {"found": False, "requested_symbol": symbol, "reason": "not_configured"}
+
+    snapshot = await fetch_bitget_position(symbol)
+    if not snapshot:
+        return {"found": False, "requested_symbol": symbol, "reason": "not_found"}
+
+    normalized = normalize_bitget_position(symbol, snapshot)
+    if not normalized:
+        return {"found": False, "requested_symbol": symbol, "reason": "empty"}
+
+    normalized["found"] = True
+    normalized["fetched_at"] = int(time.time())
+    return normalized
+
+
+@app.post("/bitget/close-position")
+async def close_position(request: Request, current_user: Dict[str, str] = Depends(get_current_user)):
+    """Close a position for a specific trade ID."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    trade_id = body.get("trade_id")
+    reason = body.get("reason", "manual_close")
+    if not trade_id:
+        raise HTTPException(status_code=400, detail="Missing required field: 'trade_id'")
+
+    # Fetch the trade from database
+    trade_row = await database.fetch_one(trades.select().where(trades.c.id == trade_id))
+    if not trade_row:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    trade_row = dict(trade_row)
+
+    # Allow closing if status is "placed" or if it's an external close (position disappeared from Bitget)
+    if trade_row.get("status") != "placed" and reason != "external_close":
+        raise HTTPException(status_code=400, detail=f"Cannot close trade with status '{trade_row.get('status')}'")
+
+    # Only attempt Bitget API close for manual closes, not for external closes
+    if reason != "external_close":
+        # Attempt to close the position on Bitget
+        await close_existing_bitget_position(trade_row)
+
+        # Get current market price for exit_price (since it's a market close)
+        symbol = trade_row.get("symbol", "")
+        exit_price = None
+        if symbol:
+            exit_price = await get_market_price_with_retries(symbol)
+
+        # Calculate realized PnL if possible
+        entry_price = safe_float(trade_row.get("price"))
+        size_value = safe_float(trade_row.get("size"))
+        realized_pnl = None
+        if exit_price is not None and entry_price is not None and size_value is not None and size_value != 0:
+            direction = 1 if str(trade_row.get("signal") or "").upper() in ("BUY", "LONG") else -1
+            realized_pnl = float((exit_price - entry_price) * size_value * direction)
+    else:
+        # For external closes, use current market price and calculate PnL
+        symbol = trade_row.get("symbol", "")
+        exit_price = None
+        realized_pnl = None
+        if symbol:
+            exit_price = await get_market_price_with_retries(symbol)
+
+            # Calculate realized PnL based on last known Bitget position data
+            try:
+                position_snapshot = await fetch_bitget_position(symbol)
+                if position_snapshot:
+                    unrealized = safe_float(position_snapshot.get("unrealizedPL") or position_snapshot.get("unrealized_pnl"))
+                    if unrealized is not None:
+                        realized_pnl = unrealized
+                    else:
+                        # Fallback to calculation
+                        entry_price = safe_float(trade_row.get("price"))
+                        size_value = safe_float(trade_row.get("size"))
+                        if exit_price is not None and entry_price is not None and size_value is not None and size_value != 0:
+                            direction = 1 if str(trade_row.get("signal") or "").upper() in ("BUY", "LONG") else -1
+                            realized_pnl = float((exit_price - entry_price) * size_value * direction)
+                else:
+                    # Fallback calculation if no position data
+                    entry_price = safe_float(trade_row.get("price"))
+                    size_value = safe_float(trade_row.get("size"))
+                    if exit_price is not None and entry_price is not None and size_value is not None and size_value != 0:
+                        direction = 1 if str(trade_row.get("signal") or "").upper() in ("BUY", "LONG") else -1
+                        realized_pnl = float((exit_price - entry_price) * size_value * direction)
+            except Exception as e:
+                try:
+                    print(f"[close-position] error calculating PnL for external close: {e}")
+                except Exception:
+                    pass
+
+    # Update trade status and exit details
+    update_values = {"status": "closed"}
+    if exit_price is not None:
+        update_values["exit_price"] = exit_price
+    if realized_pnl is not None:
+        update_values["realized_pnl"] = realized_pnl
+
+    await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_values))
+
+    # Broadcast the close event
+    await broadcast({
+        "type": "closed",
+        "id": trade_id,
+        "reason": reason,
+        "exit_price": exit_price,
+        "realized_pnl": realized_pnl,
+    })
+
+    return {
+        "ok": True,
+        "trade_id": trade_id,
+        "exit_price": exit_price,
+        "realized_pnl": realized_pnl,
+    }
+
+
+@app.get("/bitget/cancel-orders/{symbol}", dependencies=[Depends(require_role(["admin"]))])
+async def cancel_orders(symbol: str):
+    """Cancel all open orders for a symbol (admin only)."""
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        return {"ok": False, "dry_run": True, "note": "BITGET_DRY_RUN is enabled — not cancelling orders"}
+
+    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
+        raise HTTPException(status_code=400, detail="Bitget credentials not configured")
+
+    try:
+        # Normalize symbol for Bitget
+        raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
+        if "_" not in raw and BITGET_PRODUCT_TYPE:
+            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+        else:
+            bitget_symbol = raw
+
+        # Cancel all orders for the symbol
+        request_path = "/api/mix/v1/order/cancel-all-orders"
+        body_obj = {"symbol": bitget_symbol, "marginCoin": BITGET_MARGIN_COIN}
+
+        body = json.dumps(body_obj, separators=(",", ":"))
+        timestamp = str(int(time.time() * 1000))
+        sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
+
+        headers = {
+            "ACCESS-KEY": BITGET_API_KEY,
+            "ACCESS-SIGN": sign,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+            "Content-Type": "application/json",
+            "paptrading": PAPTRADING,
+            "locale": "en-US",
+        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+            data = resp.json()
+
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "bitget_symbol": bitget_symbol,
+            "status_code": resp.status_code,
+            "response": data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
