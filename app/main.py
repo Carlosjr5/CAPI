@@ -39,7 +39,7 @@ BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN")
 BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE")  # optional: e.g. 'single' for unilateral / one-way
 BITGET_POSITION_TYPE = os.getenv("BITGET_POSITION_TYPE")  # optional: try values like 'unilateral' or 'one-way' if Bitget expects 'positionType'
 BITGET_POSITION_SIDE = os.getenv("BITGET_POSITION_SIDE")  # optional: explicit position side e.g. 'long' or 'short'
-BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN", "1")
+BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN")
 
 DEFAULT_LEVERAGE_RAW = os.getenv("DEFAULT_LEVERAGE")
 try:
@@ -618,12 +618,30 @@ async def close_existing_bitget_position(trade_row: Dict[str, Any]):
                 pass
             return
 
+        # First, cancel any hanging orders for this symbol
+        try:
+            await cancel_orders_for_symbol(symbol)
+            try:
+                print(f"[bitget][close] cancelled hanging orders for {symbol}")
+            except Exception:
+                pass
+        except Exception as cancel_exc:
+            try:
+                print(f"[bitget][close] failed to cancel orders for {symbol}: {cancel_exc}")
+            except Exception:
+                pass
+
+        # Wait a moment for order cancellation to process
+        await asyncio.sleep(1.0)
+
+        # For closing positions, use a simple market order with reduce_only to close the entire position
+        # Don't use close_position as it can cause parameter conflicts in different API versions
         status_code, resp_text = await place_demo_order(
             symbol=symbol,
             side=closing_side,
             size=size_value,
             reduce_only=True,
-            close_position=True,
+            close_position=False,
         )
         try:
             print(f"[bitget][close] reduce-only order status={status_code} trade_id={trade_row.get('id')} resp={resp_text}")
@@ -632,6 +650,57 @@ async def close_existing_bitget_position(trade_row: Dict[str, Any]):
     except Exception as exc:
         try:
             print(f"[bitget][close] failed to submit reduce-only order for trade {trade_row.get('id') if trade_row else 'unknown'}: {exc}")
+        except Exception:
+            pass
+
+
+async def cancel_orders_for_symbol(symbol: str):
+    """Cancel all open orders for a symbol."""
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        return
+
+    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
+        return
+
+    try:
+        # Normalize symbol for Bitget
+        raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
+        if "_" not in raw and BITGET_PRODUCT_TYPE:
+            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+        else:
+            bitget_symbol = raw
+
+        # Cancel all orders for the symbol
+        request_path = "/api/mix/v1/order/cancel-all-orders"
+        body_obj = {"symbol": bitget_symbol, "marginCoin": BITGET_MARGIN_COIN}
+
+        body = json.dumps(body_obj, separators=(",", ":"))
+        timestamp = str(int(time.time() * 1000))
+        sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
+
+        headers = {
+            "ACCESS-KEY": BITGET_API_KEY,
+            "ACCESS-SIGN": sign,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+            "Content-Type": "application/json",
+            "paptrading": PAPTRADING,
+            "locale": "en-US",
+        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+            data = resp.json()
+
+            # Log the cancellation result
+            try:
+                print(f"[bitget][cancel] cancelled orders for {symbol}: status={resp.status_code} resp={data}")
+            except Exception:
+                pass
+
+    except Exception as e:
+        try:
+            print(f"[bitget][cancel] failed to cancel orders for {symbol}: {e}")
         except Exception:
             pass
 
@@ -2046,3 +2115,119 @@ async def get_bitget_position(symbol: str, current_user: Dict[str, str] = Depend
     normalized["found"] = True
     normalized["fetched_at"] = int(time.time())
     return normalized
+
+
+@app.post("/bitget/close-position", dependencies=[Depends(require_role(["admin"]))])
+async def close_position(request: Request):
+    """Close a position for a specific trade ID (admin only)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    trade_id = body.get("trade_id")
+    if not trade_id:
+        raise HTTPException(status_code=400, detail="Missing required field: 'trade_id'")
+
+    # Fetch the trade from database
+    trade_row = await database.fetch_one(trades.select().where(trades.c.id == trade_id))
+    if not trade_row:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    trade_row = dict(trade_row)
+
+    # Only allow closing if status is "placed"
+    if trade_row.get("status") != "placed":
+        raise HTTPException(status_code=400, detail=f"Cannot close trade with status '{trade_row.get('status')}'")
+
+    # Attempt to close the position on Bitget
+    await close_existing_bitget_position(trade_row)
+
+    # Get current market price for exit_price (since it's a market close)
+    symbol = trade_row.get("symbol", "")
+    exit_price = None
+    if symbol:
+        exit_price = await get_market_price_with_retries(symbol)
+
+    # Calculate realized PnL if possible
+    entry_price = safe_float(trade_row.get("price"))
+    size_value = safe_float(trade_row.get("size"))
+    realized_pnl = None
+    if exit_price is not None and entry_price is not None and size_value is not None and size_value != 0:
+        direction = 1 if str(trade_row.get("signal") or "").upper() in ("BUY", "LONG") else -1
+        realized_pnl = float((exit_price - entry_price) * size_value * direction)
+
+    # Update trade status and exit details
+    update_values = {"status": "closed"}
+    if exit_price is not None:
+        update_values["exit_price"] = exit_price
+    if realized_pnl is not None:
+        update_values["realized_pnl"] = realized_pnl
+
+    await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_values))
+
+    # Broadcast the close event
+    await broadcast({
+        "type": "closed",
+        "id": trade_id,
+        "reason": "manual_close",
+        "exit_price": exit_price,
+        "realized_pnl": realized_pnl,
+    })
+
+    return {
+        "ok": True,
+        "trade_id": trade_id,
+        "exit_price": exit_price,
+        "realized_pnl": realized_pnl,
+    }
+
+
+@app.get("/bitget/cancel-orders/{symbol}", dependencies=[Depends(require_role(["admin"]))])
+async def cancel_orders(symbol: str):
+    """Cancel all open orders for a symbol (admin only)."""
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        return {"ok": False, "dry_run": True, "note": "BITGET_DRY_RUN is enabled — not cancelling orders"}
+
+    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
+        raise HTTPException(status_code=400, detail="Bitget credentials not configured")
+
+    try:
+        # Normalize symbol for Bitget
+        raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
+        if "_" not in raw and BITGET_PRODUCT_TYPE:
+            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+        else:
+            bitget_symbol = raw
+
+        # Cancel all orders for the symbol
+        request_path = "/api/mix/v1/order/cancel-all-orders"
+        body_obj = {"symbol": bitget_symbol, "marginCoin": BITGET_MARGIN_COIN}
+
+        body = json.dumps(body_obj, separators=(",", ":"))
+        timestamp = str(int(time.time() * 1000))
+        sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
+
+        headers = {
+            "ACCESS-KEY": BITGET_API_KEY,
+            "ACCESS-SIGN": sign,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+            "Content-Type": "application/json",
+            "paptrading": PAPTRADING,
+            "locale": "en-US",
+        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+            data = resp.json()
+
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "bitget_symbol": bitget_symbol,
+            "status_code": resp.status_code,
+            "response": data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
