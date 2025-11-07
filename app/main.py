@@ -687,6 +687,121 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def normalize_bitget_position(requested_symbol: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize Bitget position payload into consistent keys for the UI."""
+    if not isinstance(snapshot, dict):
+        return None
+
+    def pick_float(*keys: str) -> Optional[float]:
+        for key in keys:
+            if key in snapshot:
+                candidate = safe_float(snapshot.get(key))
+                if candidate is not None:
+                    return candidate
+        return None
+
+    def pick_str(*keys: str) -> Optional[str]:
+        for key in keys:
+            if key in snapshot:
+                value = snapshot.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    stripped = value.strip()
+                    if stripped:
+                        return stripped
+                else:
+                    return str(value)
+        return None
+
+    side_raw = pick_str("holdSide", "side", "positionSide", "direction")
+    side = side_raw.lower() if isinstance(side_raw, str) else None
+
+    size = pick_float(
+        "total",
+        "holdAmount",
+        "holdSize",
+        "position",
+        "size",
+        "pos",
+        "baseSize",
+        "available",
+        "quantity",
+    )
+
+    if size is None:
+        long_hold = pick_float("longTotal", "longHold", "longQty")
+        short_hold = pick_float("shortTotal", "shortHold", "shortQty")
+        if side in ("long", "buy") and long_hold is not None:
+            size = long_hold
+        elif side in ("short", "sell") and short_hold is not None:
+            size = short_hold
+        elif long_hold is not None and short_hold is None:
+            size = long_hold
+        elif short_hold is not None and long_hold is None:
+            size = short_hold
+
+    avg_open_price = pick_float("openAvgPrice", "avgOpenPrice", "avgPrice", "averagePrice", "entry_price", "entryPrice")
+    mark_price = pick_float("markPrice", "marketPrice", "currentPrice", "lastPrice", "mark", "markPx")
+    index_price = pick_float("indexPrice", "indexPx")
+    margin = pick_float("margin", "marginSize", "positionMargin", "fixedMargin", "marginValue", "marginBalance")
+    leverage = pick_float("leverage", "lever", "marginLeverage")
+    liquidation_price = pick_float("liquidationPrice", "liqPrice", "liqPx", "liqprice")
+    unrealized = pick_float("unrealizedPL", "unrealizedPnl", "unrealizedProfit")
+    realized = pick_float("realizedPL", "realizedPnl", "realizedProfit")
+    pnl_ratio = pick_float("uplRatio", "uplRate", "unrealizedPLRatio", "pnlRatio", "profitRate", "unrealizedPnlRate")
+    margin_ratio = pick_float("marginRatio", "keepMarginRate", "maintMarginRate", "maintenanceMarginRate")
+    timestamp = pick_float("uTime", "updateTime", "timestamp", "ts", "cTime")
+    margin_coin = pick_str("marginCoin", "margin_coin")
+
+    notional = pick_float("notionalUsd", "positionValue", "quoteSize", "value", "positionValueUsd")
+    size_usd = pick_float("notionalUsd", "positionUsd", "totalValue", "valueUsd")
+
+    if notional is None and size is not None and avg_open_price is not None:
+        notional = size * avg_open_price
+    if notional is None and size is not None and mark_price is not None:
+        notional = size * mark_price
+
+    if size_usd is None:
+        size_usd = notional
+
+    signed_size = None
+    if size is not None:
+        signed_size = size
+        if side in ("short", "sell"):
+            signed_size = -abs(size)
+        elif side in ("long", "buy"):
+            signed_size = abs(size)
+
+    normalized = {
+        "requested_symbol": requested_symbol,
+        "bitget_symbol": pick_str("symbol", "instId"),
+        "margin_coin": margin_coin,
+        "side": side,
+        "size": size,
+        "signed_size": signed_size,
+        "avg_open_price": avg_open_price,
+        "mark_price": mark_price,
+        "index_price": index_price,
+        "margin": margin,
+        "leverage": leverage,
+        "liquidation_price": liquidation_price,
+        "unrealized_pnl": unrealized,
+        "realized_pnl": realized,
+    "pnl_ratio": pnl_ratio,
+        "margin_ratio": margin_ratio,
+        "notional": notional,
+        "size_usd": size_usd,
+        "timestamp": timestamp,
+    }
+
+    cleaned = {key: value for key, value in normalized.items() if value is not None}
+    if "size" not in cleaned and "size_usd" not in cleaned and "unrealized_pnl" not in cleaned:
+        # Nothing meaningful extracted; treat as missing.
+        return None
+    return cleaned
+
+
 async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_price: Optional[float], payload: Optional[Dict[str, Any]] = None):
     """Close existing trades marked as placed before opening a new one.
 
@@ -1906,3 +2021,25 @@ async def websocket_endpoint(ws: WebSocket):
         pass
     finally:
         connected_websockets[:] = [c for c in connected_websockets if c.get("ws") is not ws]
+
+
+@app.get("/bitget/position/{symbol}")
+async def get_bitget_position(symbol: str, current_user: Dict[str, str] = Depends(get_current_user)):
+    dry_run = str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on")
+    if dry_run:
+        return {"found": False, "requested_symbol": symbol, "reason": "dry_run"}
+
+    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
+        return {"found": False, "requested_symbol": symbol, "reason": "not_configured"}
+
+    snapshot = await fetch_bitget_position(symbol)
+    if not snapshot:
+        return {"found": False, "requested_symbol": symbol, "reason": "not_found"}
+
+    normalized = normalize_bitget_position(symbol, snapshot)
+    if not normalized:
+        return {"found": False, "requested_symbol": symbol, "reason": "empty"}
+
+    normalized["found"] = True
+    normalized["fetched_at"] = int(time.time())
+    return normalized

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import TradeTable from './TradeTable'
+import TradingViewChart from './TradingViewChart'
 
 const STORAGE_TOKEN_KEY = 'capi_token'
 const STORAGE_ROLE_KEY = 'capi_role'
@@ -11,50 +12,73 @@ const DEFAULT_LEVERAGE_FALLBACK = (() => {
     const parsed = Number(raw)
     return Number.isFinite(parsed) ? parsed : null
   } catch (error) {
-    console.warn('[ui] unable to parse VITE_DEFAULT_LEVERAGE', error)
     return null
   }
 })()
 
-const currencyFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 })
-const numberFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 })
-const leverageFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 })
-
-const DEFAULT_MAINTENANCE_RATE = (() => {
-  try {
-    const raw = import.meta?.env?.VITE_MAINTENANCE_MARGIN
-    if (raw === undefined || raw === null || raw === '') return 0.004
-    const parsed = Number(raw)
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0.004
-  } catch (error) {
-    console.warn('[ui] unable to parse VITE_MAINTENANCE_MARGIN', error)
-    return 0.004
-  }
-})()
-
-const isFiniteNumber = (value) => {
-  if (value === null || value === undefined || value === '') return false
-  const numeric = Number(value)
-  return Number.isFinite(numeric)
+// Utility functions
+const buildApiUrl = (endpoint) => {
+  const base = import.meta?.env?.VITE_API_URL || window.location.origin
+  return `${base}${endpoint}`
 }
 
-export default function App(){
-  const [token, setToken] = useState(() => localStorage.getItem(STORAGE_TOKEN_KEY) || '')
-  const [role, setRole] = useState(() => localStorage.getItem(STORAGE_ROLE_KEY) || '')
-  const [authChecked, setAuthChecked] = useState(false)
+const buildWsUrl = () => {
+  const base = import.meta?.env?.VITE_API_URL || window.location.origin
+  const protocol = base.startsWith('https:') ? 'wss:' : 'ws:'
+  const url = new URL(base)
+  return `${protocol}//${url.host}`
+}
+
+const formatNumber = (value, decimals = 2) => {
+  const num = Number(value)
+  return Number.isFinite(num) ? num.toFixed(decimals) : '—'
+}
+
+const formatLeverage = (value) => {
+  const num = Number(value)
+  return Number.isFinite(num) && num > 0 ? `${num}x` : '—'
+}
+
+const currencyFormatter = new Intl.NumberFormat('en-US', {
+  style: 'currency',
+  currency: 'USD',
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 8,
+})
+
+const currencyFormatterEUR = new Intl.NumberFormat('en-EU', {
+  style: 'currency',
+  currency: 'EUR',
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 8,
+})
+
+const usdtFormatter = new Intl.NumberFormat('en-US', {
+  style: 'decimal',
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+})
+
+const isFiniteNumber = (value) => Number.isFinite(Number(value))
+
+function App() {
+  // State variables
   const [loginUsername, setLoginUsername] = useState('')
   const [loginPassword, setLoginPassword] = useState('')
   const [loginError, setLoginError] = useState('')
   const [loginLoading, setLoginLoading] = useState(false)
 
-  const [trades, setTrades] = useState([])
-  const tradesRef = useRef([])
-  const [status, setStatus] = useState('Disconnected')
-  const eventsRef = useRef(null)
-  const wsRef = useRef(null)
-  const priceIntervalRef = useRef(null)
-  const [currentPrices, setCurrentPrices] = useState({})
+  const [token, setToken] = useState(localStorage.getItem(STORAGE_TOKEN_KEY))
+  const [role, setRole] = useState(localStorage.getItem(STORAGE_ROLE_KEY))
+  const [authChecked, setAuthChecked] = useState(false)
 
+  const [trades, setTrades] = useState([])
+  const [status, setStatus] = useState('Disconnected')
+  const [currentPrices, setCurrentPrices] = useState({})
+  const [bitgetPositions, setBitgetPositions] = useState({})
+  const [usdToEurRate, setUsdToEurRate] = useState(null)
+
+  // Form states for admin
   const [formSecret, setFormSecret] = useState('')
   const [formSymbol, setFormSymbol] = useState('BTCUSDT')
   const [formSide, setFormSide] = useState('BUY')
@@ -63,31 +87,17 @@ export default function App(){
   const [lastOrderResult, setLastOrderResult] = useState(null)
   const [lastOrderQuery, setLastOrderQuery] = useState(null)
 
+  // Refs
+  const wsRef = useRef(null)
+  const priceIntervalRef = useRef(null)
+  const rateIntervalRef = useRef(null)
+  const tradesRef = useRef([])
+  const bitgetDisabledRef = useRef(false)
+  const eventsRef = useRef(null)
+
   const isAdmin = role === 'admin'
 
   const handleLogout = useCallback(() => {
-    if (wsRef.current) {
-      try { wsRef.current.close() } catch (error) {}
-      wsRef.current = null
-    }
-    if (priceIntervalRef.current) {
-      clearInterval(priceIntervalRef.current)
-      priceIntervalRef.current = null
-    }
-    setToken('')
-    setRole('')
-    setStatus('Disconnected')
-    setTrades([])
-    tradesRef.current = []
-    setCurrentPrices({})
-    setFormSecret('')
-    setFormSymbol('BTCUSDT')
-    setFormSide('BUY')
-    setFormSizeUsd('100')
-    setLastOrderResult(null)
-    setLastOrderQuery(null)
-    setLoginUsername('')
-    setLoginPassword('')
     setLoginError('')
     localStorage.removeItem(STORAGE_TOKEN_KEY)
     localStorage.removeItem(STORAGE_ROLE_KEY)
@@ -99,101 +109,67 @@ export default function App(){
     return Number.isFinite(num) ? currencyFormatter.format(num) : '—'
   }, [])
 
-  const formatNumber = useCallback((value, digits = 4) => {
+  const formatUsdt = useCallback((value) => {
+    const num = Number(value)
+    return Number.isFinite(num) ? `${usdtFormatter.format(num)} USDT` : '—'
+  }, [])
+
+  const formatEur = useCallback((value) => {
+    const num = Number(value)
+    return Number.isFinite(num) ? currencyFormatterEUR.format(num) : '—'
+  }, [])
+
+  const formatPercent = useCallback((value) => {
     const num = Number(value)
     if (!Number.isFinite(num)) return '—'
-    if (digits !== 4) {
-      return new Intl.NumberFormat('en-US', { maximumFractionDigits: digits }).format(num)
-    }
-    return numberFormatter.format(num)
+    const normalized = Math.abs(num) < 0.005 && num !== 0 ? 0 : num
+    return `${normalized.toFixed(2)}%`
   }, [])
 
-  const formatLeverage = useCallback((value) => {
-    const num = Number(value)
-    if (!Number.isFinite(num) || num <= 0) return '—'
-    return `${leverageFormatter.format(num)}x`
-  }, [])
-
-  const isLocalFrontend = useCallback(() => {
-    if (typeof window === 'undefined') return false
-    const host = window.location.hostname
-    const port = window.location.port
-    const localHosts = ['localhost', '127.0.0.1']
-    const localPorts = ['5173', '5174', '3000']
-    return localHosts.includes(host) && (localPorts.includes(port) || port === '')
-  }, [])
-
-  const getApiBase = useCallback(() => {
-    let viteBase = ''
+  const verifyToken = useCallback(async () => {
     try {
-      viteBase = import.meta?.env?.VITE_API_BASE || ''
-    } catch (error) {
-      console.warn('[ui] unable to read VITE_API_BASE', error)
-    }
-    const defaultLocalApi = 'http://127.0.0.1:8000'
-    if (isLocalFrontend()) {
-      return viteBase || defaultLocalApi
-    }
-    return ''
-  }, [isLocalFrontend])
-
-  const buildApiUrl = useCallback((path) => {
-    const base = getApiBase()
-    const normalizedBase = base ? base.replace(/\/$/, '') : ''
-    return `${normalizedBase}${path}`
-  }, [getApiBase])
-
-  const buildWsUrl = useCallback(() => {
-    const base = getApiBase()
-    if (base) {
-      try {
-        const parsed = new URL(base)
-        parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:'
-        parsed.pathname = '/ws'
-        parsed.search = ''
-        parsed.hash = ''
-        return parsed.toString()
-      } catch (error) {
-        const sanitized = base.replace(/\/+$/, '')
-        return sanitized.replace(/^http(s)?:/i, (_, secure) => (secure ? 'wss:' : 'ws:')) + '/ws'
-      }
-    }
-    if (typeof window === 'undefined') return ''
-    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-    return `${proto}://${window.location.host}/ws`
-  }, [getApiBase])
-
-  useEffect(() => {
-    const verifyToken = async () => {
-      if (!token) {
-        setAuthChecked(true)
+      const res = await fetch(buildApiUrl('/auth/verify'), { headers: authHeaders() })
+      if (!res.ok) {
+        handleLogout()
         return
       }
-      try {
-        const res = await fetch(buildApiUrl('/auth/me'), {
-          headers: { Authorization: `Bearer ${token}` }
-        })
-        if (!res.ok) {
-          throw new Error('unauthorized')
-        }
-        const data = await res.json()
-        const newRole = data.role || 'user'
-        setRole(newRole)
-        localStorage.setItem(STORAGE_TOKEN_KEY, token)
-        localStorage.setItem(STORAGE_ROLE_KEY, newRole)
-        setAuthChecked(true)
-      } catch (error) {
-        console.error('Token verification failed', error)
-        handleLogout()
+      // Set auth as checked after successful verification
+      setAuthChecked(true)
+    } catch (error) {
+      console.error('[verify] error', error)
+      handleLogout()
+    }
+  }, [token, handleLogout])
+
+  const fetchUsdToEur = useCallback(async () => {
+    try {
+      const res = await fetch('https://api.exchangerate.host/latest?base=USD&symbols=EUR')
+      if (!res.ok) {
+        return
       }
+      const data = await res.json()
+      const rate = Number(data?.rates?.EUR)
+      if (Number.isFinite(rate) && rate > 0) {
+        setUsdToEurRate(rate)
+      }
+    } catch (error) {
+      console.error('[usd to eur] fetch error', error)
     }
     verifyToken()
-  }, [token, handleLogout, buildApiUrl])
+  }, [verifyToken])
 
   useEffect(() => {
-    if (!authChecked || !token) {
+    // Check for existing token and verify it
+    if (!authChecked) {
+      if (token) {
+        verifyToken()
+      } else {
+        setAuthChecked(true)
+      }
       return
     }
+
+    if (!token) return
 
     fetchTrades()
     connectWS()
@@ -215,7 +191,26 @@ export default function App(){
         wsRef.current = null
       }
     }
-  }, [authChecked, token])
+  }, [authChecked, token, verifyToken])
+
+  useEffect(() => {
+    if (!authChecked || !token) {
+      return
+    }
+
+    fetchUsdToEur()
+    if (rateIntervalRef.current) {
+      clearInterval(rateIntervalRef.current)
+    }
+    rateIntervalRef.current = setInterval(fetchUsdToEur, 15 * 60 * 1000)
+
+    return () => {
+      if (rateIntervalRef.current) {
+        clearInterval(rateIntervalRef.current)
+        rateIntervalRef.current = null
+      }
+    }
+  }, [authChecked, token, fetchUsdToEur])
 
   async function fetchTrades(){
     if (!token) return
@@ -225,6 +220,16 @@ export default function App(){
         handleLogout()
         return
       }
+      if (!res.ok) {
+        // If we get HTML instead of JSON, log it but don't crash
+        const text = await res.text()
+        if (text.includes('<!doctype') || text.includes('<html')) {
+          console.error('[trades] Server returned HTML instead of JSON, likely a backend error')
+          setTrades([])
+          return
+        }
+        throw new Error(`HTTP ${res.status}: ${text}`)
+      }
       const data = await res.json()
       const sorted = Array.isArray(data) ? [...data].sort((a,b)=>((b?.created_at||0) - (a?.created_at||0))) : []
       setTrades(sorted)
@@ -232,6 +237,7 @@ export default function App(){
       await fetchPricesForOpenPositions(sorted)
     }catch(error){
       console.error('[trades] fetch error', error)
+      setTrades([])
     }
   }
 
@@ -243,39 +249,132 @@ export default function App(){
     if (!token) return
     const source = Array.isArray(tradesData) ? tradesData : (Array.isArray(tradesRef.current) ? tradesRef.current : [])
     const openTrades = source.filter(t => mapStatus(t.status) === 'open')
-    const symbols = [...new Set(openTrades.map(t => t.symbol))]
-    if(symbols.length === 0) return
+    const symbols = [...new Set(openTrades.map(t => t.symbol).filter(Boolean))]
+    if(symbols.length === 0){
+      setCurrentPrices({})
+      setBitgetPositions({})
+      return
+    }
 
-    const updates = {}
+    const priceUpdates = {}
+    const positionUpdates = {}
+    let needsTradeRefresh = false
+
     for(const symbol of symbols){
-      try{
-        const res = await fetch(buildApiUrl(`/price/${symbol}`), { headers: authHeaders() })
-        if(res.status === 401 || res.status === 403){
-          handleLogout()
-          return
+      const encodedSymbol = encodeURIComponent(symbol)
+      let markOverride
+
+      if(!bitgetDisabledRef.current){
+        try{
+          const res = await fetch(buildApiUrl(`/bitget/position/${encodedSymbol}`), { headers: authHeaders() })
+          if(res.status === 401 || res.status === 403){
+            handleLogout()
+            return
+          }
+          if(res.ok){
+            const data = await res.json()
+            if(data && data.found){
+              positionUpdates[symbol] = data
+              const markCandidate = Number(data.mark_price ?? data.markPrice)
+              if(Number.isFinite(markCandidate)){
+                markOverride = markCandidate
+              } else {
+                const markFallback = Number(data.index_price ?? data.indexPrice)
+                if(Number.isFinite(markFallback)){
+                  markOverride = markFallback
+                }
+              }
+            }else{
+              const failurePayload = data && typeof data === 'object' ? data : { found: false, reason: 'unavailable' }
+              positionUpdates[symbol] = { ...failurePayload, found: false }
+              if(failurePayload && (failurePayload.reason === 'dry_run' || failurePayload.reason === 'not_configured')){
+                bitgetDisabledRef.current = true
+              } else if(failurePayload.reason !== 'dry_run' && failurePayload.reason !== 'not_configured'){
+                // Position not found in Bitget - mark as closed in our system
+                needsTradeRefresh = true
+              }
+            }
+          }else{
+            positionUpdates[symbol] = { found: false, reason: `http_${res.status}` }
+          }
+        }catch(error){
+          console.error(`[bitget] position fetch failed for ${symbol}`, error)
+          positionUpdates[symbol] = { found: false, reason: 'network_error' }
         }
-        const data = await res.json()
-        if(data && data.price){
-          updates[symbol] = data.price
+      }
+
+      if(!Number.isFinite(markOverride)){
+        try{
+          const res = await fetch(buildApiUrl(`/price/${encodedSymbol}`), { headers: authHeaders() })
+          if(res.status === 401 || res.status === 403){
+            handleLogout()
+            return
+          }
+          const data = await res.json()
+          if(data && data.price !== undefined && data.price !== null){
+            const priceValue = Number(data.price)
+            if(Number.isFinite(priceValue)){
+              priceUpdates[symbol] = priceValue
+            }
+          }
+        }catch(error){
+          console.error(`[price] failed for ${symbol}`, error)
         }
-      }catch(error){
-        console.error(`[price] failed for ${symbol}`, error)
+      }else{
+        priceUpdates[symbol] = markOverride
       }
     }
-    if(Object.keys(updates).length){
-      setCurrentPrices(prev => ({ ...prev, ...updates }))
+
+    const openSet = new Set(symbols)
+
+    setCurrentPrices(prev => {
+      const next = {}
+      for(const sym of openSet){
+        if(Object.prototype.hasOwnProperty.call(priceUpdates, sym)){
+          next[sym] = priceUpdates[sym]
+        }else if(prev[sym] !== undefined){
+          next[sym] = prev[sym]
+        }
+      }
+      return next
+    })
+
+    setBitgetPositions(prev => {
+      if(bitgetDisabledRef.current){
+        return prev
+      }
+      const next = {}
+      for(const sym of openSet){
+        if(Object.prototype.hasOwnProperty.call(positionUpdates, sym)){
+          next[sym] = positionUpdates[sym]
+        }else if(Object.prototype.hasOwnProperty.call(prev, sym)){
+          next[sym] = prev[sym]
+        }else{
+          next[sym] = null
+        }
+      }
+      return next
+    })
+
+    // If positions were closed externally, refresh trades to update status
+    if(needsTradeRefresh){
+      setTimeout(() => fetchTrades(), 1000)
     }
   }
 
   const calculatePnL = useCallback((trade) => {
     if (!trade) return null
-    const currentPrice = Number(currentPrices[trade.symbol])
-    const entryPrice = Number(trade.price)
-    const sizeValue = Number(trade.size)
-    if(!Number.isFinite(currentPrice) || !Number.isFinite(entryPrice) || !Number.isFinite(sizeValue)) return null
-    const multiplier = trade.signal?.toUpperCase() === 'BUY' ? 1 : -1
-    return (currentPrice - entryPrice) * sizeValue * multiplier
-  }, [currentPrices])
+    const liveSnapshot = trade.symbol ? bitgetPositions?.[trade.symbol] : null
+    if (liveSnapshot && liveSnapshot.found !== false) {
+      const livePnLRaw = liveSnapshot.unrealized_pnl ?? liveSnapshot.unrealizedPnl
+      const livePnL = Number(livePnLRaw)
+      if (Number.isFinite(livePnL)) {
+        return livePnL
+      }
+    }
+
+    return null
+  }, [bitgetPositions])
 
   function mapStatus(s){
     if(!s) return 'other'
@@ -294,34 +393,57 @@ export default function App(){
     const wsBase = buildWsUrl()
     if (!wsBase){
       console.warn('[ws] unable to determine websocket base URL')
+      setStatus('Disconnected')
       return
     }
-    const socket = new WebSocket(`${wsBase}?token=${encodeURIComponent(token)}`)
-    wsRef.current = socket
-    socket.onopen = ()=>{ setStatus('Connected'); pushEvent('WebSocket connected') }
-    socket.onclose = (event)=>{
-      setStatus('Disconnected')
-      pushEvent('WebSocket disconnected')
-      wsRef.current = null
-      if(event && event.code === 1008){
-        pushEvent('WebSocket authentication failed; logging out.')
-        handleLogout()
-      }else if(token){
-        setTimeout(()=>{
-          if(token && !wsRef.current){
-            connectWS()
-          }
-        }, 3000)
+    try {
+      const socket = new WebSocket(`${wsBase}?token=${encodeURIComponent(token)}`)
+      wsRef.current = socket
+
+      socket.onopen = () => {
+        setStatus('Connected')
+        console.log('[ws] WebSocket connected')
       }
-    }
-    socket.onmessage = (event)=>{
-      try{
-        const payload = JSON.parse(event.data)
-        pushEvent(JSON.stringify(payload))
-        if(['received','placed','error','ignored','closed'].includes(payload.type)) {
-          fetchTrades()
+
+      socket.onclose = (event) => {
+        console.log('[ws] WebSocket closed, code:', event.code, 'reason:', event.reason)
+        setStatus('Disconnected')
+        wsRef.current = null
+        if(event && event.code === 1008){
+          console.log('[ws] Authentication failed, logging out')
+          pushEvent('WebSocket authentication failed; logging out.')
+          handleLogout()
+        }else if(token){
+          // Auto-reconnect after delay
+          setTimeout(()=>{
+            if(token && !wsRef.current){
+              console.log('[ws] Attempting reconnection')
+              connectWS()
+            }
+          }, 3000)
         }
-      }catch(error){ console.error('[ws] message parse error', error) }
+      }
+
+      socket.onmessage = (event)=>{
+        try{
+          const payload = JSON.parse(event.data)
+          console.log('[ws] Received message:', payload.type)
+          if(['received','placed','error','ignored','closed'].includes(payload.type)) {
+            fetchTrades()
+          }
+        }catch(error){
+          console.error('[ws] message parse error', error)
+        }
+      }
+
+      socket.onerror = (error) => {
+        console.error('[ws] WebSocket error:', error)
+        setStatus('Error')
+      }
+
+    } catch (error) {
+      console.error('[ws] Failed to create WebSocket:', error)
+      setStatus('Error')
     }
   }
 
@@ -382,83 +504,128 @@ export default function App(){
   const { openTrades, latestOpenTrade, lastClosedTrade, counts } = tradeSummary
   const positionPnL = latestOpenTrade ? calculatePnL(latestOpenTrade) : null
 
+  const handleClosePosition = useCallback(async () => {
+    if (!latestOpenTrade || !isAdmin) return
+
+    try {
+      const res = await fetch(buildApiUrl('/bitget/close-position'), {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          symbol: latestOpenTrade.symbol,
+          tradeId: latestOpenTrade.id
+        })
+      })
+
+      if (res.status === 401 || res.status === 403) {
+        handleLogout()
+        return
+      }
+
+      if (res.ok) {
+        pushEvent('Position close initiated')
+        // Refresh trades after a short delay to allow processing
+        setTimeout(() => fetchTrades(), 2000)
+      } else {
+        const errorData = await res.json()
+        pushEvent(`Close position failed: ${errorData?.message || 'Unknown error'}`)
+      }
+    } catch (error) {
+      console.error('[close position] error', error)
+      pushEvent(`Close position failed: ${error.message || error}`)
+    }
+  }, [latestOpenTrade, isAdmin, authHeaders, buildApiUrl, handleLogout, pushEvent, fetchTrades])
+
   const positionMetrics = useMemo(() => {
     if(!latestOpenTrade) return null
+
+    const liveSnapshot = latestOpenTrade.symbol ? bitgetPositions?.[latestOpenTrade.symbol] : null
+
     const rawSize = Number(latestOpenTrade.size)
     const rawEntryPrice = Number(latestOpenTrade.price)
     const livePrice = Number(currentPrices[latestOpenTrade.symbol])
     const storedSizeUsd = Number(latestOpenTrade.size_usd)
-    const storedLeverage = Number(latestOpenTrade.leverage)
 
-    const sizeValue = Number.isFinite(rawSize) ? rawSize : null
-    const entryPrice = Number.isFinite(rawEntryPrice) ? rawEntryPrice : null
-    const currentPrice = Number.isFinite(livePrice) && livePrice > 0 ? livePrice : entryPrice
-    const notionalFromDb = Number.isFinite(storedSizeUsd) ? storedSizeUsd : null
-    const derivedNotional = sizeValue !== null && entryPrice !== null ? sizeValue * entryPrice : null
-    const notional = notionalFromDb !== null ? notionalFromDb : derivedNotional
-
-    const explicitMargin = isFiniteNumber(latestOpenTrade.margin) ? Number(latestOpenTrade.margin) : null
-
-    let leverageValue = Number.isFinite(storedLeverage) && storedLeverage > 0 ? storedLeverage : null
-    if (!leverageValue && Number.isFinite(DEFAULT_LEVERAGE_FALLBACK) && DEFAULT_LEVERAGE_FALLBACK > 0) {
-      leverageValue = DEFAULT_LEVERAGE_FALLBACK
-    }
-    if ((!leverageValue || leverageValue <= 0) && explicitMargin && explicitMargin > 0 && notional !== null) {
-      leverageValue = notional / explicitMargin
-    }
-    if (!Number.isFinite(leverageValue) || leverageValue <= 0) {
-      leverageValue = null
+    const toNumber = (value) => {
+      const num = Number(value)
+      return Number.isFinite(num) ? num : null
     }
 
-    let margin = explicitMargin
-    if ((margin === null || margin <= 0) && notional !== null && leverageValue) {
-      margin = notional / leverageValue
-    }
+    const sizeValue = toNumber(rawSize)
+    const entryPrice = toNumber(rawEntryPrice)
+    const markPrice = toNumber(liveSnapshot?.mark_price ?? liveSnapshot?.markPrice ?? liveSnapshot?.index_price ?? liveSnapshot?.indexPrice)
+    const margin = toNumber(liveSnapshot?.margin)
+    const notional = toNumber(liveSnapshot?.notional ?? liveSnapshot?.size_usd ?? liveSnapshot?.sizeUsd ?? storedSizeUsd)
+    const leverage = toNumber(liveSnapshot?.leverage)
+    const liquidationPrice = toNumber(liveSnapshot?.liquidation_price ?? liveSnapshot?.liquidationPrice)
+    const pnlRatio = toNumber(liveSnapshot?.pnl_ratio ?? liveSnapshot?.pnlRatio ?? liveSnapshot?.uplRatio ?? liveSnapshot?.uplRate)
 
-    const totalValue = (sizeValue !== null && currentPrice !== null)
-      ? sizeValue * currentPrice
-      : (notional !== null ? notional : null)
-
-    let liquidationPrice = null
-    if (isFiniteNumber(latestOpenTrade.liquidation_price)) {
-      liquidationPrice = Number(latestOpenTrade.liquidation_price)
-    } else if (isFiniteNumber(latestOpenTrade.liquidationPrice)) {
-      liquidationPrice = Number(latestOpenTrade.liquidationPrice)
-    } else if (entryPrice !== null && leverageValue) {
-      const mmr = DEFAULT_MAINTENANCE_RATE
-      const offset = Math.max(1 / leverageValue - mmr, 0)
-      const sideUp = (latestOpenTrade.signal || '').toUpperCase()
-      if (sideUp === 'BUY' || sideUp === 'LONG') {
-        liquidationPrice = entryPrice * (1 - offset)
-      } else if (sideUp === 'SELL' || sideUp === 'SHORT') {
-        liquidationPrice = entryPrice * (1 + offset)
-      }
-    }
+    const totalValue = notional !== null
+      ? notional
+      : (sizeValue !== null && markPrice !== null ? sizeValue * markPrice : null)
 
     return {
+      snapshot: liveSnapshot,
       sizeValue,
       entryPrice,
-      currentPrice,
+      markPrice,
       totalValue,
-      leverage: leverageValue,
+      leverage,
       margin,
       notional,
-      liquidationPrice
+      liquidationPrice,
+      pnlRatio,
     }
-  }, [latestOpenTrade, currentPrices])
+  }, [latestOpenTrade, bitgetPositions, currentPrices])
 
   const positionOverview = useMemo(() => {
-    if (!latestOpenTrade || !positionMetrics) return []
+    if (!latestOpenTrade || !positionMetrics) return null
     const baseSymbol = (latestOpenTrade.symbol || '').split(/[_:.]/)[0] || latestOpenTrade.symbol || '—'
+    const liveSnapshot = latestOpenTrade.symbol ? bitgetPositions?.[latestOpenTrade.symbol] : null
     const sizeDisplay = positionMetrics.sizeValue !== null ? `${formatNumber(positionMetrics.sizeValue, 4)} ${baseSymbol}` : '—'
     const sizeUsdDisplay = positionMetrics.totalValue !== null
-      ? formatCurrency(positionMetrics.totalValue)
-      : positionMetrics.notional !== null
-        ? formatCurrency(positionMetrics.notional)
+      ? formatUsdt(positionMetrics.totalValue)
+      : positionMetrics.notional !== null && Number.isFinite(positionMetrics.notional)
+        ? formatUsdt(positionMetrics.notional)
         : '—'
     const leverageDisplay = formatLeverage(positionMetrics.leverage)
-    const totalDisplay = formatCurrency(positionMetrics.totalValue ?? positionMetrics.notional)
-    const pnlDisplay = positionPnL !== null && isFiniteNumber(positionPnL) ? formatCurrency(positionPnL) : '—'
+    const totalDisplay = positionMetrics.totalValue !== null
+      ? formatUsdt(positionMetrics.totalValue)
+      : positionMetrics.notional !== null && Number.isFinite(positionMetrics.notional)
+        ? formatUsdt(positionMetrics.notional)
+        : '—'
+
+    const pnlValue = Number(positionPnL)
+    const hasPnlValue = Number.isFinite(pnlValue)
+    const pnlDisplay = hasPnlValue ? formatUsdt(pnlValue) : '—'
+
+    let pnlPercent = null
+    if (liveSnapshot && isFiniteNumber(liveSnapshot.pnl_ratio ?? liveSnapshot.uplRatio ?? liveSnapshot.uplRate)) {
+      const rawRatio = Number(liveSnapshot.pnl_ratio ?? liveSnapshot.uplRatio ?? liveSnapshot.uplRate)
+      if (Number.isFinite(rawRatio)) {
+        pnlPercent = rawRatio * 100 // ROE from Bitget is already in percentage form
+      }
+    }
+    if (pnlPercent === null && hasPnlValue) {
+      const basisRaw = Number(positionMetrics.margin ?? positionMetrics.notional)
+      if (Number.isFinite(basisRaw) && basisRaw !== 0) {
+        pnlPercent = (pnlValue / basisRaw) * 100
+      }
+    }
+    const pnlPercentDisplay = pnlPercent !== null && Number.isFinite(pnlPercent) ? formatPercent(pnlPercent) : '—'
+
+    const pnlEur = hasPnlValue && Number.isFinite(usdToEurRate) ? pnlValue * usdToEurRate : null
+    const pnlEurDisplay = pnlEur !== null && Number.isFinite(pnlEur) ? formatEur(pnlEur) : '—'
+
+    const marginValue = positionMetrics.margin
+    const marginDisplay = Number.isFinite(marginValue) ? formatUsdt(marginValue) : '—'
+    const marginEurDisplay = Number.isFinite(marginValue) && Number.isFinite(usdToEurRate)
+      ? formatEur(marginValue * usdToEurRate)
+      : '—'
+
+    const markPriceDisplay = positionMetrics.markPrice !== null && isFiniteNumber(positionMetrics.markPrice)
+      ? formatCurrency(positionMetrics.markPrice)
+      : '—'
 
     const liquidationDisplay = positionMetrics.liquidationPrice !== null && isFiniteNumber(positionMetrics.liquidationPrice)
       ? formatCurrency(positionMetrics.liquidationPrice)
@@ -472,15 +639,20 @@ export default function App(){
       leverageDisplay,
       totalDisplay,
       pnlDisplay,
+      pnlPercentDisplay,
+      pnlEurDisplay,
+      marginDisplay,
+      marginEurDisplay,
+      markPriceDisplay,
       sizeUsdDisplay,
       liquidationDisplay,
       hasLeverage,
       hasTotal,
       sideDisplay: `${(latestOpenTrade.signal || '').toUpperCase()} ${baseSymbol}`,
       sideTone: latestOpenTrade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short',
-      pnlTone: positionPnL > 0 ? 'positive' : positionPnL < 0 ? 'negative' : 'neutral'
+      pnlTone: hasPnlValue ? (pnlValue > 0 ? 'positive' : pnlValue < 0 ? 'negative' : 'neutral') : 'neutral'
     }
-  }, [latestOpenTrade, positionMetrics, formatNumber, formatLeverage, formatCurrency, positionPnL])
+  }, [latestOpenTrade, positionMetrics, formatNumber, formatLeverage, formatUsdt, positionPnL, bitgetPositions, formatPercent, usdToEurRate, formatEur, formatCurrency])
 
   const overallPnL = useMemo(() => {
     let unrealized = 0
@@ -511,8 +683,14 @@ export default function App(){
     return { unrealized, realized, hasUnrealized, hasRealized }
   }, [trades, calculatePnL])
 
-  const overallUnrealizedDisplay = overallPnL.hasUnrealized ? formatCurrency(overallPnL.unrealized) : '—'
-  const overallRealizedDisplay = overallPnL.hasRealized ? formatCurrency(overallPnL.realized) : '—'
+  const overallUnrealizedDisplay = overallPnL.hasUnrealized ? formatUsdt(overallPnL.unrealized) : '—'
+  const overallRealizedDisplay = overallPnL.hasRealized ? formatUsdt(overallPnL.realized) : '—'
+  const overallUnrealizedEurDisplay = overallPnL.hasUnrealized && Number.isFinite(usdToEurRate)
+    ? formatEur(overallPnL.unrealized * usdToEurRate)
+    : '—'
+  const overallRealizedEurDisplay = overallPnL.hasRealized && Number.isFinite(usdToEurRate)
+    ? formatEur(overallPnL.realized * usdToEurRate)
+    : '—'
   const overallUnrealizedTone = overallPnL.hasUnrealized
     ? (overallPnL.unrealized > 0 ? 'positive' : overallPnL.unrealized < 0 ? 'negative' : 'neutral')
     : 'neutral'
@@ -611,11 +789,101 @@ export default function App(){
               <div className={`pnl-block ${toneToClass(overallUnrealizedTone)}`}>
                 <span className="label">Total Unrealized</span>
                 <span className="value">{overallUnrealizedDisplay}</span>
+                <span className="subvalue">{overallUnrealizedEurDisplay}</span>
               </div>
               <div className={`pnl-block ${toneToClass(overallRealizedTone)}`}>
                 <span className="label">Total Realized</span>
                 <span className="value">{overallRealizedDisplay}</span>
+                <span className="subvalue">{overallRealizedEurDisplay}</span>
               </div>
+            </div>
+          </div>
+
+          <div className="card current-position-card">
+            <div className="card-heading">
+              <h3>Current Position</h3>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                {latestOpenTrade && (
+                  <span className={`position-side-pill ${latestOpenTrade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short'}`}>
+                    {latestOpenTrade.signal}
+                  </span>
+                )}
+                {latestOpenTrade && isAdmin && (
+                  <button
+                    type="button"
+                    className="link-button"
+                    onClick={handleClosePosition}
+                    style={{ fontSize: '12px', padding: '4px 8px' }}
+                  >
+                    Close Position
+                  </button>
+                )}
+              </div>
+            </div>
+            {latestOpenTrade ? (
+              <div className="position-content">
+                <div className="position-header">
+                  <div>
+                    <div className="position-symbol">{latestOpenTrade.symbol}</div>
+                    <div className="muted">Opened {new Date(latestOpenTrade.created_at*1000).toLocaleString()}</div>
+                  </div>
+                  <div className="position-price">Entry {formatCurrency(positionMetrics?.entryPrice)}</div>
+                </div>
+                <div className="position-hero">
+                    <div className="position-hero-main">
+                    <div className={`side-badge badge-${positionOverview?.sideTone || (latestOpenTrade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short')}`}>
+                      {(latestOpenTrade.signal || '').toUpperCase()}
+                    </div>
+                    <div className="hero-symbol">{latestOpenTrade.symbol}</div>
+                      <div className="hero-size">{positionOverview?.sizeDisplay ?? '—'}</div>
+                      <div className="hero-size hero-size-usd">{positionOverview?.sizeUsdDisplay ?? '—'}</div>
+                  </div>
+                  <div className="hero-stats">
+                    <div className={`hero-stat total ${positionOverview?.pnlTone || 'neutral'}`}>
+                      <span className="stat-label">Total Value</span>
+                      <span className="stat-value">{positionOverview?.totalDisplay ?? '—'}</span>
+                    </div>
+                    <div className={`hero-stat ${positionOverview?.hasLeverage ? '' : 'stat-missing'}`}>
+                      <span className="stat-label">Leverage</span>
+                      <span className="stat-value">{positionOverview?.leverageDisplay ?? '—'}</span>
+                    </div>
+                    <div className={`hero-stat pnl ${positionOverview?.pnlTone || 'neutral'}`}>
+                      <span className="stat-label">PnL</span>
+                      <span className="stat-value">{positionOverview?.pnlDisplay ?? '—'}</span>
+                      <span className="stat-subvalue">{positionOverview?.pnlPercentDisplay ?? '—'}</span>
+                      <span className="stat-subvalue muted">{positionOverview?.pnlEurDisplay ?? '—'}</span>
+                    </div>
+                    <div className="hero-stat">
+                      <span className="stat-label">Margin</span>
+                      <span className="stat-value">{positionOverview?.marginDisplay ?? '—'}</span>
+                      <span className="stat-subvalue muted">{positionOverview?.marginEurDisplay ?? '—'}</span>
+                    </div>
+                    <div className="hero-stat">
+                      <span className="stat-label">Mark Price</span>
+                      <span className="stat-value">{positionOverview?.markPriceDisplay ?? '—'}</span>
+                    </div>
+                    <div className="hero-stat liquidation">
+                      <span className="stat-label">Liq. Price</span>
+                      <span className="stat-value">{positionOverview?.liquidationDisplay ?? '—'}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="empty-state">No open position. When a new TradingView alert arrives, the previous position is closed automatically and the latest trade appears here.</div>
+            )}
+          </div>
+
+          <div className="card graph-card">
+            <div className="card-heading graph-heading">
+              <h3>Market Graph</h3>
+              <span className="muted">BTCUSDT.P • Bitget</span>
+            </div>
+            <div className="graph-body">
+              <TradingViewChart
+                symbol="BITGET:BTCUSDT.P"
+                positionSignals={latestOpenTrade ? [latestOpenTrade] : []}
+              />
             </div>
           </div>
 
@@ -636,58 +904,6 @@ export default function App(){
               <span className="metric-label">Total</span>
               <span className="metric-value">{counts.total}</span>
             </div>
-          </div>
-
-          <div className="card current-position-card">
-            <div className="card-heading">
-              <h3>Current Position</h3>
-              {latestOpenTrade && (
-                <span className={`position-side-pill ${latestOpenTrade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short'}`}>
-                  {latestOpenTrade.signal}
-                </span>
-              )}
-            </div>
-            {latestOpenTrade ? (
-              <div className="position-content">
-                <div className="position-header">
-                  <div>
-                    <div className="position-symbol">{latestOpenTrade.symbol}</div>
-                    <div className="muted">Opened {new Date(latestOpenTrade.created_at*1000).toLocaleString()}</div>
-                  </div>
-                  <div className="position-price">Entry {formatCurrency(positionMetrics?.entryPrice)}</div>
-                </div>
-                <div className="position-hero">
-                    <div className="position-hero-main">
-                    <div className={`side-badge badge-${positionOverview.sideTone}`}>
-                      {(latestOpenTrade.signal || '').toUpperCase()}
-                    </div>
-                    <div className="hero-symbol">{latestOpenTrade.symbol}</div>
-                      <div className="hero-size">{positionOverview.sizeDisplay}</div>
-                      <div className="hero-size hero-size-usd">{positionOverview.sizeUsdDisplay}</div>
-                  </div>
-                  <div className="hero-stats">
-                    <div className={`hero-stat total ${positionOverview.pnlTone}`}>
-                      <span className="stat-label">Total Value</span>
-                      <span className="stat-value">{positionOverview.totalDisplay}</span>
-                    </div>
-                    <div className={`hero-stat ${positionOverview.hasLeverage ? '' : 'stat-missing'}`}>
-                      <span className="stat-label">Leverage</span>
-                      <span className="stat-value">{positionOverview.leverageDisplay}</span>
-                    </div>
-                    <div className={`hero-stat pnl ${positionOverview.pnlTone}`}>
-                      <span className="stat-label">PnL</span>
-                      <span className="stat-value">{positionOverview.pnlDisplay}</span>
-                    </div>
-                    <div className="hero-stat liquidation">
-                      <span className="stat-label">Liq. Price</span>
-                      <span className="stat-value">{positionOverview.liquidationDisplay}</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="empty-state">No open position. When a new TradingView alert arrives, the previous position is closed automatically and the latest trade appears here.</div>
-            )}
           </div>
 
           {lastClosedTrade && (
@@ -790,8 +1006,10 @@ export default function App(){
                         const res = await fetch(buildApiUrl('/debug/place-test'), { method: 'POST', headers, body: JSON.stringify(body) })
                         if(res.status === 401 || res.status === 403){ handleLogout(); return }
                         let parsed = null
-                        try{ parsed = await res.json() }catch(error){ parsed = await res.text() }
-                        try{ pushEvent(`[place-test] status=${res.status} resp=${JSON.stringify(parsed)}`) }catch(error){ console.log(error) }
+                        const text = await res.text()
+                        let parsedResponse = null
+                        try{ parsedResponse = JSON.parse(text) }catch(error){ parsedResponse = { raw_response: text } }
+                        try{ pushEvent(`[place-test] status=${res.status} resp=${JSON.stringify(parsedResponse)}`) }catch(error){ console.log(error) }
                         setLastOrderResult({ status: res.status, body: parsed })
                         if(res.ok){ fetchTrades() }
                       }catch(error){ pushEvent(`[place-test] error ${error.message || error}`) }
@@ -830,8 +1048,9 @@ export default function App(){
                             if(formSecret) headers['Tradingview-Secret'] = formSecret
                             const res = await fetch(buildApiUrl('/debug/order-status'), { method: 'POST', headers, body: JSON.stringify(body) })
                             if(res.status === 401 || res.status === 403){ handleLogout(); return }
+                            const text = await res.text()
                             let parsed = null
-                            try{ parsed = await res.json() }catch(error){ parsed = await res.text() }
+                            try{ parsed = JSON.parse(text) }catch(error){ parsed = { raw_response: text } }
                             setLastOrderQuery({ loading:false, status: res.status, body: parsed })
                           }catch(error){ setLastOrderQuery({ loading:false, error: String(error) }) }
                         }}
@@ -860,3 +1079,5 @@ export default function App(){
     </div>
   )
 }
+
+export default App
