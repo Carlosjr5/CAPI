@@ -9,7 +9,7 @@ import uuid
 import asyncio
 import secrets
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.staticfiles import StaticFiles
@@ -137,6 +137,15 @@ def safe_float(value) -> Optional[float]:
         return None
 
 
+def extract_numeric_field(payload: Dict[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        if key in payload:
+            candidate = safe_float(payload.get(key))
+            if candidate is not None:
+                return candidate
+    return None
+
+
 def extract_leverage_from_payload(payload: Optional[Dict[str, object]]) -> Optional[float]:
     if not isinstance(payload, dict):
         return None
@@ -248,6 +257,10 @@ trades = sqlalchemy.Table(
     sqlalchemy.Column("size", sqlalchemy.Float),  # Add size column
     sqlalchemy.Column("size_usd", sqlalchemy.Float),
     sqlalchemy.Column("leverage", sqlalchemy.Float),
+    sqlalchemy.Column("margin", sqlalchemy.Float),
+    sqlalchemy.Column("liquidation_price", sqlalchemy.Float),
+    sqlalchemy.Column("exit_price", sqlalchemy.Float),
+    sqlalchemy.Column("realized_pnl", sqlalchemy.Float),
     sqlalchemy.Column("status", sqlalchemy.String),  # placed, filled, rejected
     sqlalchemy.Column("response", sqlalchemy.Text),
     sqlalchemy.Column("created_at", sqlalchemy.Float),
@@ -267,6 +280,14 @@ def ensure_trade_table_columns():
                 conn.execute(text("ALTER TABLE trades ADD COLUMN size_usd REAL"))
             if "leverage" not in existing:
                 conn.execute(text("ALTER TABLE trades ADD COLUMN leverage REAL"))
+            if "margin" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN margin REAL"))
+            if "liquidation_price" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN liquidation_price REAL"))
+            if "exit_price" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN exit_price REAL"))
+            if "realized_pnl" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN realized_pnl REAL"))
     except Exception as exc:
         try:
             print(f"[startup] failed to ensure trades table columns: {exc}")
@@ -422,7 +443,7 @@ def build_signature(timestamp: str, method: str, request_path: str, body: str, s
     d = mac.digest()
     return base64.b64encode(d).decode()
 
-async def place_demo_order(symbol: str, side: str, price: float = None, size: float = None):
+async def place_demo_order(symbol: str, side: str, price: float = None, size: float = None, *, reduce_only: bool = False, close_position: bool = False, extra_fields: Optional[Dict[str, Any]] = None):
     """
     Place an order on Bitget demo futures (v2 mix order)
     We'll place a market order by default. Modify `orderType` to 'limit' if you want limit.
@@ -438,7 +459,7 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # Normalize symbol for Bitget - remove TradingView suffixes like .P
     normalized_symbol = symbol.replace('.P', '').replace('.p', '')
     use_symbol = mapped_symbol if mapped_symbol else normalized_symbol
-    body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size)
+    body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size, reduce_only=reduce_only, close_position=close_position, extra_fields=extra_fields)
 
     # For SUMCBL, the symbol construction is correct but the API rejects it.
     # Keep SUMCBL for now since that's what the user configured, but this may need to be changed
@@ -568,6 +589,175 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     return 502, json.dumps({"error": "all candidate endpoints returned 404"})
 
 
+async def close_existing_bitget_position(trade_row: Dict[str, Any]):
+    """Attempt to close an existing Bitget position using a reduce-only market order."""
+    try:
+        symbol = trade_row.get("symbol") if trade_row else None
+        signal = (trade_row.get("signal") or "").upper() if trade_row else ""
+        if not symbol or signal not in ("BUY", "SELL", "LONG", "SHORT"):
+            return
+
+        closing_side = "sell" if signal in ("BUY", "LONG") else "buy"
+
+        size_value = safe_float(trade_row.get("size")) if trade_row else None
+        if not size_value or size_value <= 0:
+            size_usd_value = safe_float(trade_row.get("size_usd")) if trade_row else None
+            price_value = safe_float(trade_row.get("price")) if trade_row else None
+            if size_usd_value is not None and price_value and price_value != 0:
+                try:
+                    size_value = float(size_usd_value) / float(price_value)
+                except Exception:
+                    size_value = None
+
+        if not size_value or size_value <= 0:
+            try:
+                print(f"[bitget][close] unable to determine position size for trade {trade_row.get('id')} — skipping reduce-only close")
+            except Exception:
+                pass
+            return
+
+        status_code, resp_text = await place_demo_order(
+            symbol=symbol,
+            side=closing_side,
+            size=size_value,
+            reduce_only=True,
+            close_position=True,
+        )
+        try:
+            print(f"[bitget][close] reduce-only order status={status_code} trade_id={trade_row.get('id')} resp={resp_text}")
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            print(f"[bitget][close] failed to submit reduce-only order for trade {trade_row.get('id') if trade_row else 'unknown'}: {exc}")
+        except Exception:
+            pass
+
+
+async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
+    """Fetch current Bitget position details to enrich leverage/margin data."""
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        return None
+    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
+        return None
+    try:
+        raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
+        if "_" not in raw and BITGET_PRODUCT_TYPE:
+            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+        else:
+            bitget_symbol = raw
+
+        body_obj = {"symbol": bitget_symbol}
+        if BITGET_MARGIN_COIN:
+            body_obj["marginCoin"] = BITGET_MARGIN_COIN
+        body = json.dumps(body_obj, separators=(",", ":"))
+        request_path = "/api/mix/v1/position/singlePosition"
+
+        timestamp = str(int(time.time() * 1000))
+        sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
+        headers = {
+            "ACCESS-KEY": BITGET_API_KEY,
+            "ACCESS-SIGN": sign,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+            "Content-Type": "application/json",
+            "paptrading": PAPTRADING,
+            "locale": "en-US",
+        }
+
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+            data = resp.json()
+
+        if not isinstance(data, dict):
+            return None
+        if str(data.get("code")) != "00000":
+            return None
+
+        payload = data.get("data")
+        if isinstance(payload, dict):
+            return payload
+        if isinstance(payload, list) and payload:
+            return payload[0]
+    except Exception as exc:
+        try:
+            print(f"[bitget][position] failed to fetch position for {symbol}: {exc}")
+        except Exception:
+            pass
+    return None
+
+
+async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_price: Optional[float], payload: Optional[Dict[str, Any]] = None):
+    """Close existing trades marked as placed before opening a new one.
+
+    Attempts to submit reduce-only Bitget orders and records exit price / realized PnL."""
+    try:
+        fetched_rows = await database.fetch_all(trades.select().where(trades.c.status == "placed"))
+        closing_rows = [dict(row) for row in fetched_rows]
+    except Exception:
+        closing_rows = []
+
+    if not closing_rows:
+        return
+
+    payload_dict = payload if isinstance(payload, dict) else {}
+    price_cache: Dict[str, Optional[float]] = {}
+
+    for row in closing_rows:
+        await close_existing_bitget_position(row)
+
+        symbol_for_row = (row.get("symbol") or "").strip()
+        closing_price = None
+        if symbol_for_row and new_symbol and symbol_for_row == new_symbol and fallback_price is not None:
+            closing_price = fallback_price
+
+        if closing_price is None:
+            candidate = safe_float(payload_dict.get("price"))
+            if candidate is not None:
+                closing_price = candidate
+
+        if closing_price is None and symbol_for_row:
+            if symbol_for_row not in price_cache:
+                price_cache[symbol_for_row] = await get_market_price_with_retries(symbol_for_row)
+            closing_price = price_cache.get(symbol_for_row)
+
+        entry_price = safe_float(row.get("price"))
+        size_value = safe_float(row.get("size"))
+        if (not size_value or size_value <= 0) and entry_price:
+            size_usd_val = safe_float(row.get("size_usd"))
+            if size_usd_val is not None and entry_price not in (None, 0):
+                try:
+                    size_value = float(size_usd_val) / float(entry_price)
+                except Exception:
+                    size_value = None
+
+        exit_price = None
+        realized_pnl = None
+        if closing_price is not None and entry_price is not None and size_value is not None and size_value != 0:
+            direction = 1 if str(row.get("signal") or "").upper() in ("BUY", "LONG") else -1
+            exit_price = float(closing_price)
+            realized_pnl = float((closing_price - entry_price) * size_value * direction)
+
+        update_values = {"status": "closed"}
+        if exit_price is not None:
+            update_values["exit_price"] = exit_price
+        if realized_pnl is not None:
+            update_values["realized_pnl"] = realized_pnl
+
+        await database.execute(trades.update().where(trades.c.id == row["id"]).values(**update_values))
+
+        try:
+            await broadcast({
+                "type": "closed",
+                "id": row.get("id"),
+                "reason": "rotation",
+                "exit_price": exit_price,
+                "realized_pnl": realized_pnl,
+            })
+        except Exception:
+            pass
+
+
 async def fetch_market_price(symbol: str):
     """Try to fetch a current market price for the given symbol from a public ticker (Binance).
     Returns a float price or None if it couldn't be fetched.
@@ -659,7 +849,7 @@ async def get_market_price_with_retries(symbol: str, attempts: int = 3, backoff:
     return last
 
 
-def construct_bitget_payload(symbol: str, side: str, size: float = None):
+def construct_bitget_payload(symbol: str, side: str, size: float = None, *, reduce_only: bool = False, close_position: bool = False, extra_fields: Optional[Dict[str, Any]] = None):
     """Construct the Bitget order payload dictionary without signing/sending.
     This mirrors the logic used by place_demo_order so it can be tested by
     the debug endpoint without making external calls.
@@ -723,9 +913,14 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None):
     elif BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
         body_obj["positionMode"] = "single"
 
-    # Add price for limit orders (not needed for market orders)
-    # if body_obj["orderType"] == "limit" and price is not None:
-    #     body_obj["price"] = str(price)
+    # reduceOnly/closePosition signals from caller if provided
+    if reduce_only:
+        body_obj["reduceOnly"] = "true"
+    if close_position:
+        body_obj["closePosition"] = "true"
+    if extra_fields:
+        for key, value in extra_fields.items():
+            body_obj[key] = value
 
     # Determine the symbol
     if pt_upper in ("SUMCBL", "UMCBL"):
@@ -917,6 +1112,27 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
     if price_numeric is None:
         price_numeric = safe_float(price_for_db)
 
+    margin_value = safe_float(payload.get("margin") if isinstance(payload, dict) else None)
+    if margin_value is None and isinstance(payload, dict):
+        margin_value = safe_float(payload.get("margin_required") or payload.get("marginRequired"))
+    if margin_value is None and trade_size_usd_value is not None and leverage_value:
+        try:
+            margin_value = float(trade_size_usd_value) / float(leverage_value)
+        except Exception:
+            margin_value = None
+
+    liquidation_price_value = None
+    if isinstance(payload, dict):
+        liquidation_price_value = safe_float(
+            payload.get("liquidation_price")
+            or payload.get("liquidationPrice")
+            or payload.get("liq_price")
+            or payload.get("liqPrice")
+            or payload.get("liquidation")
+        )
+
+    await close_open_positions_for_rotation(symbol, price_numeric, payload)
+
     # If dry-run is enabled, simulate placing an order by inserting a DB row
     if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
         # Construct the payload for reporting and the simulated response
@@ -943,6 +1159,10 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
                 size=trade_size_value,
                 size_usd=trade_size_usd_value,
                 leverage=leverage_value,
+                margin=margin_value,
+                liquidation_price=liquidation_price_value,
+                exit_price=None,
+                realized_pnl=None,
                 status=simulated_status,
                 response=json.dumps(fake_resp),
                 created_at=now
@@ -961,6 +1181,8 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
                 "size": trade_size_value,
                 "size_usd": trade_size_usd_value,
                 "leverage": leverage_value,
+                "margin": margin_value,
+                "liquidation_price": liquidation_price_value,
             })
         except Exception as e:
             # Fall back to returning simulated response even if DB write failed
@@ -975,6 +1197,8 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
             "price": float(price_numeric) if price_numeric is not None else None,
             "response": fake_resp,
             "payload": constructed_payload,
+            "margin": margin_value,
+            "liquidation_price": liquidation_price_value,
         }
 
     # Place the order using the existing helper
@@ -1013,6 +1237,27 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
         if isinstance(parsed, dict):
             bitget_code = parsed.get('code') or parsed.get('status')
         trade_status = "placed" if status_code == 200 and not (bitget_code and str(bitget_code) != '00000') else "error"
+
+        if trade_status == "placed":
+            need_margin = margin_value is None
+            need_leverage = leverage_value is None or leverage_value <= 0
+            need_liq = liquidation_price_value is None
+            if not str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on") and (need_margin or need_leverage or need_liq):
+                position_snapshot = await fetch_bitget_position(symbol)
+                if position_snapshot:
+                    if need_margin:
+                        margin_candidate = extract_numeric_field(position_snapshot, "margin", "marginSize", "marginValue", "positionMargin", "fixedMargin", "marginBalance")
+                        if margin_candidate is not None:
+                            margin_value = margin_candidate
+                    if need_leverage:
+                        leverage_candidate = extract_numeric_field(position_snapshot, "leverage", "lever", "marginLeverage")
+                        if leverage_candidate is not None and leverage_candidate > 0:
+                            leverage_value = leverage_candidate
+                    if need_liq:
+                        liq_candidate = extract_numeric_field(position_snapshot, "liquidationPrice", "liqPrice", "liqPx", "liqprice")
+                        if liq_candidate is not None:
+                            liquidation_price_value = liq_candidate
+
         try:
             await database.execute(trades.insert().values(
                 id=trade_id,
@@ -1022,10 +1267,23 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
                 size=trade_size_value,
                 size_usd=trade_size_usd_value,
                 leverage=leverage_value,
+                margin=margin_value,
+                liquidation_price=liquidation_price_value,
+                exit_price=None,
+                realized_pnl=None,
                 status=trade_status,
                 response=resp_text,
                 created_at=time.time()
             ))
+            updates = {}
+            if margin_value is not None:
+                updates["margin"] = margin_value
+            if leverage_value is not None:
+                updates["leverage"] = leverage_value
+            if liquidation_price_value is not None:
+                updates["liquidation_price"] = liquidation_price_value
+            if updates:
+                await database.execute(trades.update().where(trades.c.id == trade_id).values(**updates))
             # Broadcast the placed event to connected frontends
             await broadcast({
                 "type": "placed" if trade_status == "placed" else "error",
@@ -1036,6 +1294,8 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
                 "size": trade_size_value,
                 "size_usd": trade_size_usd_value,
                 "leverage": leverage_value,
+                "margin": margin_value,
+                "liquidation_price": liquidation_price_value,
             })
         except Exception as e:
             print(f"[debug/place-test] failed to write trade to DB: {e}")
@@ -1049,6 +1309,9 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
             "response": parsed,
             "payload": constructed_payload,
             "trade_id": trade_id,
+            "margin": margin_value,
+            "leverage": leverage_value,
+            "liquidation_price": liquidation_price_value,
         }
 
         return result
@@ -1455,6 +1718,25 @@ async def webhook(req: Request):
     if price_numeric is None:
         price_numeric = safe_float(price_for_db)
 
+    margin_value = safe_float(payload.get("margin") if isinstance(payload, dict) else None)
+    if margin_value is None and isinstance(payload, dict):
+        margin_value = safe_float(payload.get("margin_required") or payload.get("marginRequired"))
+    if margin_value is None and trade_size_usd_value is not None and leverage_value:
+        try:
+            margin_value = float(trade_size_usd_value) / float(leverage_value)
+        except Exception:
+            margin_value = None
+
+    liquidation_price_value = None
+    if isinstance(payload, dict):
+        liquidation_price_value = safe_float(
+            payload.get("liquidation_price")
+            or payload.get("liquidationPrice")
+            or payload.get("liq_price")
+            or payload.get("liqPrice")
+            or payload.get("liquidation")
+        )
+
     if event == "SIGNAL":
         # Just log the signal, no order placement
         trade_id = trade_id_from_payload or str(uuid.uuid4())
@@ -1466,6 +1748,10 @@ async def webhook(req: Request):
             size=trade_size_value,
             size_usd=trade_size_usd_value,
             leverage=leverage_value,
+            margin=margin_value,
+            liquidation_price=liquidation_price_value,
+            exit_price=None,
+            realized_pnl=None,
             status="signal",
             response="",
             created_at=now
@@ -1482,16 +1768,7 @@ async def webhook(req: Request):
 
     # For ENTRY or default (backward compatibility)
     # Close any existing open positions (one-way system)
-    try:
-        closing_rows = await database.fetch_all(sqlalchemy.select(trades.c.id).where(trades.c.status == "placed"))
-    except Exception:
-        closing_rows = []
-    await database.execute(trades.update().where(trades.c.status == "placed").values(status="closed"))
-    for row in closing_rows:
-        try:
-            await broadcast({"type": "closed", "id": row["id"], "reason": "rotation"})
-        except Exception:
-            pass
+    await close_open_positions_for_rotation(symbol, price_numeric, payload)
 
     # If there's no explicit signal, fail loudly so misconfigured alerts are obvious.
     if not signal:
@@ -1508,6 +1785,10 @@ async def webhook(req: Request):
         size=trade_size_value,
         size_usd=trade_size_usd_value,
         leverage=leverage_value,
+        margin=margin_value,
+        liquidation_price=liquidation_price_value,
+        exit_price=None,
+        realized_pnl=None,
         status="received",
         response="",
         created_at=now
@@ -1526,6 +1807,8 @@ async def webhook(req: Request):
         "size": trade_size_value,
         "size_usd": trade_size_usd_value,
         "leverage": leverage_value,
+        "margin": margin_value,
+        "liquidation_price": liquidation_price_value,
         "at": now,
     })
 
@@ -1570,6 +1853,8 @@ async def webhook(req: Request):
             "size": trade_size_value,
             "size_usd": trade_size_usd_value,
             "leverage": leverage_value,
+            "margin": margin_value,
+            "liquidation_price": liquidation_price_value,
         })
 
         if not is_success:

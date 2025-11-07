@@ -20,7 +20,23 @@ const currencyFormatter = new Intl.NumberFormat('en-US', { style: 'currency', cu
 const numberFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 })
 const leverageFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 })
 
-const isFiniteNumber = (value) => Number.isFinite(Number(value))
+const DEFAULT_MAINTENANCE_RATE = (() => {
+  try {
+    const raw = import.meta?.env?.VITE_MAINTENANCE_MARGIN
+    if (raw === undefined || raw === null || raw === '') return 0.004
+    const parsed = Number(raw)
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0.004
+  } catch (error) {
+    console.warn('[ui] unable to parse VITE_MAINTENANCE_MARGIN', error)
+    return 0.004
+  }
+})()
+
+const isFiniteNumber = (value) => {
+  if (value === null || value === undefined || value === '') return false
+  const numeric = Number(value)
+  return Number.isFinite(numeric)
+}
 
 export default function App(){
   const [token, setToken] = useState(() => localStorage.getItem(STORAGE_TOKEN_KEY) || '')
@@ -251,14 +267,15 @@ export default function App(){
     }
   }
 
-  function calculatePnL(trade){
+  const calculatePnL = useCallback((trade) => {
+    if (!trade) return null
     const currentPrice = Number(currentPrices[trade.symbol])
     const entryPrice = Number(trade.price)
     const sizeValue = Number(trade.size)
     if(!Number.isFinite(currentPrice) || !Number.isFinite(entryPrice) || !Number.isFinite(sizeValue)) return null
     const multiplier = trade.signal?.toUpperCase() === 'BUY' ? 1 : -1
     return (currentPrice - entryPrice) * sizeValue * multiplier
-  }
+  }, [currentPrices])
 
   function mapStatus(s){
     if(!s) return 'other'
@@ -380,14 +397,21 @@ export default function App(){
     const derivedNotional = sizeValue !== null && entryPrice !== null ? sizeValue * entryPrice : null
     const notional = notionalFromDb !== null ? notionalFromDb : derivedNotional
 
-    const leverageFromTrade = Number.isFinite(storedLeverage) && storedLeverage > 0 ? storedLeverage : null
-    const leverageFallback = Number.isFinite(DEFAULT_LEVERAGE_FALLBACK) && DEFAULT_LEVERAGE_FALLBACK > 0 ? DEFAULT_LEVERAGE_FALLBACK : null
-    const leverageValue = leverageFromTrade ?? leverageFallback ?? null
+    const explicitMargin = isFiniteNumber(latestOpenTrade.margin) ? Number(latestOpenTrade.margin) : null
 
-    let margin = null
-    if (isFiniteNumber(latestOpenTrade.margin)) {
-      margin = Number(latestOpenTrade.margin)
-    } else if (notional !== null && leverageValue) {
+    let leverageValue = Number.isFinite(storedLeverage) && storedLeverage > 0 ? storedLeverage : null
+    if (!leverageValue && Number.isFinite(DEFAULT_LEVERAGE_FALLBACK) && DEFAULT_LEVERAGE_FALLBACK > 0) {
+      leverageValue = DEFAULT_LEVERAGE_FALLBACK
+    }
+    if ((!leverageValue || leverageValue <= 0) && explicitMargin && explicitMargin > 0 && notional !== null) {
+      leverageValue = notional / explicitMargin
+    }
+    if (!Number.isFinite(leverageValue) || leverageValue <= 0) {
+      leverageValue = null
+    }
+
+    let margin = explicitMargin
+    if ((margin === null || margin <= 0) && notional !== null && leverageValue) {
       margin = notional / leverageValue
     }
 
@@ -400,6 +424,15 @@ export default function App(){
       liquidationPrice = Number(latestOpenTrade.liquidation_price)
     } else if (isFiniteNumber(latestOpenTrade.liquidationPrice)) {
       liquidationPrice = Number(latestOpenTrade.liquidationPrice)
+    } else if (entryPrice !== null && leverageValue) {
+      const mmr = DEFAULT_MAINTENANCE_RATE
+      const offset = Math.max(1 / leverageValue - mmr, 0)
+      const sideUp = (latestOpenTrade.signal || '').toUpperCase()
+      if (sideUp === 'BUY' || sideUp === 'LONG') {
+        liquidationPrice = entryPrice * (1 - offset)
+      } else if (sideUp === 'SELL' || sideUp === 'SHORT') {
+        liquidationPrice = entryPrice * (1 + offset)
+      }
     }
 
     return {
@@ -425,35 +458,68 @@ export default function App(){
         : '—'
     const leverageDisplay = formatLeverage(positionMetrics.leverage)
     const totalDisplay = formatCurrency(positionMetrics.totalValue ?? positionMetrics.notional)
-    const marginDisplay = positionMetrics.margin !== null && isFiniteNumber(positionMetrics.margin)
-      ? formatCurrency(positionMetrics.margin)
-      : '—'
-    const entryDisplay = formatCurrency(positionMetrics.entryPrice)
-    const markDisplay = formatCurrency(positionMetrics.currentPrice)
     const pnlDisplay = positionPnL !== null && isFiniteNumber(positionPnL) ? formatCurrency(positionPnL) : '—'
 
     const liquidationDisplay = positionMetrics.liquidationPrice !== null && isFiniteNumber(positionMetrics.liquidationPrice)
       ? formatCurrency(positionMetrics.liquidationPrice)
       : '—'
 
+    const hasLeverage = isFiniteNumber(positionMetrics.leverage) && Number(positionMetrics.leverage) > 0
+    const hasTotal = positionMetrics.totalValue !== null && isFiniteNumber(positionMetrics.totalValue)
+
     return {
       sizeDisplay,
       leverageDisplay,
       totalDisplay,
-      marginDisplay,
-      entryDisplay,
-      markDisplay,
       pnlDisplay,
-  sizeUsdDisplay,
-  liquidationDisplay,
-      hasMargin: positionMetrics.margin !== null && isFiniteNumber(positionMetrics.margin),
-      hasLeverage: !!positionMetrics.leverage,
-      hasTotal: positionMetrics.totalValue !== null,
+      sizeUsdDisplay,
+      liquidationDisplay,
+      hasLeverage,
+      hasTotal,
       sideDisplay: `${(latestOpenTrade.signal || '').toUpperCase()} ${baseSymbol}`,
       sideTone: latestOpenTrade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short',
       pnlTone: positionPnL > 0 ? 'positive' : positionPnL < 0 ? 'negative' : 'neutral'
     }
   }, [latestOpenTrade, positionMetrics, formatNumber, formatLeverage, formatCurrency, positionPnL])
+
+  const overallPnL = useMemo(() => {
+    let unrealized = 0
+    let realized = 0
+    let hasUnrealized = false
+    let hasRealized = false
+
+    for (const trade of trades) {
+      const statusKey = mapStatus(trade.status)
+      if (statusKey === 'open') {
+        const pnl = calculatePnL(trade)
+        if (Number.isFinite(pnl)) {
+          unrealized += pnl
+          hasUnrealized = true
+        }
+      } else if (statusKey === 'closed') {
+        const raw = trade.realized_pnl ?? trade.realizedPnl
+        if (raw !== undefined && raw !== null) {
+          const val = Number(raw)
+          if (Number.isFinite(val)) {
+            realized += val
+            hasRealized = true
+          }
+        }
+      }
+    }
+
+    return { unrealized, realized, hasUnrealized, hasRealized }
+  }, [trades, calculatePnL])
+
+  const overallUnrealizedDisplay = overallPnL.hasUnrealized ? formatCurrency(overallPnL.unrealized) : '—'
+  const overallRealizedDisplay = overallPnL.hasRealized ? formatCurrency(overallPnL.realized) : '—'
+  const overallUnrealizedTone = overallPnL.hasUnrealized
+    ? (overallPnL.unrealized > 0 ? 'positive' : overallPnL.unrealized < 0 ? 'negative' : 'neutral')
+    : 'neutral'
+  const overallRealizedTone = overallPnL.hasRealized
+    ? (overallPnL.realized > 0 ? 'positive' : overallPnL.realized < 0 ? 'negative' : 'neutral')
+    : 'neutral'
+  const toneToClass = (tone) => (tone === 'positive' ? 'positive' : tone === 'negative' ? 'negative' : '')
 
   async function handleLogin(e){
     e?.preventDefault?.()
@@ -537,6 +603,22 @@ export default function App(){
       </header>
       <main className="dashboard-layout">
         <section className="dashboard-primary">
+          <div className="card overall-pnl-card">
+            <div className="card-heading">
+              <h3>Overall PnL</h3>
+            </div>
+            <div className="overall-pnl-grid">
+              <div className={`pnl-block ${toneToClass(overallUnrealizedTone)}`}>
+                <span className="label">Total Unrealized</span>
+                <span className="value">{overallUnrealizedDisplay}</span>
+              </div>
+              <div className={`pnl-block ${toneToClass(overallRealizedTone)}`}>
+                <span className="label">Total Realized</span>
+                <span className="value">{overallRealizedDisplay}</span>
+              </div>
+            </div>
+          </div>
+
           <div className="metric-grid">
             <div className="metric-card">
               <span className="metric-label">Open</span>
@@ -592,18 +674,6 @@ export default function App(){
                       <span className="stat-label">Leverage</span>
                       <span className="stat-value">{positionOverview.leverageDisplay}</span>
                     </div>
-                    <div className={`hero-stat ${positionOverview.hasMargin ? '' : 'stat-missing'}`}>
-                      <span className="stat-label">Margin</span>
-                      <span className="stat-value">{positionOverview.marginDisplay}</span>
-                    </div>
-                    <div className="hero-stat">
-                      <span className="stat-label">Entry</span>
-                      <span className="stat-value">{positionOverview.entryDisplay}</span>
-                    </div>
-                    <div className="hero-stat">
-                      <span className="stat-label">Mark</span>
-                      <span className="stat-value">{positionOverview.markDisplay}</span>
-                    </div>
                     <div className={`hero-stat pnl ${positionOverview.pnlTone}`}>
                       <span className="stat-label">PnL</span>
                       <span className="stat-value">{positionOverview.pnlDisplay}</span>
@@ -645,7 +715,12 @@ export default function App(){
             </div>
           )}
 
-          <TradeTable items={trades} onRefresh={fetchTrades} />
+          <TradeTable
+            items={trades}
+            onRefresh={fetchTrades}
+            calculatePnL={calculatePnL}
+            formatCurrency={formatCurrency}
+          />
         </section>
 
         <aside className="dashboard-secondary">
