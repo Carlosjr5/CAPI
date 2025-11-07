@@ -907,15 +907,14 @@ function App() {
                   )}
                 </div>
                 {positionOverview && (
-                  <div className="position-hero">
-                    <div className="position-hero-main">
-                      <div className={`side-badge badge-${positionOverview.sideTone}`}>
-                        {(latestOpenTrade.signal || '').toUpperCase()}
-                      </div>
-                      <div className="hero-symbol">{latestOpenTrade.symbol}</div>
-                      <div className="hero-size">{positionOverview.sizeDisplay}</div>
-                      <div className="hero-size hero-size-usd">{positionOverview.sizeUsdDisplay}</div>
+                <div className="position-hero">
+                  <div className="position-hero-main">
+                    <div className={`side-badge badge-${positionOverview.sideTone}`}>
+                      {(latestOpenTrade.signal || '').toUpperCase()}
                     </div>
+                    <div className="hero-symbol">{latestOpenTrade.symbol}</div>
+                    <div className="hero-size">{positionOverview.sizeDisplay}</div>
+                  </div>
                     <div className="hero-stats">
                       <div className={`hero-stat pnl ${positionOverview.pnlTone || 'neutral'}`}>
                         <span className="stat-label">PnL</span>

@@ -31,13 +31,16 @@ export default function TradeTable({items, onRefresh, calculatePnL, formatCurren
 
               return (
                 <tr key={it.id}>
-                  <td className="muted">{fmtTime(it.created_at)}</td>
-                  <td><strong>{it.symbol}</strong><div className="muted id">{it.id?.slice(0,10)}</div></td>
-                  <td>{it.signal}</td>
-                  <td>{it.price!=null? Number(it.price).toFixed(2):'-'}</td>
-                  <td>{it.size!=null? Number(it.size).toFixed(4):'-'}</td>
-                  <td className={pnlClass}>{showPnL ? pnlDisplay : '-'}</td>
-                  <td className={getStatusClass(it.status)}>{(it.status||'').toLowerCase()}</td>
+                  <td className="muted" data-label="When">{fmtTime(it.created_at)}</td>
+                  <td className="symbol-cell" data-label="Symbol">
+                    <strong>{it.symbol}</strong>
+                    <div className="muted id">{it.id?.slice(0,10)}</div>
+                  </td>
+                  <td data-label="Signal">{it.signal}</td>
+                  <td data-label="Price">{it.price!=null? Number(it.price).toFixed(2):'-'}</td>
+                  <td data-label="Size">{it.size!=null? Number(it.size).toFixed(4):'-'}</td>
+                  <td className={pnlClass} data-label="PnL">{showPnL ? pnlDisplay : '-'}</td>
+                  <td className={getStatusClass(it.status)} data-label="Status">{(it.status||'').toLowerCase()}</td>
                 </tr>
               )
             })}
