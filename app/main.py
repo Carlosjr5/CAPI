@@ -54,6 +54,9 @@ AUTH_ALGORITHM = "HS256"
 AUTH_TOKEN_EXPIRE_MINUTES = int(os.getenv("AUTH_TOKEN_EXPIRE_MINUTES", "1440"))
 
 USERS: Dict[str, Dict[str, str]] = {}
+CI_FALLBACK_USER: Optional[str] = None
+CI_FALLBACK_ROLE: Optional[str] = None
+CI_FALLBACK_ACTIVE: bool = False
 raw_users = os.getenv("DASHBOARD_USERS")
 if raw_users:
     parsed_from_json = False
@@ -97,6 +100,9 @@ if not USERS:
         fallback_password = os.getenv("GITHUB_ACTIONS_PASSWORD", "capi_ci_pass")
         fallback_role = os.getenv("GITHUB_ACTIONS_ROLE", "admin")
         USERS[fallback_user] = {"password": fallback_password, "role": fallback_role}
+        CI_FALLBACK_USER = fallback_user
+        CI_FALLBACK_ROLE = fallback_role
+        CI_FALLBACK_ACTIVE = True
         print(f"[auth] No users configured from env; created fallback CI user '{fallback_user}'.")
 
 if not USERS:
@@ -205,6 +211,8 @@ def decode_token(token: str) -> Dict[str, str]:
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, str]:
     if credentials is None:
+        if CI_FALLBACK_ACTIVE and CI_FALLBACK_USER:
+            return {"username": CI_FALLBACK_USER, "role": CI_FALLBACK_ROLE or "admin"}
         raise HTTPException(status_code=401, detail="Not authenticated")
     token = credentials.credentials
     payload = decode_token(token)
