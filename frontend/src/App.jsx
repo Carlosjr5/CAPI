@@ -2,30 +2,6 @@
 import TradeTable from './TradeTable'
 import TradingViewChart from './TradingViewChart'
 
-const TradingViewChart = ({ latestOpenTrade }) => {
-  const symbol = latestOpenTrade && latestOpenTrade.symbol
-    ? `BINANCE:${latestOpenTrade.symbol.replace('USDT', 'USDT')}`
-    : 'BINANCE:BTCUSDT'
-
-  return (
-    <div className="card tradingview-card">
-      <div className="card-heading">
-        <h3>TradingView Chart</h3>
-      </div>
-      <div className="tradingview-chart-container">
-        <iframe
-          src={`https://www.tradingview.com/widgetembed/?frameElementId=tradingview-widget&symbol=${encodeURIComponent(symbol)}&interval=D&hidesidetoolbar=1&saveimage=0&toolbarbg=131722&studies=[]&theme=dark&style=1&timezone=Etc%2FUTC&withdateranges=1&showpopupbutton=0&studies_overrides={}&overrides={}&enabled_features=[]&disabled_features=[]&showpopupbutton=0&locale=en`}
-          frameBorder="0"
-          width="100%"
-          height="400"
-          title="TradingView Chart"
-          sandbox="allow-scripts allow-same-origin allow-popups allow-presentation"
-        />
-      </div>
-    </div>
-  )
-}
-
 const STORAGE_TOKEN_KEY = 'capi_token'
 const STORAGE_ROLE_KEY = 'capi_role'
 
@@ -42,6 +18,7 @@ const DEFAULT_LEVERAGE_FALLBACK = (() => {
 
 const currencyFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 })
 const numberFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 })
+const usdtFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 })
 
 const isFiniteNumber = (value) => Number.isFinite(Number(value))
 const getPnlTone = (value) => {
@@ -153,6 +130,28 @@ function App() {
   const formatUsdt = useCallback((value) => {
     const num = Number(value)
     return Number.isFinite(num) ? `${usdtFormatter.format(num)} USDT` : EM_DASH
+  }, [])
+
+  const formatNumber = useCallback((value, digits = 4) => {
+    const num = Number(value)
+    if (!Number.isFinite(num)) return '—'
+    if (digits !== 4) {
+      return new Intl.NumberFormat('en-US', { maximumFractionDigits: digits }).format(num)
+    }
+    return numberFormatter.format(num)
+  }, [])
+
+  const buildApiUrl = useCallback((path) => {
+    if (typeof window === 'undefined') return path
+    const { protocol, host } = window.location
+    return `${protocol}//${host}${path}`
+  }, [])
+
+  const buildWsUrl = useCallback(() => {
+    if (typeof window === 'undefined') return null
+    const { protocol, host } = window.location
+    const wsProtocol = protocol === 'https:' ? 'wss:' : 'ws:'
+    return `${wsProtocol}//${host}`
   }, [])
 
   const isLocalFrontend = useCallback(() => {
@@ -702,21 +701,21 @@ function App() {
   }, [latestOpenTrade, getBitgetSnapshot])
 
   const positionOverview = useMemo(() => {
-    if (!latestOpenTrade || !positionMetrics) return []
+    if (!latestOpenTrade || !positionMetrics) return null
     const baseSymbol = (latestOpenTrade.symbol || '').split(/[_:.]/)[0] || latestOpenTrade.symbol || '—'
-    const sizeDisplay = positionMetrics.sizeValue !== null ? `${formatNumber(positionMetrics.sizeValue, 4)} ${baseSymbol}` : '—'
+    const sizeDisplay = positionMetrics.sizeValue !== null ? `${formatNumber(positionMetrics.sizeValue)} ${baseSymbol}` : '—'
     const sizeUsdDisplay = positionMetrics.totalValue !== null
       ? formatCurrency(positionMetrics.totalValue)
       : positionMetrics.notional !== null
         ? formatCurrency(positionMetrics.notional)
         : '—'
     const totalDisplay = formatCurrency(positionMetrics.totalValue ?? positionMetrics.notional)
-    const markDisplay = formatCurrency(positionMetrics.currentPrice)
+    const markDisplay = formatCurrency(positionMetrics.markPrice ?? positionMetrics.currentPrice)
     const pnlDisplay = positionPnL !== null && isFiniteNumber(positionPnL) ? formatCurrency(positionPnL) : '—'
 
     return {
-      hasSnapshot,
-      statusMessage,
+      hasSnapshot: positionMetrics.hasSnapshot,
+      statusMessage: positionMetrics.hasSnapshot ? 'Live' : 'Offline',
       sizeDisplay,
       totalDisplay,
       markDisplay,
@@ -856,10 +855,34 @@ function App() {
                     <div className="muted">Opened {new Date(latestOpenTrade.created_at*1000).toLocaleString()}</div>
                   </div>
                   <div className="position-price">Entry {formatCurrency(positionMetrics?.entryPrice)}</div>
+                  {isAdmin && (
+                    <button
+                      type="button"
+                      className="close-position-button"
+                      onClick={async () => {
+                        try {
+                          const res = await fetch(buildApiUrl(`/close/${latestOpenTrade.id}`), {
+                            method: 'POST',
+                            headers: authHeaders()
+                          })
+                          if (res.ok) {
+                            pushEvent(`Position closed successfully`)
+                            fetchTrades()
+                          } else {
+                            pushEvent(`Failed to close position: ${res.status}`)
+                          }
+                        } catch (error) {
+                          pushEvent(`Error closing position: ${error.message}`)
+                        }
+                      }}
+                    >
+                      Close Position
+                    </button>
+                  )}
                 </div>
                 <div className="position-hero">
                     <div className="position-hero-main">
-                    <div className={`side-badge badge-${positionOverview.sideTone}`}>
+                    <div className={`side-badge badge-${positionOverview.sideTone || 'neutral'}`}>
                       {(latestOpenTrade.signal || '').toUpperCase()}
                     </div>
                     <div className="hero-symbol">{latestOpenTrade.symbol}</div>
@@ -867,7 +890,7 @@ function App() {
                       <div className="hero-size hero-size-usd">{positionOverview.sizeUsdDisplay}</div>
                   </div>
                   <div className="hero-stats">
-                    <div className={`hero-stat total ${positionOverview.pnlTone}`}>
+                    <div className={`hero-stat total ${positionOverview.pnlTone || 'neutral'}`}>
                       <span className="stat-label">Total Value</span>
                       <span className="stat-value">{positionOverview.totalDisplay}</span>
                     </div>
@@ -875,7 +898,7 @@ function App() {
                       <span className="stat-label">Mark</span>
                       <span className="stat-value">{positionOverview.markDisplay}</span>
                     </div>
-                    <div className={`hero-stat pnl ${positionOverview.pnlTone}`}>
+                    <div className={`hero-stat pnl ${positionOverview.pnlTone || 'neutral'}`}>
                       <span className="stat-label">PnL</span>
                       <span className="stat-value">{positionOverview.pnlDisplay}</span>
                     </div>

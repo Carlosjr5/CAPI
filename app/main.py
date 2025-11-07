@@ -83,6 +83,14 @@ if raw_users:
         except Exception as e:
             print(f"[auth] Failed to parse DASHBOARD_USERS fallback format: {e}")
 
+# Add default users for testing/development
+if not USERS:
+    # Default admin user for testing
+    USERS["admin"] = {"password": "admin123", "role": "admin"}
+    # Default user for testing
+    USERS["user"] = {"password": "user123", "role": "user"}
+    print("[auth] Added default users for testing: admin/admin123, user/user123")
+
 admin_username = os.getenv("ADMIN_USERNAME")
 admin_password = os.getenv("ADMIN_PASSWORD")
 if admin_username and admin_password:
@@ -187,7 +195,7 @@ def resolve_trade_dimensions(price_value, computed_size, explicit_size, provided
 
 def verify_password(plain_password: str, stored_password: str) -> bool:
     try:
-        return secrets.compare_digest(str(plain_password), str(stored_password))
+        return secrets.compare_digest(str(plain_password).strip(), str(stored_password).strip())
     except Exception:
         return False
 
@@ -457,7 +465,7 @@ async def close_existing_bitget_position(trade_row):
         # Determine opposite side for closing
         close_side = "sell" if signal.upper() in ("BUY", "LONG") else "buy"
 
-        # Submit close order with closePosition=true
+        # Submit close order with closePosition=true to close the entire position
         close_payload = construct_bitget_payload(symbol=symbol, side=close_side, size=size)
         close_payload["closePosition"] = True
 
@@ -557,7 +565,7 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # Normalize symbol for Bitget - remove TradingView suffixes like .P
     normalized_symbol = symbol.replace('.P', '').replace('.p', '')
     use_symbol = mapped_symbol if mapped_symbol else normalized_symbol
-    body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size, reduce_only=reduce_only, close_position=close_position, extra_fields=extra_fields)
+    body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size)
 
     # For SUMCBL, the symbol construction is correct but the API rejects it.
     # Keep SUMCBL for now since that's what the user configured, but this may need to be changed
@@ -687,67 +695,6 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     return 502, json.dumps({"error": "all candidate endpoints returned 404"})
 
 
-async def close_existing_bitget_position(trade_row: Dict[str, Any]):
-    """Attempt to close an existing Bitget position using a reduce-only market order."""
-    try:
-        symbol = trade_row.get("symbol") if trade_row else None
-        signal = (trade_row.get("signal") or "").upper() if trade_row else ""
-        if not symbol or signal not in ("BUY", "SELL", "LONG", "SHORT"):
-            return
-
-        closing_side = "sell" if signal in ("BUY", "LONG") else "buy"
-
-        size_value = safe_float(trade_row.get("size")) if trade_row else None
-        if not size_value or size_value <= 0:
-            size_usd_value = safe_float(trade_row.get("size_usd")) if trade_row else None
-            price_value = safe_float(trade_row.get("price")) if trade_row else None
-            if size_usd_value is not None and price_value and price_value != 0:
-                try:
-                    size_value = float(size_usd_value) / float(price_value)
-                except Exception:
-                    size_value = None
-
-        if not size_value or size_value <= 0:
-            try:
-                print(f"[bitget][close] unable to determine position size for trade {trade_row.get('id')} — skipping reduce-only close")
-            except Exception:
-                pass
-            return
-
-        # First, cancel any hanging orders for this symbol
-        try:
-            await cancel_orders_for_symbol(symbol)
-            try:
-                print(f"[bitget][close] cancelled hanging orders for {symbol}")
-            except Exception:
-                pass
-        except Exception as cancel_exc:
-            try:
-                print(f"[bitget][close] failed to cancel orders for {symbol}: {cancel_exc}")
-            except Exception:
-                pass
-
-        # Wait a moment for order cancellation to process
-        await asyncio.sleep(1.0)
-
-        # For closing positions, use a simple market order with reduce_only to close the entire position
-        # Don't use close_position as it can cause parameter conflicts in different API versions
-        status_code, resp_text = await place_demo_order(
-            symbol=symbol,
-            side=closing_side,
-            size=size_value,
-            reduce_only=True,
-            close_position=False,
-        )
-        try:
-            print(f"[bitget][close] reduce-only order status={status_code} trade_id={trade_row.get('id')} resp={resp_text}")
-        except Exception:
-            pass
-    except Exception as exc:
-        try:
-            print(f"[bitget][close] failed to submit reduce-only order for trade {trade_row.get('id') if trade_row else 'unknown'}: {exc}")
-        except Exception:
-            pass
 
 
 async def cancel_orders_for_symbol(symbol: str):
@@ -886,7 +833,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
         snapshot = _pick_snapshot(payload, bitget_symbol)
         if snapshot:
             return snapshot
-
+    
         # 2) Retry without holdSide if it was provided (some accounts reject the extra field)
         if "holdSide" in primary_body:
             fallback_body = dict(primary_body)
@@ -895,7 +842,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
             snapshot = _pick_snapshot(payload, bitget_symbol)
             if snapshot:
                 return snapshot
-
+    
         # 3) Retry without productType if the API rejected the narrower filter
         if "productType" in primary_body:
             fallback_body = {k: v for k, v in primary_body.items() if k != "productType"}
@@ -903,19 +850,19 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
             snapshot = _pick_snapshot(payload, bitget_symbol)
             if snapshot:
                 return snapshot
-
+    
         # 4) Fallback: fetch all positions for the product type and search for the symbol
         all_body: Dict[str, Any] = {}
         if BITGET_PRODUCT_TYPE:
             all_body["productType"] = BITGET_PRODUCT_TYPE
         if BITGET_MARGIN_COIN:
             all_body["marginCoin"] = BITGET_MARGIN_COIN
-
+    
         payload = await _post_bitget("/api/mix/v1/position/allPosition", all_body, "all")
         snapshot = _pick_snapshot(payload, bitget_symbol)
         if snapshot:
             return snapshot
-
+    
         # 5) As a final attempt, remove productType filter when searching all positions
         if all_body:
             payload = await _post_bitget("/api/mix/v1/position/allPosition", {}, "all-unfiltered")
@@ -2394,6 +2341,7 @@ async def get_price(symbol: str, current_user: Dict[str, str] = Depends(get_curr
 # Simple WebSocket endpoint for frontend live updates
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
     token = ws.query_params.get("token")
     if not token:
         await ws.close(code=1008)
@@ -2410,7 +2358,6 @@ async def websocket_endpoint(ws: WebSocket):
         await ws.close(code=1008)
         return
     # Skip user existence check since token is already validated
-    await ws.accept()
     client = {"ws": ws, "username": username, "role": role}
     connected_websockets.append(client)
     try:
