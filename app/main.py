@@ -460,14 +460,25 @@ async def close_existing_bitget_position(trade_row):
         trade_id = trade_row['id']
         symbol = trade_row['symbol']
         signal = trade_row['signal']
-        size = trade_row['size']
+        size_value = safe_float(trade_row.get('size'))
+        if size_value is None or size_value <= 0:
+            entry_price = safe_float(trade_row.get('price'))
+            size_usd = safe_float(trade_row.get('size_usd') or trade_row.get('sizeUsd'))
+            if size_usd is not None and entry_price not in (None, 0):
+                try:
+                    size_value = abs(float(size_usd) / float(entry_price))
+                except Exception:
+                    size_value = None
+        if size_value is None or size_value <= 0:
+            size_value = 0.001
 
         # Determine opposite side for closing
         close_side = "sell" if signal.upper() in ("BUY", "LONG") else "buy"
 
         # Submit close order with closePosition=true to close the entire position
-        close_payload = construct_bitget_payload(symbol=symbol, side=close_side, size=size)
+        close_payload = construct_bitget_payload(symbol=symbol, side=close_side, size=size_value)
         close_payload["closePosition"] = True
+        close_payload["reduceOnly"] = "true"
 
         # Ensure Bitget receives the correct leg to close; holdSide/positionSide must
         # reflect the original position direction, not the side of the closing order.
@@ -520,40 +531,6 @@ async def close_existing_bitget_position(trade_row):
     except Exception as e:
         print(f"[close_position] Error in close_existing_bitget_position: {e}")
         return False
-
-
-async def close_open_positions_for_rotation(symbol: str, price_numeric: float, payload):
-    """Close any existing open positions before opening a new one (one-way system).
-    Uses Bitget's position reversal capability - instead of closing then opening,
-    we directly reverse positions which is more efficient and reliable.
-    """
-    try:
-        # Find all open positions (status = "placed")
-        open_trades = await database.fetch_all(
-            trades.select().where(trades.c.status == "placed")
-        )
-
-        if not open_trades:
-            print("[rotation] No open positions to reverse")
-            return
-
-        print(f"[rotation] Found {len(open_trades)} open positions to reverse")
-
-        # For each open position, mark it as closed in DB but don't send close orders
-        # Bitget will handle the position reversal automatically when we place the new order
-        closed_count = 0
-        for trade_row in open_trades:
-            try:
-                await database.execute(trades.update().where(trades.c.id == trade_row['id']).values(status="closed"))
-                closed_count += 1
-                print(f"[rotation] Marked trade {trade_row['id']} as closed in DB")
-            except Exception as e:
-                print(f"[rotation] Error marking trade {trade_row['id']} as closed: {e}")
-
-        print(f"[rotation] Marked {closed_count} positions as closed - ready for reversal")
-
-    except Exception as e:
-        print(f"[rotation] Error in close_open_positions_for_rotation: {e}")
 
 
 async def place_demo_order(symbol: str, side: str, price: float = None, size: float = None):
@@ -1005,7 +982,7 @@ def normalize_bitget_position(requested_symbol: str, snapshot: Dict[str, Any]) -
     return cleaned
 
 
-async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_price: Optional[float], payload: Optional[Dict[str, Any]] = None):
+async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_price: Optional[float], payload: Optional[Dict[str, Any]] = None) -> Dict[str, List[str]]:
     """Close existing trades marked as placed before opening a new one.
 
     Attempts to submit reduce-only Bitget orders and records exit price / realized PnL."""
@@ -1016,13 +993,30 @@ async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_
         closing_rows = []
 
     if not closing_rows:
-        return
+        return {"closed": [], "failed": []}
 
     payload_dict = payload if isinstance(payload, dict) else {}
     price_cache: Dict[str, Optional[float]] = {}
+    closed_ids: List[str] = []
+    failed_ids: List[str] = []
 
     for row in closing_rows:
-        await close_existing_bitget_position(row)
+        size_value = safe_float(row.get("size"))
+        if (size_value is None or size_value <= 0) and safe_float(row.get("price")) not in (None, 0):
+            size_usd_val = safe_float(row.get("size_usd") or row.get("sizeUsd"))
+            entry_price = safe_float(row.get("price"))
+            if size_usd_val is not None and entry_price not in (None, 0):
+                try:
+                    size_value = abs(float(size_usd_val) / float(entry_price))
+                except Exception:
+                    size_value = None
+        if size_value is not None and size_value > 0:
+            row["size"] = size_value
+
+        close_success = await close_existing_bitget_position(row)
+        if not close_success:
+            failed_ids.append(row.get("id"))
+            continue
 
         symbol_for_row = (row.get("symbol") or "").strip()
         closing_price = None
@@ -1063,6 +1057,7 @@ async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_
             update_values["realized_pnl"] = realized_pnl
 
         await database.execute(trades.update().where(trades.c.id == row["id"]).values(**update_values))
+        closed_ids.append(row.get("id"))
 
         try:
             await broadcast({
@@ -1074,6 +1069,20 @@ async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_
             })
         except Exception:
             pass
+
+    # Clean up any lingering open orders for the same symbols to avoid Bitget showing
+    # stale limit entries when we immediately send the reversal order.
+    unique_symbols = {str(row.get("symbol") or "").strip() for row in closing_rows if row.get("symbol")}
+    for sym in unique_symbols:
+        try:
+            await cancel_orders_for_symbol(sym)
+        except Exception as exc:
+            try:
+                print(f"[rotation] cancel_orders_for_symbol failed for {sym}: {exc}")
+            except Exception:
+                pass
+
+    return {"closed": closed_ids, "failed": failed_ids}
 
 
 async def fetch_market_price(symbol: str):
@@ -1449,7 +1458,14 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
             or payload.get("liquidation")
         )
 
-    await close_open_positions_for_rotation(symbol, price_numeric, payload)
+    close_outcome = await close_open_positions_for_rotation(symbol, price_numeric, payload)
+    if close_outcome["failed"]:
+        detail = {
+            "message": "Failed to close existing Bitget positions before rotation",
+            "failed_ids": close_outcome["failed"],
+        }
+        await broadcast({"type": "error", "reason": "close_failed", "trades": close_outcome["failed"]})
+        raise HTTPException(status_code=502, detail=detail)
 
     # If dry-run is enabled, simulate placing an order by inserting a DB row
     if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
@@ -2086,7 +2102,14 @@ async def webhook(req: Request):
 
     # For ENTRY or default (backward compatibility)
     # Close any existing open positions (one-way system)
-    await close_open_positions_for_rotation(symbol, price_numeric, payload)
+    close_outcome = await close_open_positions_for_rotation(symbol, price_numeric, payload)
+    if close_outcome["failed"]:
+        detail = {
+            "message": "Failed to close existing Bitget positions before rotation",
+            "failed_ids": close_outcome["failed"],
+        }
+        await broadcast({"type": "error", "reason": "close_failed", "trades": close_outcome["failed"]})
+        raise HTTPException(status_code=502, detail=detail)
 
     # If there's no explicit signal, fail loudly so misconfigured alerts are obvious.
     if not signal:
@@ -2253,7 +2276,14 @@ async def open_position(req: Request, current_user: Dict[str, str] = Depends(get
         }
 
         # Close any existing positions (one-way system)
-        await close_open_positions_for_rotation(symbol, price, webhook_payload)
+        close_outcome = await close_open_positions_for_rotation(symbol, price, webhook_payload)
+        if close_outcome["failed"]:
+            detail = {
+                "message": "Failed to close existing Bitget positions before manual rotation",
+                "failed_ids": close_outcome["failed"],
+            }
+            await broadcast({"type": "error", "reason": "close_failed", "trades": close_outcome["failed"]})
+            raise HTTPException(status_code=502, detail=detail)
 
         # Map signal to side
         if signal.upper() in ("BUY", "LONG"):

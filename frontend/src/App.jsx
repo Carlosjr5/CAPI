@@ -484,11 +484,34 @@ function App() {
   }
 
   function calculatePnL(trade, prices = currentPrices){
-    const currentPrice = Number(prices[trade.symbol])
+    if(!trade) return null
+
+    const statusKey = mapStatus(trade.status)
     const entryPrice = Number(trade.price)
-    const sizeValue = Number(trade.size)
-    if(!Number.isFinite(currentPrice) || !Number.isFinite(entryPrice) || !Number.isFinite(sizeValue)) return null
+    let sizeValue = Number(trade.size)
     const multiplier = trade.signal?.toUpperCase() === 'BUY' ? 1 : -1
+
+    if(!Number.isFinite(sizeValue)){
+      const sizeUsd = Number(trade.size_usd ?? trade.sizeUsd)
+      if(Number.isFinite(sizeUsd) && Number.isFinite(entryPrice) && entryPrice !== 0){
+        sizeValue = sizeUsd / entryPrice
+      }
+    }
+
+    if(statusKey === 'closed'){
+      const realized = Number(trade.realized_pnl ?? trade.realizedPnl)
+      if(Number.isFinite(realized)){
+        return realized
+      }
+      const exitPrice = Number(trade.exit_price ?? trade.exitPrice)
+      if(Number.isFinite(exitPrice) && Number.isFinite(entryPrice) && Number.isFinite(sizeValue)){
+        return (exitPrice - entryPrice) * sizeValue * multiplier
+      }
+      return null
+    }
+
+    const currentPrice = Number(prices[trade.symbol])
+    if(!Number.isFinite(currentPrice) || !Number.isFinite(entryPrice) || !Number.isFinite(sizeValue)) return null
     return (currentPrice - entryPrice) * sizeValue * multiplier
   }
 
