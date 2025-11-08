@@ -453,7 +453,7 @@ def build_signature(timestamp: str, method: str, request_path: str, body: str, s
     d = mac.digest()
     return base64.b64encode(d).decode()
 
-async def close_existing_bitget_position(trade_row):
+async def close_existing_bitget_position(trade_row) -> Tuple[bool, Optional[str]]:
     """Submit a close order for an existing position and update DB status."""
     try:
         # Extract trade details
@@ -472,68 +472,98 @@ async def close_existing_bitget_position(trade_row):
         if size_value is None or size_value <= 0:
             size_value = 0.001
 
-        # Determine opposite side for closing
-        close_side = "sell" if signal.upper() in ("BUY", "LONG") else "buy"
-
-        # Submit close order with closePosition=true to close the entire position
-        close_payload = construct_bitget_payload(symbol=symbol, side=close_side, size=size_value)
-        close_payload["closePosition"] = True
-        close_payload["reduceOnly"] = "true"
-
-        # Ensure Bitget receives the correct leg to close; holdSide/positionSide must
-        # reflect the original position direction, not the side of the closing order.
-        original_side = str(signal or "").upper()
-        hold_side = "long" if original_side in ("BUY", "LONG") else "short"
-        close_payload["holdSide"] = hold_side
-        close_payload["positionSide"] = hold_side
-
-        body = json.dumps(close_payload, separators=(',', ':'))
+        detail_msg: Optional[str] = None
 
         if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
             print(f"[close_position] DRY-RUN: would close position for trade {trade_id}")
-            # In dry-run, just update DB status
             await database.execute(trades.update().where(trades.c.id == trade_id).values(status="closed"))
-            return True
+            return True, None
 
-        # Live close order
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            for u in [BITGET_BASE + "/api/v5/trade/order"]:
+        # Determine opposite side for closing
+        close_side = "sell" if signal.upper() in ("BUY", "LONG") else "buy"
+
+        original_side = str(signal or "").upper()
+        hold_side = "long" if original_side in ("BUY", "LONG") else "short"
+        overrides = {k: v for k, v in {"holdSide": hold_side, "positionSide": hold_side}.items() if v}
+
+        parsed = None
+        last_resp_text: Optional[str] = None
+
+        for reduce_flag in (True, False):
+            status_code, resp_text = await place_demo_order(
+                symbol=symbol,
+                side=close_side,
+                size=size_value,
+                reduce_only=reduce_flag,
+                close_position=True,
+                extra_fields=overrides,
+            )
+            last_resp_text = resp_text if isinstance(resp_text, str) else json.dumps(resp_text) if resp_text is not None else None
+
+            parsed = None
+            if resp_text:
                 try:
-                    ts = str(int(time.time() * 1000))
-                    sign = build_signature(ts, "POST", "/api/v5/trade/order", body, BITGET_SECRET)
+                    parsed = json.loads(resp_text) if isinstance(resp_text, str) else resp_text
+                except Exception:
+                    parsed = None
 
-                    headers = {
-                        "ACCESS-KEY": BITGET_API_KEY,
-                        "ACCESS-SIGN": sign,
-                        "ACCESS-TIMESTAMP": ts,
-                        "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
-                        "Content-Type": "application/json",
-                        "paptrading": PAPTRADING,
-                        "locale": "en-US",
-                    }
+            if status_code == 200 and isinstance(parsed, dict) and parsed.get("code") == "00000":
+                await database.execute(trades.update().where(trades.c.id == trade_id).values(status="closed"))
+                print(f"[close_position] Successfully closed position for trade {trade_id} (reduceOnly={reduce_flag})")
+                return True, None
 
-                    resp = await client.post(u, headers=headers, content=body)
-                    if resp.status_code == 200:
-                        try:
-                            parsed = resp.json()
-                            if parsed.get('code') == '00000':
-                                # Close order successful, update DB
-                                await database.execute(trades.update().where(trades.c.id == trade_id).values(status="closed"))
-                                print(f"[close_position] Successfully closed position for trade {trade_id}")
-                                return True
-                        except Exception:
-                            pass
-                    print(f"[close_position] Failed to close position for trade {trade_id}: {resp.text}")
-                except Exception as e:
-                    print(f"[close_position] Exception closing position for trade {trade_id}: {e}")
+            if isinstance(parsed, dict):
+                detail_msg = parsed.get("msg") or parsed.get("message") or parsed.get("error")
+                if not detail_msg:
+                    try:
+                        detail_msg = json.dumps(parsed)
+                    except Exception:
+                        detail_msg = str(parsed)
+            elif isinstance(resp_text, str):
+                detail_msg = resp_text
+            else:
+                detail_msg = str(resp_text)
 
-        return False
+            print(f"[close_position] Attempt to close trade {trade_id} failed (reduceOnly={reduce_flag}) status={status_code} resp={resp_text}")
+
+            if reduce_flag and detail_msg and "reduceonly" in detail_msg.lower():
+                print(f"[close_position] Retrying close for trade {trade_id} without reduceOnly flag due to error: {detail_msg}")
+                continue
+            break
+
+        try:
+            snapshot = await fetch_bitget_position(symbol)
+            normalized = normalize_bitget_position(symbol, snapshot) if snapshot else None
+        except Exception as lookup_exc:
+            normalized = None
+            print(f"[close_position] failed to inspect Bitget position after close failure: {lookup_exc}")
+
+        if normalized:
+            remaining = normalized.get("size")
+            if remaining is None and normalized.get("signed_size") is not None:
+                remaining = abs(normalized.get("signed_size"))
+            if remaining is not None and abs(float(remaining)) < 1e-8:
+                await database.execute(trades.update().where(trades.c.id == trade_id).values(status="closed"))
+                note = "No remaining Bitget position detected after close attempt"
+                print(f"[close_position] treating trade {trade_id} as closed: {note}")
+                return True, note
+
+        return False, detail_msg or last_resp_text
     except Exception as e:
         print(f"[close_position] Error in close_existing_bitget_position: {e}")
-        return False
+        return False, str(e)
 
 
-async def place_demo_order(symbol: str, side: str, price: float = None, size: float = None):
+async def place_demo_order(
+    symbol: str,
+    side: str,
+    price: float = None,
+    size: float = None,
+    *,
+    reduce_only: bool = False,
+    close_position: bool = False,
+    extra_fields: Optional[Dict[str, Any]] = None,
+):
     """
     Place an order on Bitget demo futures (v2 mix order)
     We'll place a market order by default. Modify `orderType` to 'limit' if you want limit.
@@ -549,7 +579,14 @@ async def place_demo_order(symbol: str, side: str, price: float = None, size: fl
     # Normalize symbol for Bitget - remove TradingView suffixes like .P
     normalized_symbol = symbol.replace('.P', '').replace('.p', '')
     use_symbol = mapped_symbol if mapped_symbol else normalized_symbol
-    body_obj = construct_bitget_payload(symbol=use_symbol, side=side, size=size)
+    body_obj = construct_bitget_payload(
+        symbol=use_symbol,
+        side=side,
+        size=size,
+        reduce_only=reduce_only,
+        close_position=close_position,
+        extra_fields=extra_fields,
+    )
 
     # For SUMCBL, the symbol construction is correct but the API rejects it.
     # Keep SUMCBL for now since that's what the user configured, but this may need to be changed
@@ -982,7 +1019,7 @@ def normalize_bitget_position(requested_symbol: str, snapshot: Dict[str, Any]) -
     return cleaned
 
 
-async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_price: Optional[float], payload: Optional[Dict[str, Any]] = None) -> Dict[str, List[str]]:
+async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_price: Optional[float], payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Close existing trades marked as placed before opening a new one.
 
     Attempts to submit reduce-only Bitget orders and records exit price / realized PnL."""
@@ -999,6 +1036,7 @@ async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_
     price_cache: Dict[str, Optional[float]] = {}
     closed_ids: List[str] = []
     failed_ids: List[str] = []
+    failure_details: Dict[str, Optional[str]] = {}
 
     for row in closing_rows:
         size_value = safe_float(row.get("size"))
@@ -1013,9 +1051,12 @@ async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_
         if size_value is not None and size_value > 0:
             row["size"] = size_value
 
-        close_success = await close_existing_bitget_position(row)
+        close_success, close_detail = await close_existing_bitget_position(row)
         if not close_success:
-            failed_ids.append(row.get("id"))
+            trade_id_value = row.get("id")
+            failed_ids.append(trade_id_value)
+            if trade_id_value and close_detail:
+                failure_details[trade_id_value] = close_detail
             continue
 
         symbol_for_row = (row.get("symbol") or "").strip()
@@ -1082,7 +1123,7 @@ async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_
             except Exception:
                 pass
 
-    return {"closed": closed_ids, "failed": failed_ids}
+    return {"closed": closed_ids, "failed": failed_ids, "errors": failure_details}
 
 
 async def fetch_market_price(symbol: str):
@@ -1464,7 +1505,14 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
             "message": "Failed to close existing Bitget positions before rotation",
             "failed_ids": close_outcome["failed"],
         }
-        await broadcast({"type": "error", "reason": "close_failed", "trades": close_outcome["failed"]})
+        if close_outcome.get("errors"):
+            detail["errors"] = close_outcome["errors"]
+        await broadcast({
+            "type": "error",
+            "reason": "close_failed",
+            "trades": close_outcome["failed"],
+            "details": close_outcome.get("errors"),
+        })
         raise HTTPException(status_code=502, detail=detail)
 
     # If dry-run is enabled, simulate placing an order by inserting a DB row
@@ -2108,7 +2156,14 @@ async def webhook(req: Request):
             "message": "Failed to close existing Bitget positions before rotation",
             "failed_ids": close_outcome["failed"],
         }
-        await broadcast({"type": "error", "reason": "close_failed", "trades": close_outcome["failed"]})
+        if close_outcome.get("errors"):
+            detail["errors"] = close_outcome["errors"]
+        await broadcast({
+            "type": "error",
+            "reason": "close_failed",
+            "trades": close_outcome["failed"],
+            "details": close_outcome.get("errors"),
+        })
         raise HTTPException(status_code=502, detail=detail)
 
     # If there's no explicit signal, fail loudly so misconfigured alerts are obvious.
@@ -2225,14 +2280,14 @@ async def close_position(trade_id: str, current_user: Dict[str, str] = Depends(r
             raise HTTPException(status_code=400, detail="Trade is not in open state")
 
         # Close the position on Bitget
-        success = await close_existing_bitget_position(dict(trade))
+        success, detail = await close_existing_bitget_position(dict(trade))
 
         if success:
             # Broadcast the close event
             await broadcast({"type": "closed", "id": trade_id})
             return {"ok": True, "message": "Position closed successfully"}
         else:
-            raise HTTPException(status_code=500, detail="Failed to close position on Bitget")
+            raise HTTPException(status_code=500, detail=detail or "Failed to close position on Bitget")
 
     except HTTPException:
         raise
@@ -2282,7 +2337,14 @@ async def open_position(req: Request, current_user: Dict[str, str] = Depends(get
                 "message": "Failed to close existing Bitget positions before manual rotation",
                 "failed_ids": close_outcome["failed"],
             }
-            await broadcast({"type": "error", "reason": "close_failed", "trades": close_outcome["failed"]})
+            if close_outcome.get("errors"):
+                detail["errors"] = close_outcome["errors"]
+            await broadcast({
+                "type": "error",
+                "reason": "close_failed",
+                "trades": close_outcome["failed"],
+                "details": close_outcome.get("errors"),
+            })
             raise HTTPException(status_code=502, detail=detail)
 
         # Map signal to side
@@ -2462,7 +2524,9 @@ async def close_position(request: Request, current_user: Dict[str, str] = Depend
     # Only attempt Bitget API close for manual closes, not for external closes
     if reason != "external_close":
         # Attempt to close the position on Bitget
-        await close_existing_bitget_position(trade_row)
+        success, detail = await close_existing_bitget_position(trade_row)
+        if not success:
+            raise HTTPException(status_code=502, detail=detail or "Failed to close Bitget position")
 
         # Get current market price for exit_price (since it's a market close)
         symbol = trade_row.get("symbol", "")

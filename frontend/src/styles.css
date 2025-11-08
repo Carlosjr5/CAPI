@@ -38,8 +38,8 @@ body{margin:0;background:#0f172a;color:#e2e8f0;-webkit-font-smoothing:antialiase
 .card-heading{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .card-heading h3{margin:0;font-size:18px;font-weight:700;color:#f1f5f9}
 
-.graph-card{padding:0;overflow:hidden;background:linear-gradient(150deg,rgba(15,23,42,0.9),rgba(37,99,235,0.16));flex:1 1 auto;min-height:500px}
-.graph-heading{padding:20px 22px;border-bottom:1px solid rgba(148,163,184,0.12)}
+.graph-card{padding:0;overflow:hidden;background:linear-gradient(150deg,rgba(15,23,42,0.9),rgba(37,99,235,0.16));flex:1 1 auto;min-height:clamp(720px,85vh,1100px);height:clamp(720px,85vh,1100px);display:flex;flex-direction:column}
+.graph-heading{padding:20px 22px;border-bottom:1px solid rgba(148,163,184,0.12);display:flex;justify-content:space-between;align-items:center;gap:12px}
 .graph-body{flex:1;min-height:0;display:flex;position:relative}
 .graph-body .tradingview-widget-wrapper{height:100%;width:100%;flex:1;position:absolute;top:0;left:0;right:0;bottom:0}
 .graph-body .tradingview-widget-container{height:100%;width:100%;position:relative}

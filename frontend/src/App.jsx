@@ -38,6 +38,13 @@ const WATCH_SYMBOLS = (() => {
 })()
 
 const normalizeSymbolKey = (value) => (value || '').replace(/[^A-Z0-9]/gi, '').toUpperCase()
+const normalizeSymbolForApi = (value) => {
+  if (!value) return value
+  return value
+    .replace(/^BINANCE:/i, '')
+    .replace(/\.P$/i, '')
+    .replace(/[^A-Z0-9_]/gi, '')
+}
 const EM_DASH = '\u2014'
 const BULLET = '\u2022'
 
@@ -322,10 +329,11 @@ function App() {
 
     for(const symbol of symbols){
       const normalizedKey = normalizeSymbolKey(symbol)
+      const apiSymbol = normalizeSymbolForApi(symbol) || symbol
       if(normalizedKey){
         normalizedKeysSet.add(normalizedKey)
       }
-      const encodedSymbol = encodeURIComponent(symbol)
+      const encodedSymbol = encodeURIComponent(apiSymbol)
       let markOverride
       const previousEntry = normalizedKey ? bitgetPositionsRef.current?.[normalizedKey] : undefined
 
@@ -343,7 +351,7 @@ function App() {
                 positionUpdates[normalizedKey] = {
                   ...data,
                   symbolKey: normalizedKey,
-                  requested_symbol: data.requested_symbol || symbol,
+                  requested_symbol: symbol,
                 }
               }
               console.log('[bitget] position data:', data)
@@ -365,7 +373,7 @@ function App() {
                   ...failurePayload,
                   found: false,
                   symbolKey: normalizedKey,
-                  requested_symbol: failurePayload?.requested_symbol || symbol,
+                  requested_symbol: symbol,
                 }
               }
               if(failureReason && (failureReason === 'dry_run' || failureReason === 'not_configured') && import.meta.env.MODE !== 'development'){
@@ -976,8 +984,15 @@ function App() {
               </div>
             </div>
           )}
-
-          <TradingViewChart latestOpenTrade={latestOpenTrade} />
+          <div className="card graph-card">
+            <div className="graph-heading">
+              <h3>Market Structure</h3>
+              <span className="muted">{latestOpenTrade?.symbol || 'BTCUSDT'} • TradingView</span>
+            </div>
+            <div className="graph-body">
+              <TradingViewChart latestOpenTrade={latestOpenTrade} />
+            </div>
+          </div>
 
           <TradeTable items={trades} onRefresh={fetchTrades} calculatePnL={calculatePnL} formatCurrency={formatCurrency} currentPrices={currentPrices} />
         </section>
