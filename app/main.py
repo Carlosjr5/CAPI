@@ -446,6 +446,29 @@ def normalize_position_type(value: Optional[str]) -> Optional[str]:
         return "double_hold"
     return value
 
+
+def normalize_exchange_symbol(value: Optional[str]) -> Optional[str]:
+    """Normalize symbols from TradingView/Bitget by removing prefixes and uppercasing."""
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return normalized
+    upper = normalized.upper()
+    for prefix in ("BITGET:", "BINANCE:"):
+        if upper.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            upper = normalized.upper()
+    normalized = normalized.replace(" ", "")
+    return normalized.upper()
+
+
+def sanitize_symbol_for_bitget(value: Optional[str]) -> str:
+    """Strip known decorations so Bitget endpoints receive a clean instrument code."""
+    normalized = normalize_exchange_symbol(value) or ""
+    cleaned = normalized.replace("/", "").replace(".P", "").replace(".p", "")
+    return re.sub(r"[^A-Z0-9_]", "", cleaned)
+
 # Bitget signature (per docs): timestamp + method + requestPath + [ '?' + queryString ] + body
 def build_signature(timestamp: str, method: str, request_path: str, body: str, secret: str):
     payload = f"{timestamp}{method.upper()}{request_path}{body}"
@@ -458,7 +481,8 @@ async def close_existing_bitget_position(trade_row) -> Tuple[bool, Optional[str]
     try:
         # Extract trade details
         trade_id = trade_row['id']
-        symbol = trade_row['symbol']
+        raw_symbol = trade_row.get('symbol')
+        symbol = sanitize_symbol_for_bitget(raw_symbol) or (normalize_exchange_symbol(raw_symbol) or "")
         signal = trade_row['signal']
         size_value = safe_float(trade_row.get('size'))
         if size_value is None or size_value <= 0:
@@ -576,9 +600,9 @@ async def place_demo_order(
     # For v5 API, we don't need contract discovery - just use the symbol directly
     mapped_symbol = None
 
-    # Normalize symbol for Bitget - remove TradingView suffixes like .P
-    normalized_symbol = symbol.replace('.P', '').replace('.p', '')
-    use_symbol = mapped_symbol if mapped_symbol else normalized_symbol
+    # Normalize symbol for Bitget - strip TradingView prefixes/suffixes and whitespace
+    normalized_symbol = sanitize_symbol_for_bitget(symbol)
+    use_symbol = mapped_symbol if mapped_symbol else (normalized_symbol or (normalize_exchange_symbol(symbol) or ""))
     body_obj = construct_bitget_payload(
         symbol=use_symbol,
         side=side,
@@ -728,15 +752,24 @@ async def cancel_orders_for_symbol(symbol: str):
 
     try:
         # Normalize symbol for Bitget
-        raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
-        if "_" not in raw and BITGET_PRODUCT_TYPE:
-            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+        sanitized = sanitize_symbol_for_bitget(symbol)
+        pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
+        local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
+
+        if "_" in sanitized:
+            bitget_symbol = sanitized
+        elif local_product in ("", None, "UMCBL"):
+            bitget_symbol = sanitized
         else:
-            bitget_symbol = raw
+            bitget_symbol = f"{sanitized}_{local_product}"
 
         # Cancel all orders for the symbol
         request_path = "/api/mix/v1/order/cancel-all-orders"
-        body_obj = {"symbol": bitget_symbol, "marginCoin": BITGET_MARGIN_COIN}
+        body_obj: Dict[str, Any] = {"symbol": bitget_symbol}
+        if BITGET_MARGIN_COIN:
+            body_obj["marginCoin"] = BITGET_MARGIN_COIN
+        if local_product:
+            body_obj.setdefault("productType", local_product)
 
         body = json.dumps(body_obj, separators=(",", ":"))
         timestamp = str(int(time.time() * 1000))
@@ -835,17 +868,22 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
-        if "_" not in raw and BITGET_PRODUCT_TYPE:
-            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+        sanitized = sanitize_symbol_for_bitget(symbol)
+        pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
+        local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
+
+        if "_" in sanitized:
+            bitget_symbol = sanitized
+        elif local_product in ("", None, "UMCBL"):
+            bitget_symbol = sanitized
         else:
-            bitget_symbol = raw
+            bitget_symbol = f"{sanitized}_{local_product}"
 
         primary_body: Dict[str, Any] = {"symbol": bitget_symbol}
         if BITGET_MARGIN_COIN:
             primary_body["marginCoin"] = BITGET_MARGIN_COIN
-        if BITGET_PRODUCT_TYPE:
-            primary_body.setdefault("productType", BITGET_PRODUCT_TYPE)
+        if local_product:
+            primary_body.setdefault("productType", local_product)
         if BITGET_POSITION_SIDE:
             primary_body["holdSide"] = BITGET_POSITION_SIDE
 
@@ -1131,10 +1169,15 @@ async def fetch_market_price(symbol: str):
     Returns a float price or None if it couldn't be fetched.
     """
     # Normalize symbol (remove slashes, TradingView suffixes, uppercase). Prefer plain symbol like BTCUSDT
-    try:
-        s = symbol.replace('/', '').replace('.P', '').replace('.p', '').upper()
-    except Exception:
-        s = symbol
+    cleaned = sanitize_symbol_for_bitget(symbol)
+    if "_" in cleaned:
+        cleaned = cleaned.split("_", 1)[0]
+    s = cleaned
+    if not s:
+        try:
+            s = str(symbol or "").replace('/', '').replace('.P', '').replace('.p', '').upper()
+        except Exception:
+            s = str(symbol or "")
 
     # Prefer Binance public ticker (reliable public endpoint) then try Bitget
     candidates = []
@@ -1231,22 +1274,18 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     # or already Bitget style 'BTCUSDT_UMCBL'. Remove prefixes and
     # non-alphanumeric/underscore characters, then construct the
     # Bitget symbol as RAW + '_' + productType when needed.
-    raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
-    # remove dots and any characters except letters, digits and underscore
+    raw = sanitize_symbol_for_bitget(symbol)
+    # remove dots and any characters except letters, digits and underscore (double-sanitize defensive)
     raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
     
     # Resolve margin coin defaults per product type. Bitget demo markets expect
     # USDT for UMCBL and SUSDT for SUMCBL unless explicitly overridden.
     margin_coin_env = (BITGET_MARGIN_COIN or "").strip()
     pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
+    local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
 
     # SUMCBL demo alerts ultimately trade on the UMCBL contract. Normalize both the
     # product type and margin coin so Bitget accepts the order.
-    if pt_upper == "SUMCBL":
-        local_product = "UMCBL"
-    else:
-        local_product = pt_upper
-
     use_margin_coin = margin_coin_env
     if local_product == "UMCBL":
         if not use_margin_coin or use_margin_coin.upper() != "USDT":
@@ -1352,7 +1391,10 @@ async def debug_payload(req: Request, _: Dict[str, str] = Depends(require_role([
         raise HTTPException(status_code=400, detail="Payload must be JSON")
 
     _event, signal, side, _ = normalize_signal_payload(payload)
-    symbol = payload.get("symbol") or payload.get("ticker") or ""
+    raw_symbol = payload.get("symbol") or payload.get("ticker") or ""
+    symbol = sanitize_symbol_for_bitget(raw_symbol) or (normalize_exchange_symbol(raw_symbol) or "")
+    payload["raw_symbol"] = raw_symbol
+    payload["symbol"] = symbol
     price = payload.get("price")
     # support both explicit size and USD-based size (mirrors /webhook behavior)
     size = payload.get("size")
@@ -1370,7 +1412,7 @@ async def debug_payload(req: Request, _: Dict[str, str] = Depends(require_role([
                 p = float(price)
             else:
                 # try to fetch a live market price when caller did not provide one
-                p = await fetch_market_price(payload.get("symbol") or payload.get("ticker") or "")
+                p = await fetch_market_price(symbol)
             if p and p != 0:
                 computed_size = usd / p
             else:
@@ -1420,7 +1462,12 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
     event, signal, side, _ = normalize_signal_payload(payload)
     if not signal:
         signal = "BUY"
-    symbol = payload.get("symbol") or payload.get("ticker") or "BTCUSDT"
+    raw_symbol = payload.get("symbol") or payload.get("ticker") or "BTCUSDT"
+    symbol = sanitize_symbol_for_bitget(raw_symbol) or (normalize_exchange_symbol(raw_symbol) or "")
+    if not symbol:
+        symbol = "BTCUSDT"
+    payload["raw_symbol"] = raw_symbol
+    payload["symbol"] = symbol
     price = payload.get("price") or None
     size = payload.get("size")
     size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
@@ -1732,7 +1779,7 @@ async def debug_order_status(req: Request, _: Dict[str, str] = Depends(require_r
     request_path = "/api/v2/mix/order/get-order"
     body_obj = {"orderId": order_id}
     if symbol:
-        body_obj["symbol"] = symbol
+        body_obj["symbol"] = sanitize_symbol_for_bitget(symbol)
 
     body = json.dumps(body_obj, separators=(",", ":"))
     timestamp = str(int(time.time() * 1000))
@@ -1839,14 +1886,22 @@ async def debug_bitget_positions(req: Request):
             raise HTTPException(status_code=403, detail="Missing or invalid secret")
 
     symbol = payload.get("symbol") or payload.get("ticker") or "BTCUSDT"
-    # Map to Bitget symbol format
-    raw = symbol.replace("BINANCE:", "").replace("/", "")
-    if "_" not in raw and BITGET_PRODUCT_TYPE:
-        bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
-    else:
-        bitget_symbol = raw
+    sanitized = sanitize_symbol_for_bitget(symbol)
+    pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
+    local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
 
-    body_obj = {"symbol": bitget_symbol, "marginCoin": BITGET_MARGIN_COIN}
+    if "_" in sanitized:
+        bitget_symbol = sanitized
+    elif local_product in ("", None, "UMCBL"):
+        bitget_symbol = sanitized
+    else:
+        bitget_symbol = f"{sanitized}_{local_product}"
+
+    body_obj: Dict[str, Any] = {"symbol": bitget_symbol}
+    if BITGET_MARGIN_COIN:
+        body_obj["marginCoin"] = BITGET_MARGIN_COIN
+    if local_product:
+        body_obj.setdefault("productType", local_product)
     body = json.dumps(body_obj, separators=(",", ":"))
     request_path = "/api/mix/v1/position/singlePosition"
 
@@ -2035,7 +2090,10 @@ async def webhook(req: Request):
     if not signal and event:
         signal = str(event).upper()
     trade_id_from_payload = payload.get("trade_id")
-    symbol = payload.get("symbol") or payload.get("ticker") or ""
+    raw_symbol = payload.get("symbol") or payload.get("ticker") or ""
+    symbol = sanitize_symbol_for_bitget(raw_symbol) or (normalize_exchange_symbol(raw_symbol) or "")
+    payload["raw_symbol"] = raw_symbol
+    payload["symbol"] = symbol
     price = payload.get("price")
 
     # Support explicit size or USD-based size from TradingView payload.
@@ -2305,7 +2363,10 @@ async def open_position(req: Request, current_user: Dict[str, str] = Depends(get
 
         # Extract parameters
         signal = payload.get("signal") or payload.get("action") or ""
-        symbol = payload.get("symbol") or payload.get("ticker") or ""
+        raw_symbol = payload.get("symbol") or payload.get("ticker") or ""
+        symbol = sanitize_symbol_for_bitget(raw_symbol) or (normalize_exchange_symbol(raw_symbol) or "")
+        payload["raw_symbol"] = raw_symbol
+        payload["symbol"] = symbol
         size = payload.get("size")
         size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
 
@@ -2613,15 +2674,24 @@ async def cancel_orders(symbol: str):
 
     try:
         # Normalize symbol for Bitget
-        raw = symbol.replace("BINANCE:", "").replace("/", "").replace(".P", "").replace(".p", "")
-        if "_" not in raw and BITGET_PRODUCT_TYPE:
-            bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
+        sanitized = sanitize_symbol_for_bitget(symbol)
+        pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
+        local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
+
+        if "_" in sanitized:
+            bitget_symbol = sanitized
+        elif local_product in ("", None, "UMCBL"):
+            bitget_symbol = sanitized
         else:
-            bitget_symbol = raw
+            bitget_symbol = f"{sanitized}_{local_product}"
 
         # Cancel all orders for the symbol
         request_path = "/api/mix/v1/order/cancel-all-orders"
-        body_obj = {"symbol": bitget_symbol, "marginCoin": BITGET_MARGIN_COIN}
+        body_obj: Dict[str, Any] = {"symbol": bitget_symbol}
+        if BITGET_MARGIN_COIN:
+            body_obj["marginCoin"] = BITGET_MARGIN_COIN
+        if local_product:
+            body_obj.setdefault("productType", local_product)
 
         body = json.dumps(body_obj, separators=(",", ":"))
         timestamp = str(int(time.time() * 1000))
@@ -2643,7 +2713,7 @@ async def cancel_orders(symbol: str):
 
         return {
             "ok": True,
-            "symbol": symbol,
+            "symbol": sanitized or symbol,
             "bitget_symbol": bitget_symbol,
             "status_code": resp.status_code,
             "response": data
