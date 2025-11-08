@@ -1287,11 +1287,13 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     # SUMCBL demo alerts ultimately trade on the UMCBL contract. Normalize both the
     # product type and margin coin so Bitget accepts the order.
     use_margin_coin = margin_coin_env
-    if local_product == "UMCBL":
-        if not use_margin_coin or use_margin_coin.upper() != "USDT":
+    if not use_margin_coin:
+        if pt_upper == "SUMCBL":
+            use_margin_coin = "SUSDT"
+        elif local_product == "UMCBL":
             use_margin_coin = "USDT"
-    elif not use_margin_coin:
-        use_margin_coin = "USDT"
+        else:
+            use_margin_coin = "USDT"
 
     # Initialize body_obj with default values - use the working parameters from debug_order.py
     client_oid = f"capi-{uuid.uuid4().hex[:20]}"
