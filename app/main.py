@@ -669,8 +669,8 @@ async def place_demo_order(
     # For SUMCBL/UMCBL, use plain endpoints since they don't support productType suffixes
     if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
         candidates = [
-            BITGET_BASE + request_path,
             BITGET_BASE + "/api/v2/mix/order/place-order",
+            BITGET_BASE + request_path,
             BITGET_BASE + "/api/strategy/v1/trading-view/callback",
         ]
     else:
@@ -1371,11 +1371,11 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
             pass
 
     # Provide explicit Bitget one-way hints when dealing with SUMCBL/UMCBL contracts.
-    if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
-        if "posMode" not in body_obj:
-            body_obj["posMode"] = "single"
-        if "holdSide" not in body_obj:
-            body_obj["holdSide"] = "long" if side_key == "buy" else "short"
+    # if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
+    #     if "posMode" not in body_obj:
+    #         body_obj["posMode"] = "single"
+    #     if "holdSide" not in body_obj:
+    #         body_obj["holdSide"] = "long" if side_key == "buy" else "short"
 
     return body_obj
 
