@@ -633,7 +633,7 @@ async def place_demo_order(
         except Exception:
             pass
 
-    if BITGET_POSITION_TYPE and "positionType" not in body_obj:
+    if BITGET_POSITION_TYPE and "positionType" not in body_obj and BITGET_PRODUCT_TYPE not in ("SUMCBL", "UMCBL"):
         body_obj["positionType"] = normalize_position_type(BITGET_POSITION_TYPE)
 
     body = json.dumps(body_obj, separators=(',', ':'))  # compact body
@@ -1311,8 +1311,8 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     # Attach positional hints when available; Bitget expects explicit unilateral fields in
     # one-way accounts. Provide sensible defaults for SUMCBL/UMCBL if env vars are missing.
     default_position_type = normalize_position_type(BITGET_POSITION_TYPE)
-    if not default_position_type and BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
-        default_position_type = "single_hold"
+    # if not default_position_type and BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
+    #     default_position_type = "single_hold"
     if default_position_type:
         body_obj["positionType"] = default_position_type
 
