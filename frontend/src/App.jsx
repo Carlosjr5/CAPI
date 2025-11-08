@@ -869,14 +869,19 @@ function App() {
       </header>
       <main className="dashboard-layout">
         <section className="dashboard-primary">
-          <div className="metric-grid pnl-grid">
-            <div className="metric-card pnl-card">
-              <span className="metric-label">Total Unrealized</span>
-              <span className={`metric-value pnl-value ${getPnlTone(totalUnrealizedPnL)}`}>{formatCurrency(totalUnrealizedPnL)}</span>
+          <div className="card overall-pnl-card">
+            <div className="card-heading">
+              <h3>OVERALL PNL</h3>
             </div>
-            <div className="metric-card pnl-card">
-              <span className="metric-label">Total Realized</span>
-              <span className={`metric-value pnl-value ${getPnlTone(totalRealizedPnL)}`}>{formatCurrency(totalRealizedPnL)}</span>
+            <div className="overall-pnl-grid">
+              <div className="pnl-block">
+                <span className="label">Total Unrealized</span>
+                <span className={`value ${getPnlTone(totalUnrealizedPnL)}`}>{formatCurrency(totalUnrealizedPnL)}</span>
+              </div>
+              <div className="pnl-block">
+                <span className="label">Total Realized</span>
+                <span className={`value ${getPnlTone(totalRealizedPnL)}`}>{formatCurrency(totalRealizedPnL)}</span>
+              </div>
             </div>
           </div>
 
@@ -888,10 +893,6 @@ function App() {
             <div className="metric-card">
               <span className="metric-label">Closed</span>
               <span className="metric-value">{counts.closed}</span>
-            </div>
-            <div className="metric-card">
-              <span className="metric-label">Total</span>
-              <span className="metric-value">{counts.total}</span>
             </div>
           </div>
 
@@ -911,7 +912,6 @@ function App() {
                     <div className="position-symbol">{latestOpenTrade.symbol}</div>
                     <div className="muted">Opened {new Date(latestOpenTrade.created_at*1000).toLocaleString()}</div>
                   </div>
-                  <div className="position-price">Entry {formatCurrency(positionMetrics?.entryPrice)}</div>
                   {isAdmin && (
                     <button
                       type="button"
@@ -944,7 +944,6 @@ function App() {
                       {(latestOpenTrade.signal || '').toUpperCase()}
                     </div>
                     <div className="hero-symbol">{latestOpenTrade.symbol}</div>
-                    <div className="hero-size">{positionOverview.sizeDisplay}</div>
                   </div>
                     <div className="hero-stats">
                       <div className={`hero-stat pnl ${positionOverview.pnlTone || 'neutral'}`}>
