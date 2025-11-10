@@ -83,11 +83,17 @@ body{margin:0;background:#0f172a;color:#e2e8f0;-webkit-font-smoothing:antialiase
 .hero-stat.liquidation .stat-label::after{content:" ⚠";color:#facc15}
 .hero-stat.pnl.positive .stat-value{color:#4ade80}
 .hero-stat.pnl.negative .stat-value{color:#f87171}
+.hero-stat.roe.positive .stat-value{color:#4ade80}
+.hero-stat.roe.negative .stat-value{color:#f87171}
+.hero-stat.roi.positive .stat-value{color:#4ade80}
+.hero-stat.roi.negative .stat-value{color:#f87171}
 .hero-stat .stat-subvalue{font-size:13px;color:rgba(148,163,184,0.76);line-height:1.2}
 .hero-stat.pnl .stat-subvalue{color:inherit}
 .hero-stat .stat-subvalue.muted{color:rgba(148,163,184,0.68)}
 .pnl-block.negative .value{color:#f87171}
 .pnl-block .subvalue{font-size:13px;color:rgba(148,163,184,0.74);display:block;margin-top:4px}
+
+.roi{font-size:0.75rem;opacity:0.8}
 
 .position-metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px}
 .position-metric-grid.compact{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
@@ -236,4 +242,51 @@ button:disabled{opacity:0.6;cursor:not-allowed;filter:none;transform:none}
 	.metric-grid{grid-template-columns:1fr}
 	.hero-stats{grid-template-columns:1fr}
 	.trades th,.trades td{font-size:12px}
+.symbol-selector {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toggle-container {
+  display: flex;
+  gap: 1px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(15, 23, 42, 0.8);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  box-shadow: 0 4px 12px rgba(8, 15, 35, 0.3);
+}
+
+.symbol-toggle {
+  background-color: transparent;
+  border: none;
+  color: rgba(226, 232, 240, 0.7);
+  padding: 8px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  position: relative;
+}
+
+.symbol-toggle.active {
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(37, 99, 235, 0.15));
+  color: #60a5fa;
+  box-shadow: inset 0 1px 4px rgba(59, 130, 246, 0.3);
+  border-right: 1px solid rgba(59, 130, 246, 0.4);
+}
+
+.symbol-toggle.active:first-child {
+  border-right: none;
+  border-left: 1px solid rgba(59, 130, 246, 0.4);
+}
+
+.symbol-toggle:hover:not(.active) {
+  background-color: rgba(148, 163, 184, 0.12);
+  color: #e2e8f0;
+  transform: translateY(-1px);
+}
 }

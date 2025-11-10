@@ -74,6 +74,8 @@ function App() {
   const [lastOrderResult, setLastOrderResult] = useState(null)
   const [lastOrderQuery, setLastOrderQuery] = useState(null)
 
+  const [selectedChartSymbol, setSelectedChartSymbol] = useState('BTCUSDT')
+
   // Refs
   const wsRef = useRef(null)
   const priceIntervalRef = useRef(null)
@@ -600,6 +602,34 @@ function App() {
             if(['received','placed','error','ignored','closed'].includes(payload.type)) {
               fetchTrades()
             }
+
+            // Push event to live feed with current position info
+            if (payload.type === 'placed' && payload.price) {
+              const pnlValue = calculatePnL({ ...payload, signal: payload.signal }, currentPrices)
+              let eventText = `${payload.signal} ${payload.symbol} at ${formatCurrency(payload.price)}`
+
+              if (pnlValue !== null) {
+                eventText += ` | PnL: ${formatCurrency(pnlValue)}`
+                // Add ROE% if we have leverage info
+                const margin = payload.margin || (payload.size_usd && payload.leverage ? payload.size_usd / payload.leverage : null)
+                if (margin && margin > 0) {
+                  const roe = (pnlValue / margin) * 100
+                  eventText += ` | ROE: ${roe.toFixed(2)}%`
+                }
+              }
+
+              pushEvent(eventText)
+            } else if (payload.type === 'closed' && payload.realized_pnl !== undefined) {
+              let eventText = `Closed position | PnL: ${formatCurrency(payload.realized_pnl)}`
+
+              // Add ROE% for closed positions
+              if (payload.margin && payload.margin > 0) {
+                const roe = (payload.realized_pnl / payload.margin) * 100
+                eventText += ` | ROE: ${roe.toFixed(2)}%`
+              }
+
+              pushEvent(eventText)
+            }
           }
         }catch(error){
           console.error('[ws] message parse error', error)
@@ -692,6 +722,35 @@ function App() {
     .reduce((sum, pnl) => sum + pnl, 0)
 
   const totalPnL = totalUnrealizedPnL + totalRealizedPnL
+
+  // Calculate total ROI for entire trading history
+  const totalMarginUsed = trades.reduce((sum, t) => {
+    const normalizedKey = normalizeSymbolKey(t.symbol)
+    const bitgetPosition = bitgetPositions[normalizedKey]
+    const statusKey = mapStatus(t.status)
+    const sizeUsd = Number(t.size_usd ?? t.sizeUsd)
+
+    // For open positions, use Bitget margin if available
+    if (statusKey === 'open' && bitgetPosition?.found && bitgetPosition.margin) {
+      return sum + parseFloat(bitgetPosition.margin)
+    }
+
+    // For closed positions, use stored margin if available
+    if (statusKey === 'closed' && t.margin && !isNaN(parseFloat(t.margin))) {
+      return sum + parseFloat(t.margin)
+    }
+
+    // Calculate margin from size_usd and leverage for any trade missing margin data
+    if (Number.isFinite(sizeUsd) && sizeUsd > 0 && DEFAULT_LEVERAGE_FALLBACK) {
+      const calculatedMargin = sizeUsd / DEFAULT_LEVERAGE_FALLBACK
+      return sum + calculatedMargin
+    }
+
+    // Skip trades without margin data
+    return sum
+  }, 0)
+
+  const totalROI = totalMarginUsed > 0 ? (totalPnL / totalMarginUsed) * 100 : 0
 
   const positionMetrics = useMemo(() => {
     if (!latestOpenTrade) return null
@@ -854,294 +913,356 @@ function App() {
       </div>
     )
   }
-
-  return (
-    <div className="app">
-      <header className="app-header">
-        <div className="brand">CAPI Dashboard</div>
-        <div className="header-actions">
-          <div className={`status-chip status-${status.toLowerCase()}`}>{status}</div>
-          <div className="user-info">
-            <span className="role-pill">{role || 'user'}</span>
-            <button type="button" onClick={handleLogout}>Logout</button>
+  
+    return (
+      <div className="app">
+        <header className="app-header">
+          <div className="brand">CAPI Dashboard</div>
+          <div className="header-actions">
+            <div className={`status-chip status-${status.toLowerCase()}`}>{status}</div>
+            <div className="user-info">
+              <span className="role-pill">{role || 'user'}</span>
+              <button type="button" onClick={handleLogout}>Logout</button>
+            </div>
+          </div>
+        </header>
+        <main className="dashboard-layout" style={{ width: '100%', maxWidth: '100%' }}>
+          <section className="dashboard-primary" style={{ width: '100%', flex: '1' }}>
+            <div className="card overall-pnl-card">
+              <div className="card-heading">
+                <h3>OVERALL PNL</h3>
+              </div>
+              <div className="overall-pnl-grid">
+                <div className="pnl-block">
+                  <span className="label">Total Unrealized</span>
+                  <span className={`value ${getPnlTone(totalUnrealizedPnL)}`}>{formatCurrency(totalUnrealizedPnL)}</span>
+                </div>
+                <div className="pnl-block">
+                  <span className="label">Total Realized</span>
+                  <span className={`value ${getPnlTone(totalRealizedPnL)}`}>{formatCurrency(totalRealizedPnL)}</span>
+                </div>
+                <div className="pnl-block">
+                  <span className="label">Total ROI%</span>
+                  <span className={`value ${getPnlTone(totalROI)}`}>{isFiniteNumber(totalROI) ? `${totalROI.toFixed(2)}%` : '—'}</span>
+                </div>
+              </div>
+            </div>
+ 
+           <div className="card graph-card">
+             <div className="graph-heading">
+               <h3>Market Structure</h3>
+               <div className="symbol-selector">
+                 <div className="toggle-container">
+                   <button
+                     className={`symbol-toggle ${selectedChartSymbol === 'BTCUSDT' ? 'active' : ''}`}
+                     onClick={() => setSelectedChartSymbol('BTCUSDT')}
+                   >
+                     BTC
+                   </button>
+                   <button
+                     className={`symbol-toggle ${selectedChartSymbol === 'ETHUSDT' ? 'active' : ''}`}
+                     onClick={() => setSelectedChartSymbol('ETHUSDT')}
+                   >
+                     ETH
+                   </button>
+                 </div>
+                 <span className="muted">/USDT • TradingView</span>
+               </div>
+             </div>
+             <div className="graph-body">
+               <TradingViewChart
+                 latestOpenTrade={latestOpenTrade}
+                 trades={trades}
+                 symbol={selectedChartSymbol}
+               />
+             </div>
+           </div>
+ 
+           <div className="positions-grid">
+             {openTrades.length > 0 ? (
+               openTrades.map(trade => {
+                 const positionPnL = calculatePnL(trade)
+                 const normalizedKey = normalizeSymbolKey(trade.symbol)
+                 const bitgetPosition = bitgetPositions[normalizedKey]
+                 const hasSnapshot = bitgetPosition?.found
+                 const pnlDisplay = positionPnL !== null && isFiniteNumber(positionPnL) ? formatCurrency(positionPnL) : '—'
+                 const pnlTone = positionPnL > 0 ? 'positive' : positionPnL < 0 ? 'negative' : 'neutral'
+ 
+                 return (
+                   <div key={trade.id} className="card current-position-card">
+                     <div className="card-heading">
+                       <h3>Current Position - {trade.symbol}</h3>
+                       <span className={`position-side-pill ${trade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short'}`}>
+                         {trade.signal}
+                       </span>
+                     </div>
+                     <div className="position-content">
+                       <div className="position-header">
+                         <div>
+                           <div className="position-symbol">{trade.symbol}</div>
+                           <div className="muted">Opened {new Date(trade.created_at*1000).toLocaleString()}</div>
+                         </div>
+                         {isAdmin && (
+                           <button
+                             type="button"
+                             className="close-position-button"
+                             onClick={async () => {
+                               try {
+                                 const res = await fetch(buildApiUrl(`/close/${trade.id}`), {
+                                   method: 'POST',
+                                   headers: authHeaders()
+                                 })
+                                 if (res.ok) {
+                                   pushEvent('Position closed successfully')
+                                   fetchTrades()
+                                 } else {
+                                   pushEvent(`Failed to close position: ${res.status}`)
+                                 }
+                               } catch (error) {
+                                 pushEvent(`Error closing position: ${error.message}`)
+                               }
+                             }}
+                           >
+                             Close Position
+                           </button>
+                         )}
+                       </div>
+                       <div className="position-hero">
+                         <div className="position-hero-main">
+                           <div className={`side-badge badge-${trade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short'}`}>
+                             {(trade.signal || '').toUpperCase()}
+                           </div>
+                           <div className="hero-symbol">{trade.symbol}</div>
+                         </div>
+                         <div className="hero-stats">
+                           <div className={`hero-stat pnl ${pnlTone}`}>
+                             <span className="stat-label">PnL</span>
+                             <span className="stat-value">{pnlDisplay}</span>
+                           </div>
+                           <div className={`hero-stat roi ${pnlTone}`}>
+                             <span className="stat-label">ROI%</span>
+                             <span className="stat-value">
+                               {(() => {
+                                 if (bitgetPosition?.found && bitgetPosition.pnlRatio !== null && bitgetPosition.pnlRatio !== undefined) {
+                                   return `${(parseFloat(bitgetPosition.pnlRatio) * 100).toFixed(2)}%`
+                                 }
+                                 let margin = trade.margin ? parseFloat(trade.margin) : null
+                                 if (!margin || margin <= 0) {
+                                   const sizeUsd = Number(trade.size_usd ?? trade.sizeUsd)
+                                   if (Number.isFinite(sizeUsd) && sizeUsd > 0 && DEFAULT_LEVERAGE_FALLBACK) {
+                                     margin = sizeUsd / DEFAULT_LEVERAGE_FALLBACK
+                                   }
+                                 }
+                                 if (margin && margin > 0) {
+                                   const roi = (positionPnL / margin) * 100
+                                   return `${roi.toFixed(2)}%`
+                                 }
+                                 return '—'
+                               })()}
+                             </span>
+                           </div>
+                         </div>
+                       </div>
+                     </div>
+                   </div>
+                 )
+               })
+             ) : (
+               <div className="card current-position-card">
+                 <div className="card-heading">
+                   <h3>Current Positions</h3>
+                 </div>
+                 <div className="empty-state">No open positions. When a new TradingView alert arrives, trades are placed and positions appear here.</div>
+               </div>
+             )}
+           </div>
+  {lastClosedTrade && (
+    <div className="card previous-position-card">
+      <div className="card-heading"><h3>Previous Position</h3></div>
+      <div className="position-content">
+        <div className="position-header">
+          <div>
+            <div className="position-symbol">{lastClosedTrade.symbol}</div>
+            <div className="muted">Closed {new Date(lastClosedTrade.created_at*1000).toLocaleString()}</div>
+          </div>
+          <div className="position-price status-closed">{String(lastClosedTrade.status || '').toUpperCase()}</div>
+        </div>
+        <div className="position-metric-grid compact">
+          <div className="position-metric">
+            <span className="label">Size</span>
+            <span className="value">{formatNumber(lastClosedTrade.size, 4)}</span>
+          </div>
+          <div className="position-metric">
+            <span className="label">Exit Price</span>
+            <span className="value">{formatCurrency(lastClosedTrade.price)}</span>
           </div>
         </div>
-      </header>
-      <main className="dashboard-layout">
-        <section className="dashboard-primary">
-          <div className="card overall-pnl-card">
-            <div className="card-heading">
-              <h3>OVERALL PNL</h3>
-            </div>
-            <div className="overall-pnl-grid">
-              <div className="pnl-block">
-                <span className="label">Total Unrealized</span>
-                <span className={`value ${getPnlTone(totalUnrealizedPnL)}`}>{formatCurrency(totalUnrealizedPnL)}</span>
-              </div>
-              <div className="pnl-block">
-                <span className="label">Total Realized</span>
-                <span className={`value ${getPnlTone(totalRealizedPnL)}`}>{formatCurrency(totalRealizedPnL)}</span>
-              </div>
-            </div>
+      </div>
+    </div>
+  )}
+  
+ <div className="card current-position-card">
+  
+            <TradeTable items={trades} onRefresh={fetchTrades} calculatePnL={calculatePnL} formatCurrency={formatCurrency} currentPrices={currentPrices} positionMetrics={positionMetrics} bitgetPositions={bitgetPositions} />
           </div>
-
-          <div className="metric-grid">
-            <div className="metric-card">
-              <span className="metric-label">Open</span>
-              <span className="metric-value">{counts.open}</span>
+          </section>
+  
+          <aside className="dashboard-secondary">
+            <div className="metric-grid">
+              <div className="metric-card">
+                <span className="metric-label">Open</span>
+                <span className="metric-value">{counts.open}</span>
+              </div>
+              <div className="metric-card">
+                <span className="metric-label">Closed</span>
+                <span className="metric-value">{counts.closed}</span>
+              </div>
+              <div className="metric-card">
+                <span className="metric-label">Total</span>
+                <span className="metric-value">{counts.total}</span>
+              </div>
             </div>
-            <div className="metric-card">
-              <span className="metric-label">Closed</span>
-              <span className="metric-value">{counts.closed}</span>
+  
+            <div className="card status-card">
+              <div className="card-heading">
+                <h3>Live Status</h3>
+                <button type="button" className="link-button" onClick={fetchTrades}>Refresh</button>
+              </div>
+              <div className="status-summary">
+                <div className={`status-chip status-${status.toLowerCase()}`}>{status}</div>
+                <div className="status-metric">
+                  <span className="label">Open Trades</span>
+                  <span className="value">{counts.open}</span>
+                </div>
+                <div className="status-metric">
+                  <span className="label">Symbols Tracked</span>
+                  <span className="value">{[...new Set(openTrades.map(t => t.symbol))].length}</span>
+                </div>
+              </div>
             </div>
-          </div>
-
-          <div className="card current-position-card">
-            <div className="card-heading">
-              <h3>Current Position</h3>
-              {latestOpenTrade && (
-                <span className={`position-side-pill ${latestOpenTrade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short'}`}>
-                  {latestOpenTrade.signal}
-                </span>
-              )}
+  
+            <div className="card events-card">
+              <div className="card-heading">
+                <h3>Live Feed</h3>
+                <button type="button" className="link-button" onClick={handleClearEvents}>Clear</button>
+              </div>
+              <div ref={eventsRef} className="eventsList" data-empty="true">
+                <div className="events-empty">No events yet. Activity will appear here.</div>
+              </div>
             </div>
-            {latestOpenTrade ? (
-              <div className="position-content">
-                <div className="position-header">
-                  <div>
-                    <div className="position-symbol">{latestOpenTrade.symbol}</div>
-                    <div className="muted">Opened {new Date(latestOpenTrade.created_at*1000).toLocaleString()}</div>
+  
+            {isAdmin && (
+              <>
+                <div className="card admin-card">
+                  <div className="card-heading"><h3>Manual Demo Order</h3></div>
+                  <div className="form-grid">
+                    <label className="field">
+                      <span className="field-label">TradingView Secret</span>
+                      <input placeholder="Secret" type="password" value={formSecret} onChange={e=>setFormSecret(e.target.value)} />
+                    </label>
+                    <label className="field">
+                      <span className="field-label">Symbol</span>
+                      <select value={formSymbol} onChange={e=>setFormSymbol(e.target.value)}>
+                        <option value="BTCUSDT">BTC/USDT</option>
+                        <option value="ETHUSDT">ETH/USDT</option>
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span className="field-label">Side</span>
+                      <select value={formSide} onChange={e=>setFormSide(e.target.value)}>
+                        <option>BUY</option>
+                        <option>SELL</option>
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span className="field-label">Size (USD)</span>
+                      <input placeholder="100" value={formSizeUsd} onChange={e=>setFormSizeUsd(e.target.value)} />
+                    </label>
                   </div>
-                  {isAdmin && (
+                  <div className="form-actions">
                     <button
                       type="button"
-                      className="close-position-button"
+                      disabled={placing}
                       onClick={async () => {
-                        try {
-                          const res = await fetch(buildApiUrl(`/close/${latestOpenTrade.id}`), {
-                            method: 'POST',
-                            headers: authHeaders()
-                          })
-                          if (res.ok) {
-                            pushEvent('Position closed successfully')
-                            fetchTrades()
-                          } else {
-                            pushEvent(`Failed to close position: ${res.status}`)
-                          }
-                        } catch (error) {
-                          pushEvent(`Error closing position: ${error.message}`)
+                        setPlacing(true)
+                        try{
+                          const body = { secret: formSecret, signal: formSide, symbol: formSymbol, size_usd: formSizeUsd }
+                          const headers = authHeaders({ 'Content-Type': 'application/json' })
+                          if(formSecret) headers['Tradingview-Secret'] = formSecret
+                          const res = await fetch(buildApiUrl('/debug/place-test'), { method: 'POST', headers, body: JSON.stringify(body) })
+                          if(res.status === 401){ handleLogout(); return }
+                          let parsed = null
+                          const text = await res.text()
+                          let parsedResponse = null
+                          try{ parsedResponse = JSON.parse(text) }catch(error){ parsedResponse = { raw_response: text } }
+                          try{ pushEvent(`[place-test] status=${res.status} resp=${JSON.stringify(parsedResponse)}`) }catch(error){ console.log(error) }
+                          setLastOrderResult({ status: res.status, body: parsedResponse })
+                          if(res.ok){ fetchTrades() }
+                        }catch(error){ pushEvent(`[place-test] error ${error.message || error}`) }
+                        finally {
+                          setPlacing(false)
                         }
                       }}
                     >
-                      Close Position
+                      {placing ? 'Placing' : 'Place demo order'}
                     </button>
-                  )}
-                </div>
-                {positionOverview && (
-                <div className="position-hero">
-                  <div className="position-hero-main">
-                    <div className={`side-badge badge-${positionOverview.sideTone}`}>
-                      {(latestOpenTrade.signal || '').toUpperCase()}
-                    </div>
-                    <div className="hero-symbol">{latestOpenTrade.symbol}</div>
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={()=>{ setFormSecret(''); setFormSizeUsd('100'); setFormSymbol('BTCUSDT'); setFormSide('BUY') }}
+                    >
+                      Reset
+                    </button>
                   </div>
-                    <div className="hero-stats">
-                      <div className={`hero-stat pnl ${positionOverview.pnlTone || 'neutral'}`}>
-                        <span className="stat-label">PnL</span>
-                        <span className="stat-value">{positionOverview.pnlDisplay}</span>
+                </div>
+  
+                {lastOrderResult && (
+                  <div className="card admin-card">
+                    <div className="card-heading"><h3>Last Order Result</h3></div>
+                    <div className="muted">Status: {lastOrderResult.status}</div>
+                    <pre className="scroll-area">{JSON.stringify(lastOrderResult.body,null,2)}</pre>
+                    {lastOrderResult.body && lastOrderResult.body.orderId && (
+                      <div className="form-actions">
+                        <button type="button" className="ghost-button" onClick={()=>{ navigator.clipboard && navigator.clipboard.writeText(lastOrderResult.body.orderId) }}>Copy Order ID</button>
+                        <button
+                          type="button"
+                          onClick={async ()=>{
+                            try{
+                              setLastOrderQuery({loading:true})
+                              const body = { secret: formSecret, orderId: lastOrderResult.body.orderId }
+                              const headers = authHeaders({ 'Content-Type': 'application/json' })
+                              if(formSecret) headers['Tradingview-Secret'] = formSecret
+                              const res = await fetch(buildApiUrl('/debug/order-status'), { method: 'POST', headers, body: JSON.stringify(body) })
+                              if(res.status === 401){ handleLogout(); return }
+                              const text = await res.text()
+                              let parsed = null
+                              try{ parsed = JSON.parse(text) }catch(error){ parsed = { raw_response: text } }
+                              setLastOrderQuery({ loading:false, status: res.status, body: parsed })
+                            }catch(error){ setLastOrderQuery({ loading:false, error: String(error) }) }
+                          }}
+                        >
+                          Query Bitget
+                        </button>
                       </div>
-                    </div>
+                    )}
+                    {lastOrderQuery && (
+                      <div className="query-output">
+                        {lastOrderQuery.loading ? (
+                          <div className="muted">Querying</div>
+                        ) : lastOrderQuery.error ? (
+                          <div className="muted">Error: {lastOrderQuery.error}</div>
+                        ) : (
+                          <pre className="scroll-area">{JSON.stringify(lastOrderQuery.body,null,2)}</pre>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
-              </div>
-            ) : (
-              <div className="empty-state">No open position. When a new TradingView alert arrives, the previous position is closed automatically and the latest trade appears here.</div>
+              </>
             )}
-          </div>
-
-          {lastClosedTrade && (
-            <div className="card previous-position-card">
-              <div className="card-heading"><h3>Previous Position</h3></div>
-              <div className="position-content">
-                <div className="position-header">
-                  <div>
-                    <div className="position-symbol">{lastClosedTrade.symbol}</div>
-                    <div className="muted">Closed {new Date(lastClosedTrade.created_at*1000).toLocaleString()}</div>
-                  </div>
-                  <div className="position-price status-closed">{String(lastClosedTrade.status || '').toUpperCase()}</div>
-                </div>
-                <div className="position-metric-grid compact">
-                  <div className="position-metric">
-                    <span className="label">Size</span>
-                    <span className="value">{formatNumber(lastClosedTrade.size, 4)}</span>
-                  </div>
-                  <div className="position-metric">
-                    <span className="label">Exit Price</span>
-                    <span className="value">{formatCurrency(lastClosedTrade.price)}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-          <div className="card graph-card">
-            <div className="graph-heading">
-              <h3>Market Structure</h3>
-              <span className="muted">{latestOpenTrade?.symbol || 'BTCUSDT'} • TradingView</span>
-            </div>
-            <div className="graph-body">
-              <TradingViewChart latestOpenTrade={latestOpenTrade} />
-            </div>
-          </div>
-
-          <TradeTable items={trades} onRefresh={fetchTrades} calculatePnL={calculatePnL} formatCurrency={formatCurrency} currentPrices={currentPrices} />
-        </section>
-
-        <aside className="dashboard-secondary">
-          <div className="card status-card">
-            <div className="card-heading">
-              <h3>Live Status</h3>
-              <button type="button" className="link-button" onClick={fetchTrades}>Refresh</button>
-            </div>
-            <div className="status-summary">
-              <div className={`status-chip status-${status.toLowerCase()}`}>{status}</div>
-              <div className="status-metric">
-                <span className="label">Open Trades</span>
-                <span className="value">{counts.open}</span>
-              </div>
-              <div className="status-metric">
-                <span className="label">Symbols Tracked</span>
-                <span className="value">{[...new Set(openTrades.map(t => t.symbol))].length}</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="card events-card">
-            <div className="card-heading">
-              <h3>Live Feed</h3>
-              <button type="button" className="link-button" onClick={handleClearEvents}>Clear</button>
-            </div>
-            <div ref={eventsRef} className="eventsList" data-empty="true">
-              <div className="events-empty">No events yet. Activity will appear here.</div>
-            </div>
-          </div>
-
-          {isAdmin && (
-            <>
-              <div className="card admin-card">
-                <div className="card-heading"><h3>Manual Demo Order</h3></div>
-                <div className="form-grid">
-                  <label className="field">
-                    <span className="field-label">TradingView Secret</span>
-                    <input placeholder="Secret" type="password" value={formSecret} onChange={e=>setFormSecret(e.target.value)} />
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Symbol</span>
-                    <input placeholder="BTCUSDT" value={formSymbol} onChange={e=>setFormSymbol(e.target.value)} />
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Side</span>
-                    <select value={formSide} onChange={e=>setFormSide(e.target.value)}>
-                      <option>BUY</option>
-                      <option>SELL</option>
-                    </select>
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Size (USD)</span>
-                    <input placeholder="100" value={formSizeUsd} onChange={e=>setFormSizeUsd(e.target.value)} />
-                  </label>
-                </div>
-                <div className="form-actions">
-                  <button
-                    type="button"
-                    disabled={placing}
-                    onClick={async () => {
-                      setPlacing(true)
-                      try{
-                        const body = { secret: formSecret, signal: formSide, symbol: formSymbol, size_usd: formSizeUsd }
-                        const headers = authHeaders({ 'Content-Type': 'application/json' })
-                        if(formSecret) headers['Tradingview-Secret'] = formSecret
-                        const res = await fetch(buildApiUrl('/debug/place-test'), { method: 'POST', headers, body: JSON.stringify(body) })
-                        if(res.status === 401){ handleLogout(); return }
-                        let parsed = null
-                        const text = await res.text()
-                        let parsedResponse = null
-                        try{ parsedResponse = JSON.parse(text) }catch(error){ parsedResponse = { raw_response: text } }
-                        try{ pushEvent(`[place-test] status=${res.status} resp=${JSON.stringify(parsedResponse)}`) }catch(error){ console.log(error) }
-                        setLastOrderResult({ status: res.status, body: parsedResponse })
-                        if(res.ok){ fetchTrades() }
-                      }catch(error){ pushEvent(`[place-test] error ${error.message || error}`) }
-                      finally {
-                        setPlacing(false)
-                      }
-                    }}
-                  >
-                    {placing ? 'Placing' : 'Place demo order'}
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost-button"
-                    onClick={()=>{ setFormSecret(''); setFormSizeUsd('100'); setFormSymbol('BTCUSDT'); setFormSide('BUY') }}
-                  >
-                    Reset
-                  </button>
-                </div>
-              </div>
-
-              {lastOrderResult && (
-                <div className="card admin-card">
-                  <div className="card-heading"><h3>Last Order Result</h3></div>
-                  <div className="muted">Status: {lastOrderResult.status}</div>
-                  <pre className="scroll-area">{JSON.stringify(lastOrderResult.body,null,2)}</pre>
-                  {lastOrderResult.body && lastOrderResult.body.orderId && (
-                    <div className="form-actions">
-                      <button type="button" className="ghost-button" onClick={()=>{ navigator.clipboard && navigator.clipboard.writeText(lastOrderResult.body.orderId) }}>Copy Order ID</button>
-                      <button
-                        type="button"
-                        onClick={async ()=>{
-                          try{
-                            setLastOrderQuery({loading:true})
-                            const body = { secret: formSecret, orderId: lastOrderResult.body.orderId }
-                            const headers = authHeaders({ 'Content-Type': 'application/json' })
-                            if(formSecret) headers['Tradingview-Secret'] = formSecret
-                            const res = await fetch(buildApiUrl('/debug/order-status'), { method: 'POST', headers, body: JSON.stringify(body) })
-                            if(res.status === 401){ handleLogout(); return }
-                            const text = await res.text()
-                            let parsed = null
-                            try{ parsed = JSON.parse(text) }catch(error){ parsed = { raw_response: text } }
-                            setLastOrderQuery({ loading:false, status: res.status, body: parsed })
-                          }catch(error){ setLastOrderQuery({ loading:false, error: String(error) }) }
-                        }}
-                      >
-                        Query Bitget
-                      </button>
-                    </div>
-                  )}
-                  {lastOrderQuery && (
-                    <div className="query-output">
-                      {lastOrderQuery.loading ? (
-                        <div className="muted">Querying</div>
-                      ) : lastOrderQuery.error ? (
-                        <div className="muted">Error: {lastOrderQuery.error}</div>
-                      ) : (
-                        <pre className="scroll-area">{JSON.stringify(lastOrderQuery.body,null,2)}</pre>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
-            </>
-          )}
-        </aside>
-      </main>
-    </div>
-  )
-}
-
+          </aside>
+        </main>
+      </div>
+    )
+ }
 export default App
-
-
-
-
-
-
-

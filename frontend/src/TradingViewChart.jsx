@@ -1,3 +1,5 @@
+
+
 import React, { useEffect, useMemo, useRef } from 'react'
 
 const DEFAULT_SYMBOL = 'BITGET:BTCUSDT.P'
@@ -34,8 +36,60 @@ async function loadTradingViewScript() {
   }
 }
 
+function plotTradeSignals(chart, trades) {
+  if (!chart || !trades || !Array.isArray(trades)) return
+
+  console.log('[TradingView] Plotting trade signals for', trades.length, 'trades')
+
+  // Clear existing trade signals
+  try {
+    const shapes = chart.getAllShapes()
+    const tradeShapes = shapes.filter(shape => shape.name?.includes('trade-signal'))
+    console.log('[TradingView] Clearing', tradeShapes.length, 'existing trade signals')
+    tradeShapes.forEach(shape => chart.removeEntity(shape.id))
+  } catch (error) {
+    console.warn('[TradingView] Error clearing trade signals', error)
+  }
+
+  // Plot each trade signal
+  trades.forEach(trade => {
+    if (!trade || !trade.signal || !trade.created_at || !trade.price) {
+      console.log('[TradingView] Skipping trade - missing data:', trade?.id)
+      return
+    }
+
+    const timestamp = trade.created_at * 1000 // Convert to milliseconds
+    const price = parseFloat(trade.price)
+    const signal = trade.signal.toUpperCase()
+
+    if (isNaN(timestamp) || isNaN(price)) {
+      console.log('[TradingView] Skipping trade - invalid timestamp/price:', trade?.id, timestamp, price)
+      return
+    }
+
+    try {
+      // Create a marker for each trade - adjust shape based on signal
+      const marker = {
+        time: timestamp / 1000, // TradingView expects seconds, not milliseconds
+        position: signal === 'BUY' ? 'belowBar' : 'aboveBar',
+        color: signal === 'BUY' ? '#4ade80' : '#f87171', // Green for BUY, Red for SELL
+        shape: signal === 'BUY' ? 'arrowUp' : 'arrowDown', // Arrow up for BUY, down for SELL
+        text: signal === 'BUY' ? 'LONG' : 'SHORT', // Show LONG/SHORT instead of BUY/SELL
+        size: 1, // Smaller size as requested
+        id: `trade-signal-${trade.id}`
+      }
+
+      console.log('[TradingView] Creating shape for trade', trade.id, 'at time', timestamp / 1000)
+      chart.createShape(marker)
+    } catch (error) {
+      console.warn(`[TradingView] Error plotting trade signal for ${trade.id}`, error)
+    }
+  })
+}
+
 export default function TradingViewChart({
   latestOpenTrade,
+  trades = [],
   symbol: symbolProp = DEFAULT_SYMBOL,
   height = '100%',
 }) {
@@ -58,14 +112,20 @@ export default function TradingViewChart({
   }, [resolvedHeightValue])
 
   const resolvedSymbol = useMemo(() => {
-    if (latestOpenTrade?.symbol) {
-      return normalizeSymbol(latestOpenTrade.symbol)
-    }
-    if (symbolProp) {
-      return normalizeSymbol(symbolProp)
-    }
-    return DEFAULT_SYMBOL
-  }, [latestOpenTrade, symbolProp])
+   // Prioritize the latest open trade symbol, then fall back to symbol prop
+   if (latestOpenTrade?.symbol) {
+     return normalizeSymbol(latestOpenTrade.symbol)
+   }
+   if (symbolProp) {
+     return normalizeSymbol(symbolProp)
+   }
+   return DEFAULT_SYMBOL
+ }, [latestOpenTrade, symbolProp])
+
+ // Filter trades for current symbol
+ const symbolTrades = useMemo(() => {
+   return trades.filter(trade => normalizeSymbol(trade.symbol) === resolvedSymbol)
+ }, [trades, resolvedSymbol])
 
   useEffect(() => {
     let mounted = true
@@ -152,25 +212,50 @@ export default function TradingViewChart({
       })
 
       widgetRef.current.onChartReady(() => {
-        enqueuePersist()
+       enqueuePersist()
 
-        const chart = widgetRef.current?.activeChart?.()
-        if (chart) {
-          try {
-            chart.onIntervalChanged().subscribe(null, enqueuePersist)
-            chart.onSymbolChanged().subscribe(null, enqueuePersist)
-            chart.onDataLoaded().subscribe(enqueuePersist)
-          } catch (error) {
-            console.warn('[TradingView] Failed to wire chart events', error)
-          }
-        }
+       const chart = widgetRef.current?.activeChart?.()
+       if (chart) {
+         try {
+           chart.onIntervalChanged().subscribe(null, enqueuePersist)
+           chart.onSymbolChanged().subscribe(null, enqueuePersist)
+           chart.onDataLoaded().subscribe(enqueuePersist)
+         } catch (error) {
+           console.warn('[TradingView] Failed to wire chart events', error)
+         }
 
-        try {
-          widgetRef.current?.subscribe('drawing_tool', enqueuePersist)
-        } catch (error) {
-          // Safe to ignore if subscribe is unavailable
-        }
-      })
+         // Plot trade signals on chart initially
+         plotTradeSignals(chart, symbolTrades)
+       }
+
+       try {
+         widgetRef.current?.subscribe('drawing_tool', enqueuePersist)
+       } catch (error) {
+         // Safe to ignore if subscribe is unavailable
+       }
+     }).catch(error => {
+       console.error('[TradingView] onChartReady failed', error)
+     })
+
+     // Also plot signals after widget is created (for when trades update)
+     setTimeout(() => {
+       if (widgetRef.current?.activeChart) {
+         const chart = widgetRef.current.activeChart()
+         if (chart) {
+           plotTradeSignals(chart, symbolTrades)
+         }
+       }
+     }, 1000)
+
+     // Additional fallback: plot signals after a longer delay for slower loading
+     setTimeout(() => {
+       if (widgetRef.current?.activeChart) {
+         const chart = widgetRef.current.activeChart()
+         if (chart) {
+           plotTradeSignals(chart, symbolTrades)
+         }
+       }
+     }, 3000)
 
       window.addEventListener('beforeunload', handleBeforeUnload)
     }
@@ -182,7 +267,17 @@ export default function TradingViewChart({
       window.removeEventListener('beforeunload', handleBeforeUnload)
       teardownWidget()
     }
-  }, [resolvedSymbol])
+  }, [resolvedSymbol, symbolTrades])
+
+  // Re-plot signals when trades update
+  useEffect(() => {
+    if (widgetRef.current?.activeChart && symbolTrades.length > 0) {
+      const chart = widgetRef.current.activeChart()
+      if (chart) {
+        plotTradeSignals(chart, symbolTrades)
+      }
+    }
+  }, [symbolTrades])
 
   return (
     <div className="tradingview-widget-wrapper" style={{ height: resolvedHeightValue, width: '100%', position: 'relative', overflow: 'hidden', minHeight }}>
