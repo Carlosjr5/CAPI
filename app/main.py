@@ -36,17 +36,17 @@ TRADINGVIEW_SECRET = os.getenv("TRADINGVIEW_SECRET")
 BITGET_BASE = os.getenv("BITGET_BASE")
 BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE")
 BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN")
-BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE")  # optional: e.g. 'single' for unilateral / one-way
+BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE", "double")  # optional: e.g. 'double' for hedge mode to allow multiple positions
 BITGET_POSITION_TYPE = os.getenv("BITGET_POSITION_TYPE")  # optional: try values like 'unilateral' or 'one-way' if Bitget expects 'positionType'
 BITGET_POSITION_SIDE = os.getenv("BITGET_POSITION_SIDE")  # optional: explicit position side e.g. 'long' or 'short'
 BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN")
 
 DEFAULT_LEVERAGE_RAW = os.getenv("DEFAULT_LEVERAGE")
 try:
-    DEFAULT_LEVERAGE = float(DEFAULT_LEVERAGE_RAW) if DEFAULT_LEVERAGE_RAW not in (None, "") else None
+    DEFAULT_LEVERAGE = float(DEFAULT_LEVERAGE_RAW) if DEFAULT_LEVERAGE_RAW not in (None, "") else 30.0
 except ValueError:
-    print(f"[startup] DEFAULT_LEVERAGE is not a number: {DEFAULT_LEVERAGE_RAW}")
-    DEFAULT_LEVERAGE = None
+    print(f"[startup] DEFAULT_LEVERAGE is not a number: {DEFAULT_LEVERAGE_RAW}, using 30.0")
+    DEFAULT_LEVERAGE = 30.0
 
 # Authentication configuration
 AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY") or secrets.token_urlsafe(32)
@@ -1058,11 +1058,14 @@ def normalize_bitget_position(requested_symbol: str, snapshot: Dict[str, Any]) -
 
 
 async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_price: Optional[float], payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Close existing trades marked as placed before opening a new one.
+    """Close existing trades marked as placed for the same symbol before opening a new one.
 
     Attempts to submit reduce-only Bitget orders and records exit price / realized PnL."""
     try:
-        fetched_rows = await database.fetch_all(trades.select().where(trades.c.status == "placed"))
+        if new_symbol:
+            fetched_rows = await database.fetch_all(trades.select().where((trades.c.status == "placed") & (trades.c.symbol == new_symbol)))
+        else:
+            fetched_rows = await database.fetch_all(trades.select().where(trades.c.status == "placed"))
         closing_rows = [dict(row) for row in fetched_rows]
     except Exception:
         closing_rows = []
@@ -2040,22 +2043,8 @@ async def startup():
     except Exception:
         pass
 
-    # One-way position system: ensure only one open position at a time
-    # Close all but the most recent 'placed' trade
-    try:
-        # Handle case where size column might not exist in older databases
-        placed_trades = await database.fetch_all(trades.select().where(trades.c.status == "placed").order_by(trades.c.created_at.desc()))
-        if len(placed_trades) > 1:
-            # Close all except the first (most recent)
-            for t in placed_trades[1:]:
-                await database.execute(trades.update().where(trades.c.id == t.id).values(status="closed"))
-            print(f"[startup] Closed {len(placed_trades)-1} old open positions to maintain one-way system")
-    except Exception as e:
-        # If there's a schema error (like missing size column), just log and continue
-        if "no such column" in str(e).lower():
-            print(f"[startup] Database schema outdated (missing columns), skipping position cleanup. Will be fixed on next restart.")
-        else:
-            print(f"[startup] Error cleaning up positions: {e}")
+    # Multiple position system: allow positions in different symbols
+    # No longer closing old positions on startup
 
 @app.on_event("shutdown")
 async def shutdown():
