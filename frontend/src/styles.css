@@ -250,17 +250,18 @@ button:disabled{opacity:0.6;cursor:not-allowed;filter:none;transform:none}
 
 .toggle-container {
   display: flex;
-  gap: 1px;
+  gap: 8px;
   border-radius: 8px;
   overflow: hidden;
-  background: rgba(15, 23, 42, 0.8);
-  border: 1px solid rgba(148, 163, 184, 0.3);
-  box-shadow: 0 4px 12px rgba(8, 15, 35, 0.3);
+  background: transparent;
+  border: none;
+  box-shadow: none;
 }
 
-.symbol-toggle {
-  background-color: transparent;
-  border: none;
+.toggle-container button.symbol-toggle {
+  background: transparent !important;
+  background-color: transparent !important;
+  border: 1px solid rgba(148, 163, 184, 0.4);
   color: rgba(226, 232, 240, 0.7);
   padding: 8px 18px;
   font-size: 13px;
@@ -270,23 +271,26 @@ button:disabled{opacity:0.6;cursor:not-allowed;filter:none;transform:none}
   text-transform: uppercase;
   letter-spacing: 0.8px;
   position: relative;
+  border-radius: 6px;
 }
 
-.symbol-toggle.active {
-  background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(37, 99, 235, 0.15));
+.toggle-container button.symbol-toggle.active {
+  background: transparent !important;
+  background-color: transparent !important;
   color: #60a5fa;
-  box-shadow: inset 0 1px 4px rgba(59, 130, 246, 0.3);
-  border-right: 1px solid rgba(59, 130, 246, 0.4);
+  border: 1px solid rgba(59, 130, 246, 0.8);
+  box-shadow: none;
 }
 
-.symbol-toggle.active:first-child {
-  border-right: none;
-  border-left: 1px solid rgba(59, 130, 246, 0.4);
+.toggle-container button.symbol-toggle.active:first-child {
+  border: 1px solid rgba(59, 130, 246, 0.8);
 }
 
-.symbol-toggle:hover:not(.active) {
-  background-color: rgba(148, 163, 184, 0.12);
+.toggle-container button.symbol-toggle:hover:not(.active) {
+  background: transparent !important;
+  background-color: transparent !important;
   color: #e2e8f0;
+  border: 1px solid rgba(148, 163, 184, 0.6);
   transform: translateY(-1px);
 }
 }
