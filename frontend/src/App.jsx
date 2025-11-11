@@ -1,6 +1,7 @@
 ﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import TradeTable from './TradeTable'
 import TradingViewChart from './TradingViewChart'
+import PnlChart from './PnlChart'
 
 const STORAGE_TOKEN_KEY = 'capi_token'
 const STORAGE_ROLE_KEY = 'capi_role'
@@ -74,7 +75,7 @@ function App() {
   const [lastOrderResult, setLastOrderResult] = useState(null)
   const [lastOrderQuery, setLastOrderQuery] = useState(null)
 
-  const [selectedChartSymbol, setSelectedChartSymbol] = useState('BTCUSDT')
+  const [selectedChartSymbol, setSelectedChartSymbol] = useState('BTC')
 
   // Refs
   const wsRef = useRef(null)
@@ -133,7 +134,16 @@ function App() {
 
   const formatCurrency = useCallback((value) => {
     const num = Number(value)
-    return Number.isFinite(num) ? currencyFormatter.format(num) : EM_DASH
+    return Number.isFinite(num) ? `~${currencyFormatter.format(num)}` : EM_DASH
+  }, [])
+
+  const formatCurrencyWithColor = useCallback((value) => {
+    const num = Number(value)
+    if (!Number.isFinite(num)) return EM_DASH
+
+    const colorClass = num > 0 ? 'positive' : num < 0 ? 'negative' : 'neutral'
+    const formatted = `~${currencyFormatter.format(num)}`
+    return { value: formatted, className: colorClass }
   }, [])
 
   const formatUsdt = useCallback((value) => {
@@ -316,12 +326,38 @@ function App() {
     for (const sym of historicalSymbols) symbolSet.add(sym)
     for (const sym of WATCH_SYMBOLS) symbolSet.add(sym)
 
+    // Always add common symbols to check for positions that might exist in Bitget but not in our trades
+    const commonSymbols = ['BTCUSDT', 'ETHUSDT']
+    for (const sym of commonSymbols) symbolSet.add(sym)
+
     const symbols = Array.from(symbolSet).filter(Boolean)
     if(symbols.length === 0){
       setCurrentPrices({})
       setBitgetPositions({})
       bitgetPositionsRef.current = {}
       return
+    }
+
+    // Fetch all Bitget positions to ensure we capture any positions that exist but aren't tracked in our trades
+    try {
+      const allPositionsRes = await fetch(buildApiUrl('/bitget/all-positions'), { headers: authHeaders() })
+      if (allPositionsRes.ok) {
+        const allPositionsData = await allPositionsRes.json()
+        if (allPositionsData.positions && Array.isArray(allPositionsData.positions)) {
+          // Add symbols from all Bitget positions to ensure they're fetched
+          for (const pos of allPositionsData.positions) {
+            if (pos.requested_symbol) {
+              symbolSet.add(pos.requested_symbol)
+            } else if (pos.bitget_symbol) {
+              // Try to extract base symbol from bitget_symbol (e.g., BTCUSDT from BTCUSDT_UMCBL)
+              const baseSymbol = pos.bitget_symbol.split('_')[0]
+              if (baseSymbol) symbolSet.add(baseSymbol)
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('[updatePricesOnly] failed to fetch all Bitget positions:', error)
     }
 
     const priceUpdates = {}
@@ -928,6 +964,21 @@ function App() {
         </header>
         <main className="dashboard-layout" style={{ width: '100%', maxWidth: '100%' }}>
           <section className="dashboard-primary" style={{ width: '100%', flex: '1' }}>
+            <div className="metric-grid metric-grid-above-chart">
+              <div className="metric-card">
+                <span className="metric-label">Open</span>
+                <span className="metric-value">{counts.open}</span>
+              </div>
+              <div className="metric-card">
+                <span className="metric-label">Closed</span>
+                <span className="metric-value">{counts.closed}</span>
+              </div>
+              <div className="metric-card">
+                <span className="metric-label">Total</span>
+                <span className="metric-value">{counts.total}</span>
+              </div>
+            </div>
+
             <div className="card overall-pnl-card">
               <div className="card-heading">
                 <h3>OVERALL PNL</h3>
@@ -935,74 +986,180 @@ function App() {
               <div className="overall-pnl-grid">
                 <div className="pnl-block">
                   <span className="label">Total Unrealized</span>
-                  <span className={`value ${getPnlTone(totalUnrealizedPnL)}`}>{formatCurrency(totalUnrealizedPnL)}</span>
+                  <span className="value">
+                    <span className={totalUnrealizedPnL > 0 ? 'positive' : totalUnrealizedPnL < 0 ? 'negative' : 'neutral'}>
+                      {formatCurrency(Math.abs(totalUnrealizedPnL))}
+                    </span>
+                  </span>
                 </div>
                 <div className="pnl-block">
                   <span className="label">Total Realized</span>
-                  <span className={`value ${getPnlTone(totalRealizedPnL)}`}>{formatCurrency(totalRealizedPnL)}</span>
+                  <span className="value">
+                    <span className={totalRealizedPnL > 0 ? 'positive' : totalRealizedPnL < 0 ? 'negative' : 'neutral'}>
+                      {formatCurrency(Math.abs(totalRealizedPnL))}
+                    </span>
+                  </span>
                 </div>
                 <div className="pnl-block">
-                  <span className="label">Total ROI%</span>
-                  <span className={`value ${getPnlTone(totalROI)}`}>{isFiniteNumber(totalROI) ? `${totalROI.toFixed(2)}%` : '—'}</span>
+                  <span className="label">Total P&L</span>
+                  <span className="value">
+                    <span className={totalPnL > 0 ? 'positive' : totalPnL < 0 ? 'negative' : 'neutral'}>
+                      {formatCurrency(Math.abs(totalPnL))}
+                    </span>
+                  </span>
                 </div>
               </div>
             </div>
- 
-           <div className="card graph-card">
-             <div className="graph-heading">
-               <h3>Market Structure</h3>
-               <div className="symbol-selector">
-                 <div className="toggle-container">
-                   <button
-                     className={`symbol-toggle ${selectedChartSymbol === 'BTCUSDT' ? 'active' : ''}`}
-                     onClick={() => setSelectedChartSymbol('BTCUSDT')}
-                   >
-                     BTC
-                   </button>
-                   <button
-                     className={`symbol-toggle ${selectedChartSymbol === 'ETHUSDT' ? 'active' : ''}`}
-                     onClick={() => setSelectedChartSymbol('ETHUSDT')}
-                   >
-                     ETH
-                   </button>
-                 </div>
-                 <span className="muted">/USDT • TradingView</span>
-               </div>
-             </div>
-             <div className="graph-body">
-               <TradingViewChart
-                 latestOpenTrade={latestOpenTrade}
-                 trades={trades}
-                 symbol={selectedChartSymbol}
-               />
-             </div>
-           </div>
- 
-           <div className="positions-grid">
-             {openTrades.length > 0 ? (
-               openTrades.map(trade => {
-                 const positionPnL = calculatePnL(trade)
+
+            <div className="card pnl-chart-card">
+              <div className="card-heading">
+                <h3>P&L OVER TIME</h3>
+              </div>
+              <div className="chart-body">
+                <PnlChart trades={trades} />
+              </div>
+            </div>
+
+            <div className="positions-grid">
+             {(() => {
+               // Create a combined list of trades and Bitget positions
+               const combinedPositions = []
+
+               // Add Bitget positions that don't have matching trades
+               Object.entries(bitgetPositions).forEach(([key, position]) => {
+                 if (!position?.found) return
+
+                 const hasMatchingTrade = openTrades.some(trade =>
+                   normalizeSymbolKey(trade.symbol) === key
+                 )
+
+                 if (!hasMatchingTrade) {
+                   combinedPositions.push({
+                     type: 'bitget-only',
+                     symbol: position.requested_symbol || key,
+                     bitgetPosition: position,
+                     trade: null
+                   })
+                 }
+               })
+
+               // Add trades (both with and without Bitget positions)
+               openTrades.forEach(trade => {
                  const normalizedKey = normalizeSymbolKey(trade.symbol)
                  const bitgetPosition = bitgetPositions[normalizedKey]
                  const hasSnapshot = bitgetPosition?.found
+
+                 combinedPositions.push({
+                   type: 'trade',
+                   symbol: trade.symbol,
+                   trade,
+                   bitgetPosition
+                 })
+               })
+
+               if (combinedPositions.length === 0) {
+                 return (
+                   <div className="card current-position-card">
+                     <div className="card-heading">
+                       <h3>Current Positions</h3>
+                     </div>
+                     <div className="empty-state">No open positions. When a new TradingView alert arrives, trades are placed and positions appear here.</div>
+                   </div>
+                 )
+               }
+
+               return combinedPositions.map(item => {
+                 const { type, symbol, trade, bitgetPosition } = item
+                 const tradeId = trade?.id || `bitget-${symbol}`
+                 const hasSnapshot = bitgetPosition?.found
+                 const bitgetSide = bitgetPosition?.side?.toUpperCase()
+
+                 // Debug bitgetPosition data
+                 if (bitgetPosition) {
+                   console.log(`Position data for ${symbol}:`, bitgetPosition)
+                 }
+
+                 let positionPnL = null
+                 if (bitgetPosition?.found && bitgetPosition.unrealized_pnl !== null && bitgetPosition.unrealized_pnl !== undefined) {
+                   positionPnL = Number(bitgetPosition.unrealized_pnl)
+                 } else if (trade) {
+                   positionPnL = calculatePnL(trade)
+                 }
+
                  const pnlDisplay = positionPnL !== null && isFiniteNumber(positionPnL) ? formatCurrency(positionPnL) : '—'
                  const pnlTone = positionPnL > 0 ? 'positive' : positionPnL < 0 ? 'negative' : 'neutral'
- 
+
                  return (
-                   <div key={trade.id} className="card current-position-card">
+                   <div key={tradeId} className="card current-position-card">
                      <div className="card-heading">
-                       <h3>Current Position - {trade.symbol}</h3>
-                       <span className={`position-side-pill ${trade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short'}`}>
-                         {trade.signal}
-                       </span>
+                       <h3>{symbol}</h3>
                      </div>
                      <div className="position-content">
-                       <div className="position-header">
-                         <div>
-                           <div className="position-symbol">{trade.symbol}</div>
-                           <div className="muted">Opened {new Date(trade.created_at*1000).toLocaleString()}</div>
+                       <div className="position-hero" style={{ textAlign: 'center', padding: '24px 20px' }}>
+                         <div className={`side-badge badge-${bitgetSide === 'LONG' ? 'long' : bitgetSide === 'SHORT' ? 'short' : (trade?.signal || '').toUpperCase() === 'BUY' ? 'long' : 'short'}`} style={{ margin: '0 auto 16px auto', display: 'block' }}>
+                           {bitgetSide || (trade?.signal || '').toUpperCase()}
                          </div>
-                         {isAdmin && (
+                         <div className="hero-stats" style={{ justifyContent: 'center' }}>
+                           <div className={`hero-stat pnl ${pnlTone}`}>
+                             <span className="stat-label">P&L @ 10x</span>
+                             <span className="stat-value">
+                               {(() => {
+                                 // Calculate P&L at 10x leverage for positions that have leverage data
+                                 if (bitgetPosition?.found && bitgetPosition.unrealized_pnl !== null && bitgetPosition.unrealized_pnl !== undefined) {
+                                   const pnlValue = parseFloat(bitgetPosition.unrealized_pnl)
+                                   // If leverage is available and not 10x, adjust the P&L to 10x equivalent
+                                   if (bitgetPosition.leverage && bitgetPosition.leverage !== 10) {
+                                     const pnlAt10x = pnlValue * (10 / bitgetPosition.leverage)
+                                     return formatCurrency(pnlAt10x)
+                                   }
+                                   // If leverage is 10x or unknown, show as-is
+                                   return formatCurrency(pnlValue)
+                                 }
+                                 // Fallback to calculated PnL
+                                 return pnlDisplay
+                               })()}
+                             </span>
+                           </div>
+                         </div>
+                         {hasSnapshot && (
+                           <div className="position-metric-grid" style={{ marginTop: '20px', justifyContent: 'center' }}>
+                             <div className="position-metric">
+                               <span className="label">Size</span>
+                               <span className="value">
+                                 {bitgetPosition.sizeValue !== null ? formatNumber(bitgetPosition.sizeValue) : '—'}
+                               </span>
+                             </div>
+                             <div className="position-metric">
+                               <span className="label">Entry Price</span>
+                               <span className="value">
+                                 {bitgetPosition.avg_open_price !== null ? formatCurrency(bitgetPosition.avg_open_price) : '—'}
+                               </span>
+                             </div>
+                             <div className="position-metric">
+                               <span className="label">Mark Price</span>
+                               <span className="value">
+                                 {bitgetPosition.mark_price !== null ? formatCurrency(bitgetPosition.mark_price) : '—'}
+                               </span>
+                             </div>
+                             <div className="position-metric">
+                               <span className="label">Leverage</span>
+                               <span className="value">
+                                 {bitgetPosition.leverage !== null ? `${bitgetPosition.leverage}x` : '—'}
+                               </span>
+                             </div>
+                           </div>
+                         )}
+                         <div className="muted" style={{ marginTop: '12px', fontSize: '13px' }}>
+                           {type === 'bitget-only'
+                             ? 'Live position from Bitget'
+                             : hasSnapshot
+                               ? 'Live position from Bitget'
+                               : `Opened ${new Date((trade?.created_at || 0)*1000).toLocaleString()}`
+                           }
+                         </div>
+                       </div>
+                       {isAdmin && trade && (
+                         <div style={{ textAlign: 'center', padding: '12px 0' }}>
                            <button
                              type="button"
                              className="close-position-button"
@@ -1025,103 +1182,52 @@ function App() {
                            >
                              Close Position
                            </button>
-                         )}
-                       </div>
-                       <div className="position-hero">
-                         <div className="position-hero-main">
-                           <div className={`side-badge badge-${trade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short'}`}>
-                             {(trade.signal || '').toUpperCase()}
-                           </div>
-                           <div className="hero-symbol">{trade.symbol}</div>
                          </div>
-                         <div className="hero-stats">
-                           <div className={`hero-stat pnl ${pnlTone}`}>
-                             <span className="stat-label">PnL</span>
-                             <span className="stat-value">{pnlDisplay}</span>
-                           </div>
-                           <div className={`hero-stat roi ${pnlTone}`}>
-                             <span className="stat-label">ROI%</span>
-                             <span className="stat-value">
-                               {(() => {
-                                 if (bitgetPosition?.found && bitgetPosition.pnlRatio !== null && bitgetPosition.pnlRatio !== undefined) {
-                                   return `${(parseFloat(bitgetPosition.pnlRatio) * 100).toFixed(2)}%`
-                                 }
-                                 let margin = trade.margin ? parseFloat(trade.margin) : null
-                                 if (!margin || margin <= 0) {
-                                   const sizeUsd = Number(trade.size_usd ?? trade.sizeUsd)
-                                   if (Number.isFinite(sizeUsd) && sizeUsd > 0 && DEFAULT_LEVERAGE_FALLBACK) {
-                                     margin = sizeUsd / DEFAULT_LEVERAGE_FALLBACK
-                                   }
-                                 }
-                                 if (margin && margin > 0) {
-                                   const roi = (positionPnL / margin) * 100
-                                   return `${roi.toFixed(2)}%`
-                                 }
-                                 return '—'
-                               })()}
-                             </span>
-                           </div>
-                         </div>
-                       </div>
+                       )}
                      </div>
                    </div>
                  )
                })
-             ) : (
-               <div className="card current-position-card">
-                 <div className="card-heading">
-                   <h3>Current Positions</h3>
-                 </div>
-                 <div className="empty-state">No open positions. When a new TradingView alert arrives, trades are placed and positions appear here.</div>
-               </div>
-             )}
+             })()}
            </div>
-  {lastClosedTrade && (
-    <div className="card previous-position-card">
-      <div className="card-heading"><h3>Previous Position</h3></div>
-      <div className="position-content">
-        <div className="position-header">
-          <div>
-            <div className="position-symbol">{lastClosedTrade.symbol}</div>
-            <div className="muted">Closed {new Date(lastClosedTrade.created_at*1000).toLocaleString()}</div>
+
+           <div className="card graph-card">
+            <div className="graph-heading">
+              <h3>Market Structure</h3>
+              <div className="symbol-selector">
+                <div className="toggle-container">
+                  <button
+                    className={`symbol-toggle ${selectedChartSymbol === 'BTC' ? 'active' : ''}`}
+                    onClick={() => setSelectedChartSymbol('BTC')}
+                  >
+                    BTC
+                  </button>
+                  <button
+                    className={`symbol-toggle ${selectedChartSymbol === 'ETH' ? 'active' : ''}`}
+                    onClick={() => setSelectedChartSymbol('ETH')}
+                  >
+                    ETH
+                  </button>
+                </div>
+                <span className="muted">/USDT • TradingView</span>
+              </div>
+            </div>
+            <div className="graph-body">
+              <TradingViewChart
+                latestOpenTrade={latestOpenTrade}
+                trades={trades}
+                symbol={selectedChartSymbol}
+              />
+            </div>
           </div>
-          <div className="position-price status-closed">{String(lastClosedTrade.status || '').toUpperCase()}</div>
-        </div>
-        <div className="position-metric-grid compact">
-          <div className="position-metric">
-            <span className="label">Size</span>
-            <span className="value">{formatNumber(lastClosedTrade.size, 4)}</span>
-          </div>
-          <div className="position-metric">
-            <span className="label">Exit Price</span>
-            <span className="value">{formatCurrency(lastClosedTrade.price)}</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  )}
-  
+
  <div className="card current-position-card">
-  
+
             <TradeTable items={trades} onRefresh={fetchTrades} calculatePnL={calculatePnL} formatCurrency={formatCurrency} currentPrices={currentPrices} positionMetrics={positionMetrics} bitgetPositions={bitgetPositions} />
           </div>
           </section>
   
           <aside className="dashboard-secondary">
-            <div className="metric-grid">
-              <div className="metric-card">
-                <span className="metric-label">Open</span>
-                <span className="metric-value">{counts.open}</span>
-              </div>
-              <div className="metric-card">
-                <span className="metric-label">Closed</span>
-                <span className="metric-value">{counts.closed}</span>
-              </div>
-              <div className="metric-card">
-                <span className="metric-label">Total</span>
-                <span className="metric-value">{counts.total}</span>
-              </div>
-            </div>
   
             <div className="card status-card">
               <div className="card-heading">

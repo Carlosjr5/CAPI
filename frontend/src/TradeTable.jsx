@@ -1,3 +1,5 @@
+import React, { useState } from 'react'
+
 function fmtTime(t){ return new Date(t*1000).toLocaleString() }
 
 function getStatusClass(s){
@@ -11,8 +13,8 @@ function getStatusClass(s){
   return ''
 }
 
-function calculateROI(it, pnlValue, currentPrices, bitgetPositions) {
-  // First try to get ROI directly from Bitget position data
+function calculateROE(it, pnlValue, currentPrices, bitgetPositions) {
+  // ROE comes directly from Bitget position data - no calculations
   const normalizedKey = (it.symbol || '').replace(/[^A-Z0-9]/gi, '').toUpperCase()
   const bitgetPosition = bitgetPositions?.[normalizedKey]
 
@@ -20,33 +22,61 @@ function calculateROI(it, pnlValue, currentPrices, bitgetPositions) {
     return parseFloat(bitgetPosition.pnlRatio) * 100
   }
 
-  // Fallback to calculation: ROI = unrealized PnL ÷ initial margin
-  const margin = it.margin ? parseFloat(it.margin) : null
-  if (!margin || margin === 0) return null
-
-  const pnl = pnlValue !== null && pnlValue !== undefined ? pnlValue : (it.realized_pnl ? parseFloat(it.realized_pnl) : 0)
-  return (pnl / margin) * 100
+  return null
 }
 
+const ITEMS_PER_PAGE = 10
+
 export default function TradeTable({items, onRefresh, calculatePnL, formatCurrency, currentPrices, bitgetPositions}){
+  const [currentPage, setCurrentPage] = useState(1)
+
+  // Calculate pagination
+  const totalItems = items.length
+  const totalPages = Math.ceil(totalItems / ITEMS_PER_PAGE)
+  const startIndex = (currentPage - 1) * ITEMS_PER_PAGE
+  const endIndex = startIndex + ITEMS_PER_PAGE
+  const currentItems = items.slice(startIndex, endIndex)
+
+  const goToPage = (page) => {
+    if (page >= 1 && page <= totalPages) {
+      setCurrentPage(page)
+    }
+  }
+
+  const goToPrevious = () => {
+    goToPage(currentPage - 1)
+  }
+
+  const goToNext = () => {
+    goToPage(currentPage + 1)
+  }
+
   return (
     <div className="card table-card">
       <div className="toolbar">
-        <button onClick={onRefresh}>Refresh</button>
+        <button onClick={onRefresh} className="refresh-btn">
+          <span className="refresh-icon">🔄</span>
+          Refresh
+        </button>
+        {totalPages > 1 && (
+          <div className="pagination-info">
+            Page {currentPage} of {totalPages} ({totalItems} total)
+          </div>
+        )}
       </div>
       <div className="table-scroller" tabIndex={0} aria-label="Trade history">
         <table className="trades">
-          <thead><tr><th>When</th><th>Symbol</th><th>Signal</th><th>Price</th><th>Size</th><th>PnL / ROE%</th><th>Status</th></tr></thead>
+          <thead><tr><th>When</th><th>Symbol</th><th>Signal</th><th>Price</th><th>Size (USD)</th><th>PnL</th><th>Status</th></tr></thead>
           <tbody>
-            {items.map(it=> {
+            {currentItems.map(it=> {
               const pnlValue = calculatePnL ? calculatePnL(it, currentPrices) : null
               const pnlDisplay = pnlValue !== null && pnlValue !== undefined ? formatCurrency(pnlValue) : '-'
               const pnlClass = pnlValue !== null && pnlValue !== undefined ? (pnlValue > 0 ? 'positive' : pnlValue < 0 ? 'negative' : '') : ''
 
-              // Calculate ROI%
-              const roiValue = calculateROI(it, pnlValue, currentPrices, bitgetPositions)
-              const roiDisplay = roiValue !== null && roiValue !== undefined ? `${roiValue.toFixed(2)}%` : ''
-              const roiClass = roiValue !== null && roiValue !== undefined ? (roiValue > 0 ? 'positive' : roiValue < 0 ? 'negative' : '') : ''
+              // Calculate ROE%
+              const roeValue = calculateROE(it, pnlValue, currentPrices, bitgetPositions)
+              const roeDisplay = roeValue !== null && roeValue !== undefined ? `${roeValue.toFixed(2)}%` : ''
+              const roeClass = roeValue !== null && roeValue !== undefined ? (roeValue > 0 ? 'positive' : roeValue < 0 ? 'negative' : '') : ''
 
               // Show PnL for all positions - open and closed
               let showPnL = true
@@ -60,10 +90,9 @@ export default function TradeTable({items, onRefresh, calculatePnL, formatCurren
                   </td>
                   <td data-label="Signal">{it.signal}</td>
                   <td data-label="Price">{it.price!=null? Number(it.price).toFixed(2):'-'}</td>
-                  <td data-label="Size">{it.size!=null? Number(it.size).toFixed(4):'-'}</td>
-                  <td className={pnlClass} data-label="PnL / ROI%">
+                  <td data-label="Size (USD)">{it.size_usd!=null? formatCurrency(it.size_usd):'-'}</td>
+                  <td className={pnlClass} data-label="PnL">
                     <div>{showPnL ? pnlDisplay : '-'}</div>
-                    <div className={`roi ${roiClass}`}>{roiDisplay}</div>
                   </td>
                   <td className={getStatusClass(it.status)} data-label="Status">{(it.status||'').toLowerCase()}</td>
                 </tr>
@@ -72,6 +101,27 @@ export default function TradeTable({items, onRefresh, calculatePnL, formatCurren
           </tbody>
         </table>
       </div>
+      {totalPages > 1 && (
+        <div className="pagination-controls">
+          <button
+            onClick={goToPrevious}
+            disabled={currentPage === 1}
+            className="pagination-btn"
+          >
+            Previous
+          </button>
+          <span className="pagination-info">
+            Page {currentPage} of {totalPages}
+          </span>
+          <button
+            onClick={goToNext}
+            disabled={currentPage === totalPages}
+            className="pagination-btn"
+          >
+            Next
+          </button>
+        </div>
+      )}
     </div>
   )
 }

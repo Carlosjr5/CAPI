@@ -2,7 +2,7 @@ fastapi
 uvicorn[standard]
 httpx
 python-dotenv
-databases[sqlite]
+databases[sqlite,postgresql]
 sqlalchemy
 websockets
 python-multipart

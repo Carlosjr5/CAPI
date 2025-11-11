@@ -9,6 +9,11 @@ function normalizeSymbol(rawSymbol) {
   if (rawSymbol.includes(':')) return rawSymbol
   const trimmed = String(rawSymbol).replace(/\s+/g, '').toUpperCase()
   // Assume Bitget perpetuals when no exchange prefix provided
+  if (trimmed === 'BTC') {
+    return 'BITGET:BTCUSDT.P'
+  } else if (trimmed === 'ETH') {
+    return 'BITGET:ETHUSDT.P'
+  }
   return `BITGET:${trimmed}.P`
 }
 
@@ -106,21 +111,21 @@ export default function TradingViewChart({
     }
     const lowered = resolvedHeightValue.toLowerCase()
     if (lowered.includes('%') || lowered.includes('vh') || lowered.includes('auto')) {
-      return '720px'
+      return '380px' // Match the new min-height from CSS
     }
     return resolvedHeightValue
   }, [resolvedHeightValue])
 
   const resolvedSymbol = useMemo(() => {
-   // Prioritize the latest open trade symbol, then fall back to symbol prop
-   if (latestOpenTrade?.symbol) {
-     return normalizeSymbol(latestOpenTrade.symbol)
-   }
+   // Prioritize the symbol prop (from button selection), then fall back to latest open trade symbol
    if (symbolProp) {
      return normalizeSymbol(symbolProp)
    }
+   if (latestOpenTrade?.symbol) {
+     return normalizeSymbol(latestOpenTrade.symbol)
+   }
    return DEFAULT_SYMBOL
- }, [latestOpenTrade, symbolProp])
+ }, [symbolProp, latestOpenTrade])
 
  // Filter trades for current symbol
  const symbolTrades = useMemo(() => {
