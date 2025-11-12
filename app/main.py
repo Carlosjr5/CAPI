@@ -626,7 +626,7 @@ async def place_demo_order(
     We'll place a market order by default. Modify `orderType` to 'limit' if you want limit.
     """
     # Use Bitget v2 mix API for futures trading
-    request_path = "/api/v2/mix/order/place"
+    request_path = "/api/v2/mix/order/placeOrder"
     url = BITGET_BASE + request_path
 
     # For v5 API, we don't need contract discovery - just use the symbol directly
@@ -786,8 +786,8 @@ async def cancel_orders_for_symbol(symbol: str):
         else:
             bitget_symbol = f"{sanitized}_{local_product}"
 
-        # Cancel all orders for the symbol using v5 API
-        request_path = "/api/v5/trade/cancel-batch-orders"
+        # Cancel all orders for the symbol using v2 mix API
+        request_path = "/api/v2/mix/order/cancelAllOrders"
         body_obj: Dict[str, Any] = {"symbol": bitget_symbol}
         if BITGET_MARGIN_COIN:
             body_obj["marginCoin"] = BITGET_MARGIN_COIN
@@ -832,10 +832,10 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
     if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
         return None
 
-    async def _post_bitget(request_path: str, body_obj: Dict[str, Any], label: str) -> Optional[Any]:
-        body = json.dumps(body_obj, separators=(",", ":"))
+    async def _request_bitget(method: str, request_path: str, body_obj: Optional[Dict[str, Any]], label: str) -> Tuple[int, str]:
+        body = json.dumps(body_obj, separators=(",", ":")) if body_obj else ""
         timestamp = str(int(time.time() * 1000))
-        sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
+        sign = build_signature(timestamp, method.upper(), request_path, body, BITGET_SECRET)
         headers = {
             "ACCESS-KEY": BITGET_API_KEY,
             "ACCESS-SIGN": sign,
@@ -848,47 +848,17 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
 
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
-                resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
-                try:
-                    data = resp.json()
-                except Exception:
-                    # Handle JSON parsing errors gracefully
-                    data = {"error": f"Invalid JSON response: {resp.text[:200]}"}
-        except Exception as exc:
+                if method.upper() == "GET":
+                    resp = await client.get(BITGET_BASE + request_path, headers=headers)
+                else:
+                    resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+                return resp.status_code, resp.text
+        except Exception as e:
             try:
-                print(f"[bitget][position] request failure ({label}) for {symbol}: {exc}")
+                print(f"[bitget][position] Exception with {request_path}: {e}")
             except Exception:
                 pass
-            return None
-
-        try:
-            print(f"[bitget][position] response ({label}) for {symbol}: status={resp.status_code} data={data}")
-        except Exception:
-            pass
-
-        if not isinstance(data, dict):
-            try:
-                print(f"[bitget][position] invalid response type ({label}) for {symbol}: {type(data)}")
-            except Exception:
-                pass
-            return None
-
-        # Check for error responses
-        if data.get("error"):
-            try:
-                print(f"[bitget][position] API error ({label}) for {symbol}: {data['error']}")
-            except Exception:
-                pass
-            return None
-
-        if str(data.get("code")) != "00000":
-            try:
-                print(f"[bitget][position] API error ({label}) for {symbol}: code={data.get('code')} msg={data.get('msg')}")
-            except Exception:
-                pass
-            return None
-
-        return data.get("data")
+            return 502, json.dumps({"error": str(e)})
 
     def _pick_snapshot(payload: Optional[Any], desired_symbol: str) -> Optional[Dict[str, Any]]:
         if isinstance(payload, dict):
@@ -922,25 +892,23 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
 
         # Try multiple Bitget API endpoints for positions
         endpoints_to_try = [
-            "/api/v2/mix/position/singlePosition",  # Mix API v2 single position
-            "/api/v2/mix/position/allPosition",  # Mix API v2 all positions
-            "/api/v5/position/list",  # Unified API
+            ("/api/v2/mix/position/singlePosition", "GET", {"symbol": bitget_symbol, "productType": pt_upper, "marginCoin": "USDT"}),
+            ("/api/v2/mix/position/allPosition", "GET", {"productType": pt_upper, "marginCoin": "USDT"}),
         ]
     
         successful_positions = []
     
-        for endpoint in endpoints_to_try:
+        for endpoint, method, params in endpoints_to_try:
             try:
-                if endpoint == "/api/v5/position/list":
-                    body = {}
+                if method == "GET":
+                    query = "&".join(f"{k}={v}" for k, v in params.items())
+                    full_path = f"{endpoint}?{query}"
+                    body = None
                 else:
-                    # For mix API, use different body format
-                    pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-                    body = {"productType": pt_upper}
-                    if BITGET_MARGIN_COIN:
-                        body["marginCoin"] = BITGET_MARGIN_COIN
+                    full_path = endpoint
+                    body = params
     
-                status_code, resp_text = await _post_bitget(endpoint, body, f"positions-{endpoint.split('/')[-1]}")
+                status_code, resp_text = await _request_bitget(method, full_path, body, f"positions-{endpoint.split('/')[-1]}")
     
                 if status_code == 200:
                     try:
@@ -986,7 +954,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
     
         # Try account info as final verification
         try:
-            status_code, resp_text = await _post_bitget("/api/v5/account/account-info", {}, "account")
+            status_code, resp_text = await _request_bitget("GET", f"/api/v2/mix/account/accounts?productType={pt_upper}", None, "account")
             if status_code == 200:
                 try:
                     data = json.loads(resp_text)
@@ -1260,8 +1228,8 @@ async def fetch_market_price(symbol: str):
     candidates = []
     candidates.append(f"https://api.binance.com/api/v3/ticker/price?symbol={s}")
     try:
-        # e.g. https://api.bitget.com/api/mix/v1/market/ticker?symbol=BTCUSDT
-        candidates.append(f"{BITGET_BASE}/api/mix/v1/market/ticker?symbol={s}")
+        # e.g. https://api.bitget.com/api/v2/mix/market/ticker?symbol=BTCUSDT&productType=UMCBL
+        candidates.append(f"{BITGET_BASE}/api/v2/mix/market/ticker?symbol={s}&productType=UMCBL")
         candidates.append(f"{BITGET_BASE}/api/spot/v1/market/ticker?symbol={s}")
     except Exception:
         pass
