@@ -833,9 +833,21 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
         return None
 
     async def _request_bitget(method: str, request_path: str, body_obj: Optional[Dict[str, Any]], label: str) -> Tuple[int, str]:
-        body = json.dumps(body_obj, separators=(",", ":")) if body_obj else ""
+        if method.upper() == "GET":
+            body = ""
+            request_path_for_sign = request_path
+            url = BITGET_BASE + request_path
+            if body_obj:
+                from urllib.parse import urlencode
+                query_string = urlencode(body_obj)
+                request_path_for_sign = request_path + "?" + query_string
+                url = BITGET_BASE + request_path_for_sign
+        else:
+            body = json.dumps(body_obj, separators=(",", ":")) if body_obj else ""
+            request_path_for_sign = request_path
+            url = BITGET_BASE + request_path
         timestamp = str(int(time.time() * 1000))
-        sign = build_signature(timestamp, method.upper(), request_path, body, BITGET_SECRET)
+        sign = build_signature(timestamp, method.upper(), request_path_for_sign, body, BITGET_SECRET)
         headers = {
             "ACCESS-KEY": BITGET_API_KEY,
             "ACCESS-SIGN": sign,
@@ -845,13 +857,12 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
             "paptrading": PAPTRADING,
             "locale": "en-US",
         }
-
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 if method.upper() == "GET":
-                    resp = await client.get(BITGET_BASE + request_path, headers=headers)
+                    resp = await client.get(url, headers=headers)
                 else:
-                    resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+                    resp = await client.post(url, headers=headers, content=body)
                 return resp.status_code, resp.text
         except Exception as e:
             try:
@@ -875,7 +886,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
     try:
         sanitized = sanitize_symbol_for_bitget(symbol)
         pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-        local_product = pt_upper
+        local_product = "umcbl" if pt_upper == "SUMCBL" else pt_upper.lower()
 
         if "_" in sanitized:
             bitget_symbol = sanitized
@@ -892,7 +903,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
 
         # Try multiple Bitget API endpoints for positions
         endpoints_to_try = [
-            ("/api/mix/v1/position/allPosition-v2", "GET", {"productType": pt_upper, "marginCoin": "USDT"}),
+            ("/api/v5/position/list", "GET", {"productType": local_product, "marginCoin": BITGET_MARGIN_COIN or "USDT", "symbol": bitget_symbol}),
         ]
     
         successful_positions = []
@@ -1951,15 +1962,16 @@ async def debug_bitget_positions(req: Request):
     else:
         bitget_symbol = f"{sanitized}_{local_product}"
 
-    body_obj: Dict[str, Any] = {"symbol": bitget_symbol}
+    query_params: Dict[str, Any] = {"symbol": bitget_symbol}
     if BITGET_MARGIN_COIN:
-        body_obj["marginCoin"] = BITGET_MARGIN_COIN
-    body = json.dumps(body_obj, separators=(",", ":"))
+        query_params["marginCoin"] = BITGET_MARGIN_COIN
     request_path = "/api/v5/position/list"
 
     # build signature
     timestamp = str(int(time.time() * 1000))
-    sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
+    from urllib.parse import urlencode
+    request_path_for_sign = request_path + "?" + urlencode(query_params)
+    sign = build_signature(timestamp, "GET", request_path_for_sign, "", BITGET_SECRET)
     headers = {
         "ACCESS-KEY": BITGET_API_KEY,
         "ACCESS-SIGN": sign,
@@ -1971,11 +1983,11 @@ async def debug_bitget_positions(req: Request):
     }
 
     if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
-        return {"ok": False, "dry_run": True, "note": "BITGET_DRY_RUN is enabled — not querying live Bitget", "payload": body_obj}
+        return {"ok": False, "dry_run": True, "note": "BITGET_DRY_RUN is enabled — not querying live Bitget", "payload": query_params}
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+            resp = await client.get(BITGET_BASE + request_path_for_sign, headers=headers)
             try:
                 parsed = resp.json()
             except Exception:
@@ -2604,58 +2616,80 @@ async def get_all_bitget_positions(current_user: Dict[str, str] = Depends(get_cu
 
     try:
         # Try multiple endpoints for positions - prioritize demo-compatible endpoints
-        endpoints_to_try = [
-            "/api/mix/v1/position/allPosition-v2",  # Mix API v1 all positions (demo compatible)
-            "/api/v5/position/list",  # Unified API (fallback)
-        ]
-
+        pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
+        local_product = "umcbl" if pt_upper == "SUMCBL" else pt_upper.lower()
+        endpoints_to_try = ["/api/v5/position/list"]
         all_positions = []
+        async def _request_bitget(method: str, request_path: str, body_obj: Optional[Dict[str, Any]], label: str) -> Tuple[int, str]:
+            if method.upper() == "GET":
+                body = ""
+                request_path_for_sign = request_path
+                url = BITGET_BASE + request_path
+                if body_obj:
+                    from urllib.parse import urlencode
+                    query_string = urlencode(body_obj)
+                    request_path_for_sign = request_path + "?" + query_string
+                    url = BITGET_BASE + request_path_for_sign
+            else:
+                body = json.dumps(body_obj, separators=(",", ":")) if body_obj else ""
+                request_path_for_sign = request_path
+                url = BITGET_BASE + request_path
+            timestamp = str(int(time.time() * 1000))
+            sign = build_signature(timestamp, method.upper(), request_path_for_sign, body, BITGET_SECRET)
+            headers = {
+                "ACCESS-KEY": BITGET_API_KEY,
+                "ACCESS-SIGN": sign,
+                "ACCESS-TIMESTAMP": timestamp,
+                "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+                "Content-Type": "application/json",
+                "paptrading": PAPTRADING,
+                "locale": "en-US",
+            }
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    if method.upper() == "GET":
+                        resp = await client.get(url, headers=headers)
+                    else:
+                        resp = await client.post(url, headers=headers, content=body)
+                    return resp.status_code, resp.text
+            except Exception as e:
+                try:
+                    print(f"[bitget][position] Exception with {request_path}: {e}")
+                except Exception:
+                    pass
+                return 502, json.dumps({"error": str(e)})
 
         for endpoint in endpoints_to_try:
             try:
-                if endpoint == "/api/v5/position/list":
-                    body = "{}"
-                else:
-                    # For mix API, use product type
-                    pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-                    body_obj = {"productType": pt_upper}
-                    if BITGET_MARGIN_COIN:
-                        body_obj["marginCoin"] = BITGET_MARGIN_COIN
-                    body = json.dumps(body_obj, separators=(",", ":"))
-
-                timestamp = str(int(time.time() * 1000))
-                sign = build_signature(timestamp, "POST", endpoint, body, BITGET_SECRET)
-
-                headers = {
-                    "ACCESS-KEY": BITGET_API_KEY,
-                    "ACCESS-SIGN": sign,
-                    "ACCESS-TIMESTAMP": timestamp,
-                    "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
-                    "Content-Type": "application/json",
-                    "paptrading": PAPTRADING,
-                    "locale": "en-US",
-                }
-
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.post(BITGET_BASE + endpoint, headers=headers, content=body)
-
-                    if resp.status_code == 200:
-                        try:
-                            data = resp.json()
-                            if isinstance(data, dict) and (data.get("code") == "00000" or data.get("code") == "0"):
+                method = "GET"
+                query_params = {"productType": local_product}
+                if BITGET_MARGIN_COIN:
+                    query_params["marginCoin"] = BITGET_MARGIN_COIN
+                status_code, resp_text = await _request_bitget(method, endpoint, query_params, f"positions-{endpoint.split('/')[-1]}")
+                if status_code == 200:
+                    try:
+                        data = json.loads(resp_text)
+                        if isinstance(data, dict):
+                            # Check for success codes
+                            if data.get("code") == "00000" or data.get("code") == "0":
                                 positions_data = data.get("data", [])
                                 if isinstance(positions_data, list):
                                     all_positions.extend(positions_data)
                                 elif isinstance(positions_data, dict):
                                     all_positions.append(positions_data)
                                 break  # Success, stop trying other endpoints
-                        except json.JSONDecodeError:
-                            pass
-                    else:
-                        try:
-                            print(f"[all-positions] {endpoint} HTTP {resp.status_code}: {resp.text[:100]}...")
-                        except Exception:
-                            pass
+                            elif data.get("msg"):
+                                try:
+                                    print(f"[all-positions] {endpoint} error: {data.get('msg')}")
+                                except Exception:
+                                    pass
+                    except json.JSONDecodeError:
+                        pass
+                else:
+                    try:
+                        print(f"[all-positions] {endpoint} HTTP {status_code}: {resp_text[:100]}...")
+                    except Exception:
+                        pass
             except Exception as e:
                 try:
                     print(f"[all-positions] Exception with {endpoint}: {e}")
