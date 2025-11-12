@@ -292,20 +292,43 @@ metadata.create_all(engine)
 def ensure_trade_table_columns():
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text("PRAGMA table_info(trades)")).fetchall()
-            existing = {row[1] for row in rows}
+            if DATABASE_URL.startswith("sqlite"):
+                rows = conn.execute(text("PRAGMA table_info(trades)")).fetchall()
+                existing = {row[1] for row in rows}
+            else:
+                # PostgreSQL
+                rows = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'trades' AND table_schema = 'public'")).fetchall()
+                existing = {row[0] for row in rows}
             if "size_usd" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN size_usd REAL"))
+                if DATABASE_URL.startswith("sqlite"):
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN size_usd REAL"))
+                else:
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN size_usd DOUBLE PRECISION"))
             if "leverage" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN leverage REAL"))
+                if DATABASE_URL.startswith("sqlite"):
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN leverage REAL"))
+                else:
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN leverage DOUBLE PRECISION"))
             if "margin" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN margin REAL"))
+                if DATABASE_URL.startswith("sqlite"):
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN margin REAL"))
+                else:
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN margin DOUBLE PRECISION"))
             if "liquidation_price" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN liquidation_price REAL"))
+                if DATABASE_URL.startswith("sqlite"):
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN liquidation_price REAL"))
+                else:
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN liquidation_price DOUBLE PRECISION"))
             if "exit_price" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN exit_price REAL"))
+                if DATABASE_URL.startswith("sqlite"):
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN exit_price REAL"))
+                else:
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN exit_price DOUBLE PRECISION"))
             if "realized_pnl" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN realized_pnl REAL"))
+                if DATABASE_URL.startswith("sqlite"):
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN realized_pnl REAL"))
+                else:
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN realized_pnl DOUBLE PRECISION"))
     except Exception as exc:
         try:
             print(f"[startup] failed to ensure trades table columns: {exc}")
