@@ -34,12 +34,12 @@ BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
 PAPTRADING = os.getenv("PAPTRADING", "1")
 TRADINGVIEW_SECRET = os.getenv("TRADINGVIEW_SECRET")
 BITGET_BASE = os.getenv("BITGET_BASE") or "https://api.bitget.com"
-BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "SUMCBL")  # Use proper API product type for demo futures
+BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "UMCBL")  # Use proper API product type for demo futures
 
 # For Railway deployment, override with correct values
 if os.getenv("RAILWAY_ENVIRONMENT"):
-    BITGET_PRODUCT_TYPE = "SUMCBL"
-    BITGET_MARGIN_COIN = "SUSDT"
+    BITGET_PRODUCT_TYPE = "UMCBL"
+    BITGET_MARGIN_COIN = "USDT"
     BITGET_POSITION_MODE = "single"
 BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN")
 BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE", "single")  # optional: e.g. 'double' for hedge mode to allow multiple positions
