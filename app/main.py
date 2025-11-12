@@ -892,7 +892,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
 
         # Try multiple Bitget API endpoints for positions
         endpoints_to_try = [
-            ("/api/mix/v1/position/allPosition", "GET", {"productType": pt_upper, "marginCoin": "USDT"}),
+            ("/api/mix/v1/position/allPosition-v2", "GET", {"productType": pt_upper, "marginCoin": "USDT"}),
         ]
     
         successful_positions = []
@@ -2605,7 +2605,7 @@ async def get_all_bitget_positions(current_user: Dict[str, str] = Depends(get_cu
     try:
         # Try multiple endpoints for positions - prioritize demo-compatible endpoints
         endpoints_to_try = [
-            "/api/mix/v1/position/allPosition",  # Mix API v1 all positions (demo compatible)
+            "/api/mix/v1/position/allPosition-v2",  # Mix API v1 all positions (demo compatible)
             "/api/v5/position/list",  # Unified API (fallback)
         ]
 
