@@ -777,7 +777,7 @@ async def cancel_orders_for_symbol(symbol: str):
         # Normalize symbol for Bitget
         sanitized = sanitize_symbol_for_bitget(symbol)
         pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-        local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
+        local_product = pt_upper
 
         if "_" in sanitized:
             bitget_symbol = sanitized
@@ -875,7 +875,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
     try:
         sanitized = sanitize_symbol_for_bitget(symbol)
         pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-        local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
+        local_product = pt_upper
 
         if "_" in sanitized:
             bitget_symbol = sanitized
@@ -1330,7 +1330,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     # USDT for UMCBL and SUSDT for SUMCBL unless explicitly overridden.
     margin_coin_env = (BITGET_MARGIN_COIN or "").strip()
     pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-    local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
+    local_product = pt_upper
 
     # SUMCBL demo alerts ultimately trade on the UMCBL contract. Normalize both the
     # product type and margin coin so Bitget accepts the order.
