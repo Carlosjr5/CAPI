@@ -781,7 +781,7 @@ async def cancel_orders_for_symbol(symbol: str):
 
         if "_" in sanitized:
             bitget_symbol = sanitized
-        elif local_product in ("", None, "UMCBL"):
+        elif local_product in ("", None):
             bitget_symbol = sanitized
         else:
             bitget_symbol = f"{sanitized}_{local_product}"
@@ -879,7 +879,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
 
         if "_" in sanitized:
             bitget_symbol = sanitized
-        elif local_product in ("", None, "UMCBL"):
+        elif local_product in ("", None):
             bitget_symbol = sanitized
         else:
             bitget_symbol = f"{sanitized}_{local_product}"
@@ -1323,6 +1323,10 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     # remove dots and any characters except letters, digits and underscore (double-sanitize defensive)
     raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
     
+    bitget_symbol = raw
+    if "_" not in bitget_symbol and local_product:
+        bitget_symbol = f"{bitget_symbol}_{local_product}"
+    
     # Resolve margin coin defaults per product type. Bitget demo markets expect
     # USDT for UMCBL and SUSDT for SUMCBL unless explicitly overridden.
     margin_coin_env = (BITGET_MARGIN_COIN or "").strip()
@@ -1423,6 +1427,8 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     #         body_obj["posMode"] = "single"
     #     if "holdSide" not in body_obj:
     #         body_obj["holdSide"] = "long" if side_key == "buy" else "short"
+
+    body_obj["symbol"] = bitget_symbol
 
     return body_obj
 
