@@ -886,7 +886,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
     try:
         sanitized = sanitize_symbol_for_bitget(symbol)
         pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-        local_product = "umcbl" if pt_upper == "SUMCBL" else pt_upper.lower()
+        local_product = pt_upper.lower()
 
         if "_" in sanitized:
             bitget_symbol = sanitized
@@ -1341,7 +1341,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     # USDT for UMCBL and SUSDT for SUMCBL unless explicitly overridden.
     margin_coin_env = (BITGET_MARGIN_COIN or "").strip()
     pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-    local_product = pt_upper
+    local_product = pt_upper.lower()
 
     # SUMCBL demo alerts ultimately trade on the UMCBL contract. Normalize both the
     # product type and margin coin so Bitget accepts the order.
@@ -1953,7 +1953,7 @@ async def debug_bitget_positions(req: Request):
     symbol = payload.get("symbol") or payload.get("ticker") or "BTCUSDT"
     sanitized = sanitize_symbol_for_bitget(symbol)
     pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-    local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
+    local_product = pt_upper.lower()
 
     if "_" in sanitized:
         bitget_symbol = sanitized
@@ -2617,7 +2617,7 @@ async def get_all_bitget_positions(current_user: Dict[str, str] = Depends(get_cu
     try:
         # Try multiple endpoints for positions - prioritize demo-compatible endpoints
         pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-        local_product = "umcbl" if pt_upper == "SUMCBL" else pt_upper.lower()
+        local_product = pt_upper.lower()
         endpoints_to_try = ["/api/v5/position/list"]
         all_positions = []
         async def _request_bitget(method: str, request_path: str, body_obj: Optional[Dict[str, Any]], label: str) -> Tuple[int, str]:
@@ -2843,7 +2843,7 @@ async def cancel_orders(symbol: str):
         # Normalize symbol for Bitget
         sanitized = sanitize_symbol_for_bitget(symbol)
         pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-        local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
+        local_product = pt_upper.lower()
 
         if "_" in sanitized:
             bitget_symbol = sanitized
