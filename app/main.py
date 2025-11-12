@@ -602,8 +602,8 @@ async def place_demo_order(
     Place an order on Bitget demo futures (v2 mix order)
     We'll place a market order by default. Modify `orderType` to 'limit' if you want limit.
     """
-    # Use Bitget v5 unified API for futures trading
-    request_path = "/api/v5/trade/order"
+    # Use Bitget v2 mix API for futures trading
+    request_path = "/api/v2/mix/order/place"
     url = BITGET_BASE + request_path
 
     # For v5 API, we don't need contract discovery - just use the symbol directly
@@ -899,8 +899,8 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
 
         # Try multiple Bitget API endpoints for positions
         endpoints_to_try = [
-            "/api/mix/v1/position/singlePosition",  # Mix API v1 single position
-            "/api/mix/v1/position/allPosition",  # Mix API v1 all positions
+            "/api/v2/mix/position/singlePosition",  # Mix API v2 single position
+            "/api/v2/mix/position/allPosition",  # Mix API v2 all positions
             "/api/v5/position/list",  # Unified API
         ]
     
@@ -1353,12 +1353,15 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     client_oid = f"capi-{uuid.uuid4().hex[:20]}"
 
     body_obj = {
-        "productType": local_product or BITGET_PRODUCT_TYPE,
         "symbol": "",  # Will be set below
-        "orderType": "market",
-        "size": str(size) if size is not None else "0.001",  # Smaller default size like debug script
         "marginCoin": use_margin_coin,
-        "marginMode": "crossed",  # Use crossed like the working debug script
+        "size": str(size) if size is not None else "0.001",  # Smaller default size like debug script
+        "side": side_key,
+        "orderType": "market",
+        "price": "",
+        "timeInForceValue": "normal",
+        "presetStopSurplusPrice": "",
+        "presetStopLossPrice": "",
         "clientOid": client_oid  # Unique per order to avoid Bitget duplicate errors
     }
 
@@ -1387,9 +1390,8 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
 
     # Determine the symbol
     if pt_upper in ("SUMCBL", "UMCBL"):
-        # Bitget expects plain symbol (e.g. BTCUSDT) with productType set separately for mix futures.
-        bitget_symbol = raw
-        body_obj["productType"] = local_product or "UMCBL"
+        # Bitget v2 expects symbol with product type suffix (e.g. BTCUSDT_UMCBL)
+        bitget_symbol = raw + "_" + local_product
     else:
         # For other product types, check if suffix is already present
         if BITGET_PRODUCT_TYPE and ("_" in raw and raw.upper().endswith(str(BITGET_PRODUCT_TYPE).upper())):

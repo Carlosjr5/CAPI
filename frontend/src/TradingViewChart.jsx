@@ -216,38 +216,42 @@ export default function TradingViewChart({
         saved_data: savedData,
       })
 
-      widgetRef.current.onChartReady(() => {
-       enqueuePersist()
+      if (typeof widgetRef.current?.onChartReady === 'function') {
+        widgetRef.current.onChartReady(() => {
+         enqueuePersist()
 
-       const chart = widgetRef.current?.activeChart?.()
-       if (chart) {
-         try {
-           chart.onIntervalChanged().subscribe(null, enqueuePersist)
-           chart.onSymbolChanged().subscribe(null, enqueuePersist)
-           chart.onDataLoaded().subscribe(enqueuePersist)
-         } catch (error) {
-           console.warn('[TradingView] Failed to wire chart events', error)
+         const chart = widgetRef.current?.activeChart?.()
+         if (chart) {
+           try {
+             chart.onIntervalChanged().subscribe(null, enqueuePersist)
+             chart.onSymbolChanged().subscribe(null, enqueuePersist)
+             chart.onDataLoaded().subscribe(enqueuePersist)
+           } catch (error) {
+             console.warn('[TradingView] Failed to wire chart events', error)
+           }
+
+           // Plot trade signals on chart initially
+           plotTradeSignals(chart, symbolTrades)
          }
 
-         // Plot trade signals on chart initially
-         plotTradeSignals(chart, symbolTrades)
-       }
+         try {
+           widgetRef.current?.subscribe('drawing_tool', enqueuePersist)
+         } catch (error) {
+           // Safe to ignore if subscribe is unavailable
+         }
+       }).catch(error => {
+         console.error('[TradingView] onChartReady failed', error)
+       })
+      } else {
+        console.warn('[TradingView] onChartReady not available, skipping chart setup')
+      }
 
-       try {
-         widgetRef.current?.subscribe('drawing_tool', enqueuePersist)
-       } catch (error) {
-         // Safe to ignore if subscribe is unavailable
-       }
-     }).catch(error => {
-       console.error('[TradingView] onChartReady failed', error)
-     })
-
-     // Also plot signals after widget is created (for when trades update)
-     setTimeout(() => {
-       if (widgetRef.current?.activeChart) {
-         const chart = widgetRef.current.activeChart()
-         if (chart) {
-           plotTradeSignals(chart, symbolTrades)
+      // Also plot signals after widget is created (for when trades update)
+      setTimeout(() => {
+        if (widgetRef.current?.activeChart) {
+          const chart = widgetRef.current.activeChart()
+          if (chart) {
+            plotTradeSignals(chart, symbolTrades)
          }
        }
      }, 1000)
