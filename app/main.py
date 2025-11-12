@@ -625,8 +625,8 @@ async def place_demo_order(
     Place an order on Bitget demo futures (v2 mix order)
     We'll place a market order by default. Modify `orderType` to 'limit' if you want limit.
     """
-    # Use Bitget v2 mix API for futures trading
-    request_path = "/api/v2/mix/order/placeOrder"
+    # Use Bitget v1 mix API for futures trading
+    request_path = "/api/mix/v1/order/placeOrder"
     url = BITGET_BASE + request_path
 
     # For v5 API, we don't need contract discovery - just use the symbol directly
@@ -786,8 +786,8 @@ async def cancel_orders_for_symbol(symbol: str):
         else:
             bitget_symbol = f"{sanitized}_{local_product}"
 
-        # Cancel all orders for the symbol using v2 mix API
-        request_path = "/api/v2/mix/order/cancelAllOrders"
+        # Cancel all orders for the symbol using v1 mix API
+        request_path = "/api/mix/v1/order/cancelAllOrders"
         body_obj: Dict[str, Any] = {"symbol": bitget_symbol}
         if BITGET_MARGIN_COIN:
             body_obj["marginCoin"] = BITGET_MARGIN_COIN
@@ -892,8 +892,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
 
         # Try multiple Bitget API endpoints for positions
         endpoints_to_try = [
-            ("/api/v2/mix/position/singlePosition", "GET", {"symbol": bitget_symbol, "productType": pt_upper, "marginCoin": "USDT"}),
-            ("/api/v2/mix/position/allPosition", "GET", {"productType": pt_upper, "marginCoin": "USDT"}),
+            ("/api/mix/v1/position/allPosition", "GET", {"productType": pt_upper, "marginCoin": "USDT"}),
         ]
     
         successful_positions = []
@@ -954,7 +953,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
     
         # Try account info as final verification
         try:
-            status_code, resp_text = await _request_bitget("GET", f"/api/v2/mix/account/accounts?productType={pt_upper}", None, "account")
+            status_code, resp_text = await _request_bitget("GET", f"/api/mix/v1/account/accounts?productType={pt_upper}", None, "account")
             if status_code == 200:
                 try:
                     data = json.loads(resp_text)
@@ -1228,8 +1227,8 @@ async def fetch_market_price(symbol: str):
     candidates = []
     candidates.append(f"https://api.binance.com/api/v3/ticker/price?symbol={s}")
     try:
-        # e.g. https://api.bitget.com/api/v2/mix/market/ticker?symbol=BTCUSDT&productType=UMCBL
-        candidates.append(f"{BITGET_BASE}/api/v2/mix/market/ticker?symbol={s}&productType=UMCBL")
+        # e.g. https://api.bitget.com/api/mix/v1/market/ticker?symbol=BTCUSDT&productType=UMCBL
+        candidates.append(f"{BITGET_BASE}/api/mix/v1/market/ticker?symbol={s}&productType=UMCBL")
         candidates.append(f"{BITGET_BASE}/api/spot/v1/market/ticker?symbol={s}")
     except Exception:
         pass
