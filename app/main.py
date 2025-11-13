@@ -682,10 +682,10 @@ async def place_demo_order(
         print(f"[bitget][error] {err}")
         return 400, json.dumps({"error": err})
 
-    # Use v5 unified API for all order placement
+    # Use v2 mix API for SUMCBL/UMCBL order placement (the v5 API doesn't support demo trading)
     candidates = [
-        BITGET_BASE + request_path,
-        BITGET_BASE + "/api/strategy/v1/trading-view/callback",
+        BITGET_BASE + "/api/v2/mix/order/place-order",
+        BITGET_BASE + "/api/mix/v1/order/placeOrder",
     ]
 
     last_exc = None
@@ -700,7 +700,7 @@ async def place_demo_order(
 
                 # Build fresh timestamp and signature for this specific requestPath
                 ts = str(int(time.time() * 1000))
-                sign = build_signature(ts, "POST", request_path_for_sign, body, BITGET_SECRET)
+                sign = build_signature(ts, "POST", request_path, body, BITGET_SECRET)
 
                 headers = {
                     "ACCESS-KEY": BITGET_API_KEY,
@@ -1344,16 +1344,8 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
     local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
 
-    # SUMCBL demo alerts ultimately trade on the UMCBL contract. Normalize both the
-    # product type and margin coin so Bitget accepts the order.
-    use_margin_coin = margin_coin_env
-    if not use_margin_coin:
-        if pt_upper == "SUMCBL":
-            use_margin_coin = "SUSDT"
-        elif local_product == "UMCBL":
-            use_margin_coin = "USDT"
-        else:
-            use_margin_coin = "USDT"
+    # For UMCBL demo trading, use USDT as margin coin
+    use_margin_coin = margin_coin_env or "USDT"
 
     # Initialize body_obj with default values - use the working parameters from debug_order.py
     client_oid = f"capi-{uuid.uuid4().hex[:20]}"
@@ -1368,20 +1360,6 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
         "clientOid": client_oid  # Unique per order to avoid Bitget duplicate errors
     }
 
-    # Attach positional hints when available; Bitget expects explicit unilateral fields in
-    # one-way accounts. Provide sensible defaults for SUMCBL/UMCBL if env vars are missing.
-    default_position_type = normalize_position_type(BITGET_POSITION_TYPE)
-    # if not default_position_type and BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
-    #     default_position_type = "single_hold"
-    if default_position_type:
-        body_obj["positionType"] = default_position_type
-
-    normalized_mode = normalize_position_mode(BITGET_POSITION_MODE)
-    if normalized_mode:
-        body_obj["positionMode"] = normalized_mode
-    elif BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
-        body_obj["positionMode"] = "single"
-
     # reduceOnly/closePosition signals from caller if provided
     if reduce_only:
         body_obj["reduceOnly"] = "true"
@@ -1391,23 +1369,10 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
         for key, value in extra_fields.items():
             body_obj[key] = value
 
-    # Determine the symbol
-    if pt_upper in ("SUMCBL", "UMCBL"):
-        # Bitget expects plain symbol (e.g. BTCUSDT) with productType set separately for mix futures.
-        bitget_symbol = raw
-        body_obj["productType"] = local_product or "UMCBL"
-    else:
-        # For other product types, check if suffix is already present
-        if BITGET_PRODUCT_TYPE and ("_" in raw and raw.upper().endswith(str(BITGET_PRODUCT_TYPE).upper())):
-            bitget_symbol = raw
-        else:
-            # append product type if not present
-            if BITGET_PRODUCT_TYPE:
-                bitget_symbol = f"{raw}_{BITGET_PRODUCT_TYPE}"
-            else:
-                bitget_symbol = raw
-    
+    # Determine the symbol - for demo trading, use plain symbol (BTCUSDT) with productType
+    bitget_symbol = raw  # Use plain symbol like BTCUSDT
     body_obj["symbol"] = bitget_symbol
+    body_obj["productType"] = local_product or BITGET_PRODUCT_TYPE
 
     # Map side for single/unilateral accounts when necessary
     side_key = side.lower()
@@ -2059,25 +2024,19 @@ async def debug_check_creds():
 @app.on_event("startup")
 async def startup():
     await database.connect()
-    ensure_trade_table_columns()
-    
-    # Check if database schema needs migration (simple check for size column)
-    try:
-        # Try to query with size column
-        await database.fetch_all(trades.select().limit(1))
-        schema_ok = True
-    except Exception as e:
-        if "no such column" in str(e).lower():
-            schema_ok = False
-            print("[startup] Database schema outdated, recreating tables...")
-            # Drop and recreate tables
-            async with database.connection() as conn:
-                await conn.execute("DROP TABLE IF EXISTS trades")
-            # Recreate tables with new schema
+
+    # For Railway deployments, be more conservative with schema changes
+    # Only create tables if they don't exist, never drop them
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        print("[startup] Railway deployment detected - preserving existing database")
+        try:
             metadata.create_all(engine)
-            print("[startup] Database schema updated successfully")
-        else:
-            schema_ok = True  # Other errors are not schema issues
+            print("[startup] Database tables created/verified successfully")
+        except Exception as e:
+            print(f"[startup] Error creating/verifying tables: {e}")
+    else:
+        # Local development - can be more aggressive with schema changes
+        ensure_trade_table_columns()
     
     # Print important runtime info to help verify demo vs prod endpoints and dry-run
     try:
