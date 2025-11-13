@@ -31,15 +31,32 @@ load_dotenv()
 BITGET_API_KEY = os.getenv("BITGET_API_KEY")
 BITGET_SECRET = os.getenv("BITGET_SECRET")
 BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
+
+# Support multiple API keys (comma-separated for load balancing/failover)
+BITGET_API_KEYS = [key.strip() for key in (BITGET_API_KEY or "").split(",") if key.strip()]
+BITGET_SECRETS = [secret.strip() for secret in (BITGET_SECRET or "").split(",") if secret.strip()]
+BITGET_PASSPHRASES = [passphrase.strip() for passphrase in (BITGET_PASSPHRASE or "").split(",") if passphrase.strip()]
+
+# Validate that we have matching sets of credentials
+if len(BITGET_API_KEYS) != len(BITGET_SECRETS) or len(BITGET_SECRETS) != len(BITGET_PASSPHRASES):
+    print(f"[error] Mismatched API credentials: {len(BITGET_API_KEYS)} keys, {len(BITGET_SECRETS)} secrets, {len(BITGET_PASSPHRASES)} passphrases")
+    BITGET_API_KEYS = []
+    BITGET_SECRETS = []
+    BITGET_PASSPHRASES = []
+
+# Default to first set if available
+BITGET_API_KEY = BITGET_API_KEYS[0] if BITGET_API_KEYS else None
+BITGET_SECRET = BITGET_SECRETS[0] if BITGET_SECRETS else None
+BITGET_PASSPHRASE = BITGET_PASSPHRASES[0] if BITGET_PASSPHRASES else None
 PAPTRADING = os.getenv("PAPTRADING", "1")
 TRADINGVIEW_SECRET = os.getenv("TRADINGVIEW_SECRET")
 BITGET_BASE = os.getenv("BITGET_BASE") or "https://api.bitget.com"
-BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "SUMCBL")  # Use proper API product type for demo futures
+BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")  # Use proper API product type for demo futures
 
 # For Railway deployment, override with correct values
 if os.getenv("RAILWAY_ENVIRONMENT"):
-    BITGET_PRODUCT_TYPE = "SUMCBL"
-    BITGET_MARGIN_COIN = "SUSDT"
+    BITGET_PRODUCT_TYPE = "USDT-FUTURES"
+    BITGET_MARGIN_COIN = "USDT"
     BITGET_POSITION_MODE = "single"
 BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN")
 BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE", "single")  # optional: e.g. 'double' for hedge mode to allow multiple positions
@@ -300,6 +317,8 @@ def ensure_trade_table_columns():
         with engine.connect() as conn:
             rows = conn.execute(text("PRAGMA table_info(trades)")).fetchall()
             existing = {row[1] for row in rows}
+            if "size" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN size REAL"))
             if "size_usd" not in existing:
                 conn.execute(text("ALTER TABLE trades ADD COLUMN size_usd REAL"))
             if "leverage" not in existing:
@@ -608,8 +627,8 @@ async def place_demo_order(
     Place an order on Bitget demo futures (v2 mix order)
     We'll place a market order by default. Modify `orderType` to 'limit' if you want limit.
     """
-    # Use Bitget v5 unified API for futures trading
-    request_path = "/api/v5/trade/order"
+    # Use Bitget mix API for futures trading (v2 mix API is more reliable for paper trading)
+    request_path = "/api/mix/v1/order/placeOrder"
     url = BITGET_BASE + request_path
 
     # For v5 API, we don't need contract discovery - just use the symbol directly
@@ -628,10 +647,6 @@ async def place_demo_order(
         extra_fields=extra_fields,
     )
 
-    # For SUMCBL, the symbol construction is correct but the API rejects it.
-    # Keep SUMCBL for now since that's what the user configured, but this may need to be changed
-    # if Bitget doesn't support live orders on SUMCBL product type
-
     # Set side for all products
     side_key = side.lower()
     body_obj["side"] = side_key
@@ -649,7 +664,7 @@ async def place_demo_order(
         except Exception:
             pass
 
-    if BITGET_POSITION_TYPE and "positionType" not in body_obj and BITGET_PRODUCT_TYPE not in ("SUMCBL", "UMCBL"):
+    if BITGET_POSITION_TYPE and "positionType" not in body_obj:
         body_obj["positionType"] = normalize_position_type(BITGET_POSITION_TYPE)
 
     body = json.dumps(body_obj, separators=(',', ':'))  # compact body
@@ -677,15 +692,24 @@ async def place_demo_order(
     # (live request path continues below)
 
     # Ensure required credentials are present before making the live request
-    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE):
+    if not BITGET_API_KEYS or not BITGET_SECRETS or not BITGET_PASSPHRASES:
         err = "Missing Bitget credentials (API key/secret/passphrase) required to send live orders"
         print(f"[bitget][error] {err}")
         return 400, json.dumps({"error": err})
 
-    # Use v2 mix API for SUMCBL/UMCBL order placement (the v5 API doesn't support demo trading)
+    # Select API key to use (round-robin for load balancing)
+    import time
+    key_index = int(time.time() * 1000) % len(BITGET_API_KEYS)
+    current_api_key = BITGET_API_KEYS[key_index]
+    current_secret = BITGET_SECRETS[key_index]
+    current_passphrase = BITGET_PASSPHRASES[key_index]
+
+    print(f"[bitget] Using API key {key_index + 1}/{len(BITGET_API_KEYS)}")
+
+    # Use v2 mix API for futures order placement
     candidates = [
-        BITGET_BASE + "/api/v2/mix/order/place-order",
         BITGET_BASE + "/api/mix/v1/order/placeOrder",
+        BITGET_BASE + "/api/v2/mix/order/place-order",
     ]
 
     last_exc = None
@@ -759,15 +783,11 @@ async def cancel_orders_for_symbol(symbol: str):
     try:
         # Normalize symbol for Bitget
         sanitized = sanitize_symbol_for_bitget(symbol)
-        pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-        local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
 
         if "_" in sanitized:
             bitget_symbol = sanitized
-        elif local_product in ("", None, "UMCBL"):
-            bitget_symbol = sanitized
         else:
-            bitget_symbol = f"{sanitized}_{local_product}"
+            bitget_symbol = sanitized
 
         # Cancel all orders for the symbol using v5 API
         request_path = "/api/v5/trade/cancel-batch-orders"
@@ -887,15 +907,11 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
 
     try:
         sanitized = sanitize_symbol_for_bitget(symbol)
-        pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-        local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
 
         if "_" in sanitized:
             bitget_symbol = sanitized
-        elif local_product in ("", None, "UMCBL"):
-            bitget_symbol = sanitized
         else:
-            bitget_symbol = f"{sanitized}_{local_product}"
+            bitget_symbol = sanitized
 
         primary_body: Dict[str, Any] = {}
         if BITGET_MARGIN_COIN:
@@ -917,9 +933,8 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
                 if endpoint == "/api/v5/position/list":
                     body = {}
                 else:
-                    # For mix API, use different body format
-                    pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-                    body = {"productType": pt_upper}
+                    # For mix API, use product type in body
+                    body = {"productType": "usdt-futures"}
                     if BITGET_MARGIN_COIN:
                         body["marginCoin"] = BITGET_MARGIN_COIN
     
@@ -1344,14 +1359,13 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
     local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
 
-    # For UMCBL demo trading, use USDT as margin coin
+    # For USDT futures, use USDT as margin coin
     use_margin_coin = margin_coin_env or "USDT"
 
     # Initialize body_obj with default values - use the working parameters from debug_order.py
     client_oid = f"capi-{uuid.uuid4().hex[:20]}"
 
     body_obj = {
-        "productType": local_product or BITGET_PRODUCT_TYPE,
         "symbol": "",  # Will be set below
         "orderType": "market",
         "size": str(size) if size is not None else "0.001",  # Smaller default size like debug script
@@ -1369,17 +1383,16 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
         for key, value in extra_fields.items():
             body_obj[key] = value
 
-    # Determine the symbol - for demo trading, use plain symbol (BTCUSDT) with productType
+    # Determine the symbol - for futures trading, use plain symbol (BTCUSDT)
     bitget_symbol = raw  # Use plain symbol like BTCUSDT
     body_obj["symbol"] = bitget_symbol
-    body_obj["productType"] = local_product or BITGET_PRODUCT_TYPE
 
     # Map side for single/unilateral accounts when necessary
     side_key = side.lower()
     pm = str(BITGET_POSITION_MODE or "").lower()
     pt = str(BITGET_POSITION_TYPE or "").lower()
     single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way", "oneway")
-    if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way", "oneway")) or BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
+    if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way", "oneway")):
         # Use buy/sell for unilateral mode - the positionMode handles the unilateral aspect
         body_obj["side"] = side_key
     else:
@@ -1394,13 +1407,6 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
             body_obj["positionSide"] = inferred
         except Exception:
             pass
-
-    # Provide explicit Bitget one-way hints when dealing with SUMCBL/UMCBL contracts.
-    # if BITGET_PRODUCT_TYPE in ("SUMCBL", "UMCBL"):
-    #     if "posMode" not in body_obj:
-    #         body_obj["posMode"] = "single"
-    #     if "holdSide" not in body_obj:
-    #         body_obj["holdSide"] = "long" if side_key == "buy" else "short"
 
     return body_obj
 
@@ -1919,10 +1925,8 @@ async def debug_bitget_positions(req: Request):
 
     if "_" in sanitized:
         bitget_symbol = sanitized
-    elif local_product in ("", None, "UMCBL"):
-        bitget_symbol = sanitized
     else:
-        bitget_symbol = f"{sanitized}_{local_product}"
+        bitget_symbol = sanitized
 
     body_obj: Dict[str, Any] = {"symbol": bitget_symbol}
     if BITGET_MARGIN_COIN:
@@ -1994,10 +1998,10 @@ async def debug_check_creds():
                 sign = build_signature(ts, method, request_path_for_sign, body if body else "", BITGET_SECRET)
 
                 headers = {
-                    "ACCESS-KEY": BITGET_API_KEY,
+                    "ACCESS-KEY": current_api_key,
                     "ACCESS-SIGN": sign,
                     "ACCESS-TIMESTAMP": ts,
-                    "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+                    "ACCESS-PASSPHRASE": current_passphrase,
                     "Content-Type": "application/json",
                     "paptrading": PAPTRADING,
                     "locale": "en-US",
@@ -2583,9 +2587,8 @@ async def get_all_bitget_positions(current_user: Dict[str, str] = Depends(get_cu
                 if endpoint == "/api/v5/position/list":
                     body = "{}"
                 else:
-                    # For mix API, use product type
-                    pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-                    body_obj = {"productType": pt_upper}
+                    # For mix API, use usdt-futures product type
+                    body_obj = {"productType": "usdt-futures"}
                     if BITGET_MARGIN_COIN:
                         body_obj["marginCoin"] = BITGET_MARGIN_COIN
                     body = json.dumps(body_obj, separators=(",", ":"))
@@ -2775,23 +2778,17 @@ async def cancel_orders(symbol: str):
     try:
         # Normalize symbol for Bitget
         sanitized = sanitize_symbol_for_bitget(symbol)
-        pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-        local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
 
         if "_" in sanitized:
             bitget_symbol = sanitized
-        elif local_product in ("", None, "UMCBL"):
-            bitget_symbol = sanitized
         else:
-            bitget_symbol = f"{sanitized}_{local_product}"
+            bitget_symbol = sanitized
 
         # Cancel all orders for the symbol
         request_path = "/api/mix/v1/order/cancel-all-orders"
-        body_obj: Dict[str, Any] = {"symbol": bitget_symbol}
+        body_obj: Dict[str, Any] = {"symbol": bitget_symbol, "productType": "usdt-futures"}
         if BITGET_MARGIN_COIN:
             body_obj["marginCoin"] = BITGET_MARGIN_COIN
-        if local_product:
-            body_obj.setdefault("productType", local_product)
 
         body = json.dumps(body_obj, separators=(",", ":"))
         timestamp = str(int(time.time() * 1000))
