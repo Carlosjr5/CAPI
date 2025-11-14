@@ -934,7 +934,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
                     body = {}
                 else:
                     # For mix API, use product type in body
-                    body = {"productType": "usdt-futures"}
+                    body = {"productType": "USDT-FUTURES"}
                     if BITGET_MARGIN_COIN:
                         body["marginCoin"] = BITGET_MARGIN_COIN
     
@@ -1367,6 +1367,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
 
     body_obj = {
         "symbol": "",  # Will be set below
+        "productType": local_product,  # Add required productType
         "orderType": "market",
         "size": str(size) if size is not None else "0.001",  # Smaller default size like debug script
         "marginCoin": use_margin_coin,
@@ -1386,6 +1387,10 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     # Determine the symbol - for futures trading, use plain symbol (BTCUSDT)
     bitget_symbol = raw  # Use plain symbol like BTCUSDT
     body_obj["symbol"] = bitget_symbol
+
+    # Ensure productType is always included for Bitget API
+    if "productType" not in body_obj:
+        body_obj["productType"] = local_product
 
     # Map side for single/unilateral accounts when necessary
     side_key = side.lower()
@@ -2448,6 +2453,9 @@ async def open_position(req: Request, current_user: Dict[str, str] = Depends(get
         price = await get_market_price_with_retries(symbol)
         if not price:
             raise HTTPException(status_code=400, detail="Unable to fetch market price for symbol")
+
+        # Add productType to payload for Bitget API
+        payload["productType"] = "USDT-FUTURES"
 
         # Prepare payload similar to webhook
         webhook_payload = {
