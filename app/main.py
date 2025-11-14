@@ -279,8 +279,17 @@ DATABASE_URL = os.getenv("DATABASE_URL")  # Railway provides this for PostgreSQL
 if not DATABASE_URL:
     # For Railway, use a persistent path for SQLite
     if os.getenv("RAILWAY_ENVIRONMENT"):
-        # Railway persistent volume path
-        db_path = "/data/trades.db"
+        # Railway persistent volume path - create directory if needed
+        import os
+        db_dir = "/data"
+        db_path = f"{db_dir}/trades.db"
+
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+            print(f"[db] Created Railway persistent directory: {db_dir}")
+        except Exception as e:
+            print(f"[db] Warning: Could not create {db_dir}: {e}")
+
         DATABASE_URL = f"sqlite:///{db_path}"
         print(f"[db] Using Railway persistent SQLite database: {db_path}")
     else:
@@ -316,7 +325,10 @@ if DATABASE_URL.startswith("sqlite"):
 else:
     # PostgreSQL for Railway
     engine = sqlalchemy.create_engine(DATABASE_URL)
-metadata.create_all(engine)
+
+# Only create tables if not in Railway environment (Railway handles this in startup event)
+if not os.getenv("RAILWAY_ENVIRONMENT"):
+    metadata.create_all(engine)
 
 
 def ensure_trade_table_columns():
@@ -2039,6 +2051,14 @@ async def debug_check_creds():
 
 @app.on_event("startup")
 async def startup():
+    # For Railway, ensure /data directory exists before connecting to database
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        try:
+            os.makedirs("/data", exist_ok=True)
+            print("[startup] Ensured /data directory exists for persistent storage")
+        except Exception as e:
+            print(f"[startup] Warning: Could not create /data directory: {e}")
+
     await database.connect()
 
     # For Railway deployments, be more conservative with schema changes
