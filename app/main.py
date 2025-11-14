@@ -2036,6 +2036,8 @@ async def startup():
         try:
             metadata.create_all(engine)
             print("[startup] Database tables created/verified successfully")
+            # Still add missing columns for Railway (safe operation)
+            ensure_trade_table_columns()
         except Exception as e:
             print(f"[startup] Error creating/verifying tables: {e}")
     else:
@@ -2329,6 +2331,67 @@ async def webhook(req: Request):
 async def list_trades(current_user: Dict[str, str] = Depends(get_current_user)):
     rows = await database.fetch_all(trades.select().order_by(trades.c.created_at.desc()))
     return [dict(r) for r in rows]
+
+@app.get("/tradingview-trades")
+async def get_tradingview_trades(current_user: Dict[str, str] = Depends(get_current_user)):
+    """Get trades from TradingView webhook signals only (status='signal')"""
+    rows = await database.fetch_all(
+        trades.select()
+        .where(trades.c.status == "signal")
+        .order_by(trades.c.created_at.desc())
+    )
+    return [dict(r) for r in rows]
+
+@app.get("/bitget-trades")
+async def get_bitget_trades(current_user: Dict[str, str] = Depends(get_current_user)):
+    """Get trades that were actually executed on Bitget (status='placed' or 'error')"""
+    rows = await database.fetch_all(
+        trades.select()
+        .where(trades.c.status.in_(["placed", "error"]))
+        .order_by(trades.c.created_at.desc())
+    )
+    return [dict(r) for r in rows]
+
+@app.get("/trade-sync-status")
+async def get_trade_sync_status(current_user: Dict[str, str] = Depends(get_current_user)):
+    """Get synchronization status between TradingView signals and Bitget executions"""
+    tv_trades = await database.fetch_all(
+        trades.select()
+        .where(trades.c.status == "signal")
+        .order_by(trades.c.created_at.desc())
+    )
+
+    bitget_trades = await database.fetch_all(
+        trades.select()
+        .where(trades.c.status.in_(["placed", "error"]))
+        .order_by(trades.c.created_at.desc())
+    )
+
+    # Count by signal type
+    tv_buy_signals = len([t for t in tv_trades if t.signal.upper() == "BUY"])
+    tv_sell_signals = len([t for t in tv_trades if t.signal.upper() == "SELL"])
+    bg_buy_trades = len([t for t in bitget_trades if t.signal.upper() == "BUY"])
+    bg_sell_trades = len([t for t in bitget_trades if t.signal.upper() == "SELL"])
+
+    return {
+        "tradingview_signals": {
+            "total": len(tv_trades),
+            "buy_signals": tv_buy_signals,
+            "sell_signals": tv_sell_signals,
+            "trades": [dict(r) for r in tv_trades]
+        },
+        "bitget_executions": {
+            "total": len(bitget_trades),
+            "buy_trades": bg_buy_trades,
+            "sell_trades": bg_sell_trades,
+            "trades": [dict(r) for r in bitget_trades]
+        },
+        "sync_status": {
+            "buy_signals_executed": bg_buy_trades == tv_buy_signals,
+            "sell_signals_executed": bg_sell_trades == tv_sell_signals,
+            "all_signals_executed": len(bitget_trades) == len(tv_trades)
+        }
+    }
 
 @app.post("/close/{trade_id}")
 async def close_position(trade_id: str, current_user: Dict[str, str] = Depends(require_role(["admin"]))):
