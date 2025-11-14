@@ -277,9 +277,16 @@ def require_role(allowed_roles: List[str]):
 # DB - Use PostgreSQL on Railway, fallback to SQLite locally
 DATABASE_URL = os.getenv("DATABASE_URL")  # Railway provides this for PostgreSQL
 if not DATABASE_URL:
-    # Local development fallback to SQLite
-    DATABASE_URL = "sqlite:///./trades.db"
-    print("[db] Using local SQLite database")
+    # For Railway, use a persistent path for SQLite
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        # Railway persistent volume path
+        db_path = "/data/trades.db"
+        DATABASE_URL = f"sqlite:///{db_path}"
+        print(f"[db] Using Railway persistent SQLite database: {db_path}")
+    else:
+        # Local development fallback to SQLite
+        DATABASE_URL = "sqlite:///./trades.db"
+        print("[db] Using local SQLite database")
 
 database = Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
@@ -2039,10 +2046,13 @@ async def startup():
     if os.getenv("RAILWAY_ENVIRONMENT"):
         print("[startup] Railway deployment detected - preserving existing database")
         try:
+            # Create tables if they don't exist
             metadata.create_all(engine)
             print("[startup] Database tables created/verified successfully")
-            # Still add missing columns for Railway (safe operation)
+
+            # Ensure all required columns exist (safe operation for existing tables)
             ensure_trade_table_columns()
+            print("[startup] Database schema migration completed")
         except Exception as e:
             print(f"[startup] Error creating/verifying tables: {e}")
     else:
