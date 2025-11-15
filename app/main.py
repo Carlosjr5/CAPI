@@ -2329,8 +2329,49 @@ async def webhook(req: Request):
         )
 
     if event == "SIGNAL":
-        # Just log the signal, no order placement
+        # Decide if we need to log this signal. If a same-side position is
+        # already open, we will ignore the incoming signal to prevent duplicate
+        # entries in the database.
         trade_id = trade_id_from_payload or str(uuid.uuid4())
+        # Attempt to detect an existing open position via Bitget and DB fallback
+        # so signals that are duplicates are ignored even when Bitget snapshots
+        # are missing.
+        current_direction = None
+        current_size = None
+        current_position_data = await fetch_bitget_position(symbol)
+        normalized_position = None
+        if current_position_data:
+            normalized_position = normalize_bitget_position(symbol, current_position_data)
+            if normalized_position and normalized_position.get("size"):
+                sz = safe_float(normalized_position.get("size"))
+                if sz and sz > 0:
+                    side_val = str(normalized_position.get("side") or "").lower()
+                    if side_val in ("long", "buy"):
+                        current_direction = "long"
+                    elif side_val in ("short", "sell"):
+                        current_direction = "short"
+                    current_size = sz
+        # DB fallback when Bitget not available
+        if (not current_direction or not current_size) and not normalized_position:
+            try:
+                existing_trades = await database.fetch_all(
+                    trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol)).order_by(trades.c.created_at.desc())
+                )
+                if existing_trades:
+                    existing_trade = dict(existing_trades[0])
+                    db_signal = str(existing_trade.get("signal") or "").upper()
+                    if db_signal == "LONG":
+                        current_direction = "long"
+                    elif db_signal == "SHORT":
+                        current_direction = "short"
+                    current_size = safe_float(existing_trade.get("size")) or safe_float(existing_trade.get("size_usd")) or current_size
+            except Exception:
+                pass
+        # If duplicate, ignore
+        if current_direction and current_direction == ("long" if signal == "LONG" else "short") and current_size and current_size > 0:
+            await broadcast({"type":"ignored","id":trade_id,"symbol":symbol,"reason":f"Ignored signal: already have {current_direction} open for {symbol}"})
+            return {"ok": False, "id": trade_id, "ignored": True, "detail": "already have open position"}
+        # Otherwise, record the signal
         await database.execute(trades.insert().values(
             id=trade_id,
             signal=signal,
@@ -2395,6 +2436,24 @@ async def webhook(req: Request):
             elif side_val in ("short", "sell"):
                 current_direction = "short"
             current_size = sz
+    # If we couldn't fetch a Bitget position (or Bitget returned no position),
+    # check our DB for any previously 'placed' trades to derive the current direction
+    # so we can properly ignore duplicates when Bitget snapshots are unavailable.
+    if (not current_direction or not current_size) and not normalized_position:
+        try:
+            existing_trades = await database.fetch_all(
+                trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol)).order_by(trades.c.created_at.desc())
+            )
+            if existing_trades:
+                existing_trade = dict(existing_trades[0])
+                db_signal = str(existing_trade.get("signal") or "").upper()
+                if db_signal == "LONG":
+                    current_direction = "long"
+                elif db_signal == "SHORT":
+                    current_direction = "short"
+                current_size = safe_float(existing_trade.get("size")) or safe_float(existing_trade.get("size_usd")) or current_size
+        except Exception:
+            pass
     print(f"[webhook] Current direction: {current_direction}, Current size: {current_size}, Intended direction: {intended_direction}")
 
     # Logic: For webhook alerts, allow opposite positions to be opened (hedge mode)
@@ -2423,6 +2482,24 @@ async def webhook(req: Request):
     # If no current position, just proceed to open the new position
     elif not current_direction or current_size <= 0:
         print(f"[webhook] No current position for {symbol}, proceeding to open {intended_direction}")
+
+    # If an existing same-side position is already open, ignore the incoming
+    # alert and do not persist it to DB. This prevents duplicate 'received'
+    # records showing up from signals that try to open the same direction.
+    if current_direction and current_direction == intended_direction and current_size and current_size > 0:
+        # Broadcast an ignored event so connected clients can show user feedback
+        tmp_id = trade_id_from_payload or str(uuid.uuid4())
+        await broadcast({
+            "type": "ignored",
+            "id": tmp_id,
+            "symbol": symbol,
+            "reason": f"Already have an open {current_direction} position for {symbol}; incoming {intended_direction} ignored",
+        })
+        try:
+            print(f"[webhook] Ignored incoming duplicate {intended_direction} for {symbol} (existing {current_direction})")
+        except Exception:
+            pass
+        return {"ok": False, "id": tmp_id, "ignored": True, "detail": f"Already have an open {current_direction} position for {symbol}."}
 
     # Save incoming alert to DB as pending (use discovered price when available)
     trade_id = trade_id_from_payload or str(uuid.uuid4())

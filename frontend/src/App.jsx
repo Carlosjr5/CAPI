@@ -427,6 +427,31 @@ function App() {
               }
               console.log('[bitget] position data:', data)
               const markCandidate = Number(data.mark_price ?? data.markPrice)
+                            // If a previously found position changed side (e.g., short -> long), close the old trade
+                            try {
+                              const prevSide = (previousEntry?.side || previousEntry?.positionSide || '').toUpperCase()
+                              const newSide = (data.side || data.positionSide || '').toUpperCase()
+                              if (previousEntry && previousEntry.found && prevSide && newSide && prevSide !== newSide) {
+                                // Attempt to close any open trade for this symbol that has the opposite side
+                                const matchingTrade = openTrades.find((t) => normalizeSymbolKey(t.symbol) === normalizedKey && (t.signal || '').toUpperCase() !== newSide)
+                                if (matchingTrade?.id) {
+                                  needsTradeRefresh = true
+                                  try {
+                                    const closeRes = await fetch(buildApiUrl('/bitget/close-position'), {
+                                      method: 'POST',
+                                      headers: authHeaders({ 'Content-Type': 'application/json' }),
+                                      body: JSON.stringify({ trade_id: matchingTrade.id, reason: 'external_close' })
+                                    })
+                                    if (closeRes.ok) {
+                                      console.log(`[bitget] closed position for ${symbol} after side change (${prevSide} -> ${newSide})`)
+                                      try { fetchTrades() } catch (e) {}
+                                    }
+                                  } catch (closeError) {
+                                    console.error(`[bitget] failed to close position for ${symbol}:`, closeError)
+                                  }
+                                }
+                              }
+                            } catch (e) { console.warn('[bitget] side-change reconciliation error', e) }
               if(Number.isFinite(markCandidate)){
                 markOverride = markCandidate
               } else {
@@ -451,7 +476,7 @@ function App() {
                 bitgetDisabledRef.current = true
               } else if(normalizedKey && (failureReason === 'not_found' || failureReason === 'empty')){
                 const previouslyFound = previousEntry?.found !== false && previousEntry !== null && previousEntry !== undefined
-                if(previouslyFound){
+                  if(previouslyFound){
                   // Position was previously found but now missing - mark as closed in our system
                   needsTradeRefresh = true
 
@@ -468,6 +493,8 @@ function App() {
                       })
                       if (closeRes.ok) {
                         console.log(`[bitget] closed position for ${symbol} after Bitget reported it missing`)
+                        // Fetch trades immediately so UI updates to closed state
+                        try { fetchTrades() } catch(e) { /* ignore */ }
                       }
                     } catch (closeError) {
                       console.error(`[bitget] failed to close position for ${symbol}:`, closeError)
@@ -768,7 +795,34 @@ function App() {
       lastClosedTrade: null,
       counts: { open: 0, closed: 0, other: 0, total: 0 }
     }
+    // First pass: determine live open trades by symbol and side so we can
+    // ignore any incoming signals/received alerts that would duplicate them
+    const liveOpenMap = new Map() // normalizedSymbol -> Set of signal sides
+    for (const t of trades){
+      const statusKey = mapStatus(t.status)
+      if (statusKey === 'open'){
+        const key = normalizeSymbolKey(t.symbol)
+        const side = (t.signal || '').toUpperCase()
+        if(!liveOpenMap.has(key)) liveOpenMap.set(key, new Set())
+        liveOpenMap.get(key).add(side)
+      }
+    }
+
     for (const trade of trades){
+      // If this trade is a received/signal alert which would duplicate an
+      // existing open position on the same symbol AND same direction, hide it
+      const tradeStatusKey = mapStatus(trade.status)
+      const isSignalOrReceived = ['signal','received'].includes((trade.status||'').toLowerCase())
+      if (isSignalOrReceived && trade.symbol){
+        const key = normalizeSymbolKey(trade.symbol)
+        const existingSides = liveOpenMap.get(key)
+        const mySide = (trade.signal || '').toUpperCase()
+        if (existingSides && existingSides.has(mySide)){
+          // Skip adding this trade to the UI summary on purpose to avoid
+          // duplicate display of an already open same-side trade
+          continue
+        }
+      }
       const statusKey = mapStatus(trade.status)
       summary.counts[statusKey] = (summary.counts[statusKey] || 0) + 1
       summary.counts.total += 1
@@ -785,6 +839,33 @@ function App() {
   }, [trades])
 
   const { openTrades, latestOpenTrade, lastClosedTrade, counts } = tradeSummary
+
+  // Compute a filtered list of trades that should be displayed in tables and charts
+  // This removes 'received'/'signal' alerts that duplicate an already-open same-side position
+  const displayTrades = useMemo(() => {
+    const openMap = new Map()
+    for (const t of trades){
+      const key = normalizeSymbolKey(t.symbol)
+      if (!key) continue
+      if (mapStatus(t.status) === 'open'){
+        const side = (t.signal || '').toUpperCase()
+        if(!openMap.has(key)) openMap.set(key, new Set())
+        openMap.get(key).add(side)
+      }
+    }
+    return trades.filter(trade => {
+      const s = (trade.status || '').toLowerCase()
+      if (s === 'received' || s === 'signal'){
+        const key = normalizeSymbolKey(trade.symbol)
+        const sides = openMap.get(key)
+        const mySide = (trade.signal || '').toUpperCase()
+        if (sides && sides.has(mySide)){
+          return false
+        }
+      }
+      return true
+    })
+  }, [trades])
   const positionPnL = latestOpenTrade ? calculatePnL(latestOpenTrade) : null
 
   // Calculate total PnL metrics
@@ -1072,7 +1153,7 @@ function App() {
             <div style={{display: 'flex', flexDirection: 'row', gap: '16px', width: '100%'}}>
               <div className="card pnl-chart-card" style={{height: isMobile ? '400px' : '650px', flex: '0 0 calc(50% - 8px)'}}>
                 <div className="chart-body">
-                  <PnlChart trades={trades} currentPrices={currentPrices} bitgetPositions={bitgetPositions} totalPnL={totalPnL} />
+                  <PnlChart trades={displayTrades} currentPrices={currentPrices} bitgetPositions={bitgetPositions} totalPnL={totalPnL} />
                 </div>
               </div>
 
@@ -1100,7 +1181,7 @@ function App() {
                 <div className="graph-body">
                   <TradingViewChart
                     latestOpenTrade={latestOpenTrade}
-                    trades={trades}
+                    trades={displayTrades}
                     symbol={selectedChartSymbol}
                   />
                 </div>
@@ -1112,29 +1193,51 @@ function App() {
                // Create a combined list of trades and Bitget positions
                const combinedPositions = []
 
-               // Add Bitget positions that don't have matching trades
+               // Add Bitget positions (always add snapshot object — we prefer Bitget snapshot as authoritative)
                Object.entries(bitgetPositions).forEach(([key, position]) => {
                  if (!position?.found) return
-
-                 const hasMatchingTrade = openTrades.some(trade =>
-                   normalizeSymbolKey(trade.symbol) === key
-                 )
-
-                 if (!hasMatchingTrade) {
-                   combinedPositions.push({
-                     type: 'bitget-only',
-                     symbol: position.requested_symbol || key,
-                     bitgetPosition: position,
-                     trade: null
-                   })
-                 }
+                 combinedPositions.push({
+                   type: 'bitget-only',
+                   symbol: position.requested_symbol || key,
+                   bitgetPosition: position,
+                   trade: null
+                 })
                })
 
-               // Add trades (both with and without Bitget positions)
-               openTrades.forEach(trade => {
+               // Add trades (both with and without Bitget positions) — deduplicate by symbol and keep the earliest (first) open
+               const latestOpenByKey = {}
+               openTrades.forEach(t => {
+                 const key = normalizeSymbolKey(t.symbol)
+                 if (!key) return
+                 const prev = latestOpenByKey[key]
+                 // Keep the earliest (lowest created_at) trade for the symbol to accept the first alert only
+                 if (!prev || (t.created_at || 0) < (prev.created_at || 0)) {
+                   latestOpenByKey[key] = t
+                 }
+               })
+               Object.values(latestOpenByKey).forEach(trade => {
                  const normalizedKey = normalizeSymbolKey(trade.symbol)
                  const bitgetPosition = bitgetPositions[normalizedKey]
                  const hasSnapshot = bitgetPosition?.found
+                 // If Bitget explicitly reports the position as missing, don't render
+                 // this trade as an open position (the trade likely was closed externally).
+                 if (bitgetPosition && bitgetPosition.found === false) {
+                   return
+                 }
+                // If Bitget snapshot exists, prefer Bitget as authoritative and skip the DB trade so we don't show
+                // duplicates in the UI. Also handle side mismatches by closing the DB trade via reconciliation.
+                if (hasSnapshot && bitgetPosition?.side) {
+                  const bitgetSideUp = (bitgetPosition.side || '').toUpperCase()
+                  const tradeSideUp = (trade.signal || '').toUpperCase()
+                  if (bitgetSideUp === tradeSideUp) {
+                    // Duplicate: Bitget already has same side open — prefer snapshot and skip the DB trade
+                    return
+                  }
+                  if (tradeSideUp && bitgetSideUp !== tradeSideUp) {
+                    // Side mismatch — treat the DB trade as stale and skip it (reconciliation will close it)
+                    return
+                  }
+                }
 
                  combinedPositions.push({
                    type: 'trade',
@@ -1285,7 +1388,7 @@ function App() {
            </div>
 
            <div className="card trade-history-card">
-            <TradeTable items={trades} onRefresh={fetchTrades} calculatePnL={calculatePnL} formatCurrency={formatCurrency} currentPrices={currentPrices} positionMetrics={positionMetrics} bitgetPositions={bitgetPositions} />
+            <TradeTable items={displayTrades} onRefresh={fetchTrades} calculatePnL={calculatePnL} formatCurrency={formatCurrency} currentPrices={currentPrices} positionMetrics={positionMetrics} bitgetPositions={bitgetPositions} />
           </div>
           </section>
   
@@ -1366,7 +1469,12 @@ function App() {
                           try{ parsedResponse = JSON.parse(text) }catch(error){ parsedResponse = { raw_response: text } }
                           try{ pushEvent(`[place-test] status=${res.status} resp=${JSON.stringify(parsedResponse)}`) }catch(error){ console.log(error) }
                           setLastOrderResult({ status: res.status, body: parsedResponse })
-                          if(res.ok){ fetchTrades() }
+                          if (res.ok) {
+                            fetchTrades()
+                          } else if (res.status === 400 && parsedResponse && (parsedResponse.detail || '').toString().toLowerCase().includes('already have an open')) {
+                            // Inform the user via events feed that this test was ignored
+                            pushEvent(`[place-test] ignored duplicate ${formSide} for ${formSymbol}: ${parsedResponse.detail}`)
+                          }
                         }catch(error){ pushEvent(`[place-test] error ${error.message || error}`) }
                         finally {
                           setPlacing(false)
