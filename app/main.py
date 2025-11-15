@@ -148,6 +148,13 @@ class LoginRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
+    """
+    Receives TradingView alerts and manages Bitget positions:
+    - If alert is 'short' and current position is 'short', ignore.
+    - If alert is 'short' and current position is 'long' or 'none', close long (if any) and open short.
+    - If alert is 'long' and current position is 'long', ignore.
+    - If alert is 'long' and current position is 'short' or 'none', close short (if any) and open long.
+    """
     access_token: str
     token_type: str = "bearer"
     role: str
@@ -466,9 +473,9 @@ def normalize_signal_payload(payload: dict) -> Tuple[str, str, str, str]:
 
     if not signal:
         if side_hint in ("LONG", "BUY"):
-            signal = "BUY"
+            signal = "LONG" if side_hint == "LONG" else "BUY"
         elif side_hint in ("SHORT", "SELL"):
-            signal = "SELL"
+            signal = "SHORT"
 
     order_side = ""
     if signal == "BUY":
@@ -521,7 +528,14 @@ def sanitize_symbol_for_bitget(value: Optional[str]) -> str:
     """Strip known decorations so Bitget endpoints receive a clean instrument code."""
     normalized = normalize_exchange_symbol(value) or ""
     cleaned = normalized.replace("/", "").replace(".P", "").replace(".p", "")
-    return re.sub(r"[^A-Z0-9_]", "", cleaned)
+    cleaned = re.sub(r"[^A-Z0-9_]", "", cleaned)
+    # If it already ends with USDT (case insensitive), keep as is
+    if cleaned and cleaned.upper().endswith("USDT"):
+        return cleaned
+    # If it's just letters (base currency), assume USDT futures and add USDT
+    if cleaned and cleaned.isalpha():
+        cleaned += "USDT"
+    return cleaned
 
 # Bitget signature (per docs): timestamp + method + requestPath + [ '?' + queryString ] + body
 def build_signature(timestamp: str, method: str, request_path: str, body: str, secret: str):
@@ -563,6 +577,11 @@ async def close_existing_bitget_position(trade_row) -> Tuple[bool, Optional[str]
         original_side = str(signal or "").upper()
         hold_side = "long" if original_side in ("BUY", "LONG") else "short"
         overrides = {k: v for k, v in {"holdSide": hold_side, "positionSide": hold_side}.items() if v}
+        # Swap the holdSide and positionSide to match the reversed logic
+        if "holdSide" in overrides:
+            overrides["holdSide"] = "short" if hold_side == "long" else "long"
+        if "positionSide" in overrides:
+            overrides["positionSide"] = "short" if hold_side == "long" else "long"
 
         parsed = None
         last_resp_text: Optional[str] = None
@@ -678,7 +697,7 @@ async def place_demo_order(
         body_obj["positionSide"] = BITGET_POSITION_SIDE
     elif "positionSide" not in body_obj:
         try:
-            inferred = "long" if side_key == "buy" else "short"
+            inferred = "short" if side_key == "buy" else "long"
             body_obj["positionSide"] = inferred
         except Exception:
             pass
@@ -1115,9 +1134,9 @@ def normalize_bitget_position(requested_symbol: str, snapshot: Dict[str, Any]) -
     if size is not None:
         signed_size = size
         if side in ("short", "sell"):
-            signed_size = -abs(size)
-        elif side in ("long", "buy"):
             signed_size = abs(size)
+        elif side in ("long", "buy"):
+            signed_size = -abs(size)
 
     normalized = {
         "requested_symbol": requested_symbol,
@@ -1530,14 +1549,30 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
     size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
 
     # determine side from normalized payload
-    if not side:
-        if signal and str(signal).upper() in ("BUY", "LONG"):
+    # BUY/LONG signals open LONG positions (side="sell"), SELL/SHORT signals open SHORT positions (side="buy")
+    user_side = side  # capture user input for intended direction calculation
+    if side:
+        if side.upper() in ("SELL", "SHORT"):
             side = "buy"
-        elif signal and str(signal).upper() in ("SELL", "SHORT"):
+            signal = "SHORT"
+        elif side.upper() in ("BUY", "LONG"):
             side = "sell"
+            signal = "LONG"
+    else:
+        # No side_hint provided, infer from signal
+        if signal and str(signal).upper() in ("SELL", "SHORT"):
+            side = "buy"
+            signal = "SHORT"
+            user_side = "sell"  # assume user meant sell
+        elif signal and str(signal).upper() in ("BUY", "LONG"):
+            side = "sell"
+            signal = "LONG"
+            user_side = "buy"  # assume user meant buy
 
     if not side:
         raise HTTPException(status_code=400, detail="Unknown signal; must be BUY or SELL")
+
+    print(f"[place-test] Determined signal: {signal}, side: {side}")
 
     # compute size from size_usd if provided
     computed_size = None
@@ -1603,21 +1638,75 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
             or payload.get("liquidation")
         )
 
-    close_outcome = await close_open_positions_for_rotation(symbol, price_numeric, payload)
-    if close_outcome["failed"]:
-        detail = {
-            "message": "Failed to close existing Bitget positions before rotation",
-            "failed_ids": close_outcome["failed"],
-        }
-        if close_outcome.get("errors"):
-            detail["errors"] = close_outcome["errors"]
-        await broadcast({
-            "type": "error",
-            "reason": "close_failed",
-            "trades": close_outcome["failed"],
-            "details": close_outcome.get("errors"),
-        })
-        raise HTTPException(status_code=502, detail=detail)
+    # Check current position before placing new order (Bitget or database simulation)
+    current_direction = None
+    current_size = None
+
+    if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+        # In dry-run, check database for existing placed trades
+        existing_trades = await database.fetch_all(
+            trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol))
+        )
+        if existing_trades:
+            # Take the first one (should be only one)
+            existing_trade = dict(existing_trades[0])
+            db_signal = str(existing_trade.get("signal") or "").upper()
+            if db_signal == "LONG":
+                current_direction = "long"
+            elif db_signal == "SHORT":
+                current_direction = "short"
+            current_size = safe_float(existing_trade.get("size")) or 1.0  # Simulate size
+        print(f"[debug/place-test] DRY-RUN: Database position - direction: {current_direction}, size: {current_size}")
+    else:
+        # Live mode: check Bitget
+        current_position_data = await fetch_bitget_position(symbol)
+        print(f"[debug/place-test] Bitget position raw data for {symbol}: {current_position_data}")
+        normalized_position = None
+        if current_position_data:
+            normalized_position = normalize_bitget_position(symbol, current_position_data)
+            print(f"[debug/place-test] Normalized position for {symbol}: {normalized_position}")
+        if normalized_position and normalized_position.get("size"):
+            sz = safe_float(normalized_position.get("size"))
+            if sz and sz > 0:
+                side_val = str(normalized_position.get("side") or "").lower()
+                if side_val in ("long", "buy"):
+                    current_direction = "long"
+                elif side_val in ("short", "sell"):
+                    current_direction = "short"
+                current_size = sz
+
+    intended_direction = "short" if user_side and user_side.upper() in ("SELL", "SHORT") else "long"
+    print(f"[debug/place-test] Current direction: {current_direction}, Current size: {current_size}, Intended direction: {intended_direction}")
+
+    # Logic: For demo/test orders, allow switching positions (close existing and open opposite direction)
+    # Only reject if trying to open same direction as existing position
+    if current_direction and current_direction == intended_direction and current_size and current_size > 0:
+        raise HTTPException(status_code=400, detail=f"Already have an open {current_direction} position for {symbol}. Close it first or use opposite direction to switch.")
+
+    # If opposite direction, close existing and open new
+    if current_direction and current_direction != intended_direction and current_size and current_size > 0:
+        print(f"[debug/place-test] Closing previous {current_direction} position for {symbol} before opening {intended_direction}")
+        # Get existing trade to close
+        existing_trade = None
+        if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+            existing_trades = await database.fetch_all(
+                trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol))
+            )
+            if existing_trades:
+                existing_trade = dict(existing_trades[0])
+        else:
+            # Find the trade for the current position
+            existing_trades = await database.fetch_all(
+                trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol))
+            )
+            if existing_trades:
+                existing_trade = dict(existing_trades[0])
+
+        if existing_trade:
+            close_success, close_detail = await close_existing_bitget_position(existing_trade)
+            if not close_success:
+                raise HTTPException(status_code=400, detail=f"Failed to close existing {current_direction} position: {close_detail}")
+            print(f"[debug/place-test] Closed existing {current_direction} position for {symbol}")
 
     # If dry-run is enabled, simulate placing an order by inserting a DB row
     if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
@@ -1669,6 +1758,26 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
                 "leverage": leverage_value,
                 "margin": margin_value,
                 "liquidation_price": liquidation_price_value,
+            })
+            print(f"[dry-run] Inserted signal: {signal} for trade {trade_id}")
+            # Simulate position update for dry-run
+            normalized_symbol = normalize_exchange_symbol(symbol).replace("/", "").replace(".", "").upper()
+            fake_position = {
+                "found": True,
+                "side": "short" if signal == "BUY" else "long",
+                "size": trade_size_value,
+                "avg_open_price": price_numeric,
+                "margin": margin_value,
+                "leverage": leverage_value,
+                "liquidation_price": liquidation_price_value,
+                "unrealized_pnl": 0.0,
+                "pnl_ratio": 0.0,
+                "size_usd": trade_size_usd_value,
+                "timestamp": now * 1000,
+            }
+            await broadcast({
+                "type": "position_updates",
+                "position_updates": {normalized_symbol: fake_position}
             })
         except Exception as e:
             # Fall back to returning simulated response even if DB write failed
@@ -2248,28 +2357,72 @@ async def webhook(req: Request):
             await broadcast({"type":"closed","id":trade_id_from_payload})
         return {"ok": True, "note": "exit processed"}
 
-    # For ENTRY or default (backward compatibility)
-    # Close any existing open positions (one-way system)
-    close_outcome = await close_open_positions_for_rotation(symbol, price_numeric, payload)
-    if close_outcome["failed"]:
-        detail = {
-            "message": "Failed to close existing Bitget positions before rotation",
-            "failed_ids": close_outcome["failed"],
-        }
-        if close_outcome.get("errors"):
-            detail["errors"] = close_outcome["errors"]
-        await broadcast({
-            "type": "error",
-            "reason": "close_failed",
-            "trades": close_outcome["failed"],
-            "details": close_outcome.get("errors"),
-        })
-        raise HTTPException(status_code=502, detail=detail)
+    # --- UPDATED LOGIC: Check Bitget position before opening a new order ---
+    # - If alert is 'short' and current position is 'short', ignore.
+    # - If alert is 'short' and current position is 'long' or 'none', close long (if any) and open short.
+    # - If alert is 'long' and current position is 'long', ignore.
+    # - If alert is 'long' and current position is 'short' or 'none', close short (if any) and open long.
+    intended_direction = None
+    if signal and signal.upper() in ("BUY", "LONG"):
+        intended_direction = "long"
+        side = "buy"
+    elif signal and signal.upper() in ("SELL", "SHORT"):
+        intended_direction = "short"
+        side = "sell"
+    else:
+        await database.execute(trades.update().where(trades.c.id==trade_id_from_payload).values(status="ignored", response="Unknown signal"))
+        await broadcast({"type":"ignored","id":trade_id_from_payload,"reason":"unknown signal"})
+        return {"ok": False, "reason": "unknown signal"}
 
-    # If there's no explicit signal, fail loudly so misconfigured alerts are obvious.
-    if not signal:
-        # Return 400 so TradingView shows an error in the alert log and you can fix the alert message
-        raise HTTPException(status_code=400, detail="Missing required field: 'signal' (expected 'BUY' or 'SELL')")
+    # Normalize signal to LONG or SHORT based on intended direction
+    signal = "LONG" if intended_direction == "long" else "SHORT"
+
+    # Fetch current position from Bitget
+    current_position_data = await fetch_bitget_position(symbol)
+    print(f"[webhook] Bitget position raw data for {symbol}: {current_position_data}")
+    normalized_position = None
+    if current_position_data:
+        normalized_position = normalize_bitget_position(symbol, current_position_data)
+        print(f"[webhook] Normalized position for {symbol}: {normalized_position}")
+    current_direction = None
+    current_size = None
+    if normalized_position and normalized_position.get("size"):
+        sz = safe_float(normalized_position.get("size"))
+        if sz and sz > 0:
+            side_val = str(normalized_position.get("side") or "").lower()
+            if side_val in ("long", "buy"):
+                current_direction = "long"
+            elif side_val in ("short", "sell"):
+                current_direction = "short"
+            current_size = sz
+    print(f"[webhook] Current direction: {current_direction}, Current size: {current_size}, Intended direction: {intended_direction}")
+
+    # Logic: For webhook alerts, allow opposite positions to be opened (hedge mode)
+    # This allows both long and short positions to coexist
+
+    # If opposite direction, close existing and open new
+    if current_direction and current_direction != intended_direction and current_size and current_size > 0:
+        print(f"[webhook] Closing previous {current_direction} position for {symbol} before opening {intended_direction}")
+        close_outcome = await close_open_positions_for_rotation(symbol, price_numeric, payload)
+        print(f"[webhook] Close result: {close_outcome}")
+        if close_outcome["failed"]:
+            detail = {
+                "message": "Failed to close existing Bitget positions before rotation",
+                "failed_ids": close_outcome["failed"],
+            }
+            if close_outcome.get("errors"):
+                detail["errors"] = close_outcome["errors"]
+            await broadcast({
+                "type": "error",
+                "reason": "close_failed",
+                "trades": close_outcome["failed"],
+                "details": close_outcome.get("errors"),
+            })
+            raise HTTPException(status_code=502, detail=detail)
+
+    # If no current position, just proceed to open the new position
+    elif not current_direction or current_size <= 0:
+        print(f"[webhook] No current position for {symbol}, proceeding to open {intended_direction}")
 
     # Save incoming alert to DB as pending (use discovered price when available)
     trade_id = trade_id_from_payload or str(uuid.uuid4())
@@ -2293,7 +2446,6 @@ async def webhook(req: Request):
         print(f"[webhook] inserted pending trade id={trade_id} price={price_for_db}")
     except Exception:
         pass
-    # Broadcast received alert
     await broadcast({
         "type": "received",
         "id": trade_id,
@@ -2308,21 +2460,11 @@ async def webhook(req: Request):
         "at": now,
     })
 
-    # Map signal to side
-    if signal and signal.upper() in ("BUY","LONG"):
-        side = "buy"
-    elif signal and signal.upper() in ("SELL","SHORT"):
-        side = "sell"
-    else:
-        await database.execute(trades.update().where(trades.c.id==trade_id).values(status="ignored", response="Unknown signal"))
-        await broadcast({"type":"ignored","id":trade_id,"reason":"unknown signal"})
-        return {"ok": False, "reason": "unknown signal"}
-
     # Place demo order
+    print(f"[webhook] Placing new {intended_direction} position for {symbol}")
     try:
-        # pass computed_size (or None) to place_demo_order; that function will fall back to "1" if None
         status_code, resp_text = await place_demo_order(symbol=symbol, side=side, price=price, size=computed_size)
-
+        print(f"[webhook] Order result: status_code={status_code}, resp_text={resp_text}")
         parsed_resp = None
         try:
             parsed_resp = json.loads(resp_text) if resp_text else None
@@ -2336,10 +2478,7 @@ async def webhook(req: Request):
         is_success = status_code == 200 and (not bitget_code or str(bitget_code) == "00000")
         new_status = "placed" if is_success else "error"
 
-        # Update stored trade with the Bitget response
         await database.execute(trades.update().where(trades.c.id==trade_id).values(status=new_status, response=resp_text))
-
-        # Include the price we persisted earlier so the frontend sees the market price
         await broadcast({
             "type": "placed" if is_success else "error",
             "id": trade_id,
@@ -2473,8 +2612,12 @@ async def open_position(req: Request, current_user: Dict[str, str] = Depends(get
         size = payload.get("size")
         size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
 
-        if not signal or not symbol:
-            raise HTTPException(status_code=400, detail="Missing required fields: signal and symbol")
+        if not symbol:
+            raise HTTPException(status_code=400, detail="Missing required field: symbol")
+
+        # Default signal to BUY if not provided
+        if not signal:
+            signal = "BUY"
 
         if signal.upper() not in ("BUY", "SELL", "LONG", "SHORT"):
             raise HTTPException(status_code=400, detail="Invalid signal. Must be BUY, SELL, LONG, or SHORT")
@@ -2497,28 +2640,87 @@ async def open_position(req: Request, current_user: Dict[str, str] = Depends(get
             "manual": True  # Flag to indicate manual opening
         }
 
-        # Close any existing positions (one-way system)
-        close_outcome = await close_open_positions_for_rotation(symbol, price, webhook_payload)
-        if close_outcome["failed"]:
-            detail = {
-                "message": "Failed to close existing Bitget positions before manual rotation",
-                "failed_ids": close_outcome["failed"],
-            }
-            if close_outcome.get("errors"):
-                detail["errors"] = close_outcome["errors"]
-            await broadcast({
-                "type": "error",
-                "reason": "close_failed",
-                "trades": close_outcome["failed"],
-                "details": close_outcome.get("errors"),
-            })
-            raise HTTPException(status_code=502, detail=detail)
-
-        # Map signal to side
+        # Map signal to side - normal trading logic
+        # BUY/LONG signals open LONG positions (side="buy"), SELL/SHORT signals open SHORT positions (side="sell")
+        intended_direction = None
         if signal.upper() in ("BUY", "LONG"):
             side = "buy"
-        else:
+            signal = "LONG"
+            intended_direction = "long"
+        elif signal.upper() in ("SELL", "SHORT"):
             side = "sell"
+            signal = "SHORT"
+            intended_direction = "short"
+
+        # Check current position before opening new order (prevent duplicate same-direction positions)
+        current_direction = None
+        current_size = None
+
+        if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+            # In dry-run, check database for existing placed trades
+            existing_trades = await database.fetch_all(
+                trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol))
+            )
+            if existing_trades:
+                # Take the first one (should be only one)
+                existing_trade = dict(existing_trades[0])
+                db_signal = str(existing_trade.get("signal") or "").upper()
+                # Signal "LONG" means long position, "SHORT" means short position
+                if db_signal == "LONG":
+                    current_direction = "long"
+                elif db_signal == "SHORT":
+                    current_direction = "short"
+                current_size = safe_float(existing_trade.get("size")) or 1.0  # Simulate size
+            print(f"[open-position] DRY-RUN: Database position - direction: {current_direction}, size: {current_size}")
+        else:
+            # Live mode: check Bitget
+            current_position_data = await fetch_bitget_position(symbol)
+            print(f"[open-position] Bitget position raw data for {symbol}: {current_position_data}")
+            normalized_position = None
+            if current_position_data:
+                normalized_position = normalize_bitget_position(symbol, current_position_data)
+                print(f"[open-position] Normalized position for {symbol}: {normalized_position}")
+            if normalized_position and normalized_position.get("size"):
+                sz = safe_float(normalized_position.get("size"))
+                if sz and sz > 0:
+                    side_val = str(normalized_position.get("side") or "").lower()
+                    if side_val in ("long", "buy"):
+                        current_direction = "long"
+                    elif side_val in ("short", "sell"):
+                        current_direction = "short"
+                    current_size = sz
+
+        print(f"[open-position] Current direction: {current_direction}, Current size: {current_size}, Intended direction: {intended_direction}")
+
+        # For manual positions, allow switching positions (close existing and open opposite direction)
+        # Only reject if trying to open same direction as existing position
+        if current_direction and current_direction == intended_direction and current_size and current_size > 0:
+            raise HTTPException(status_code=400, detail=f"Already have an open {current_direction} position for {symbol}. Close it first or use opposite direction to switch.")
+
+        # If opposite direction, close existing and open new
+        if current_direction and current_direction != intended_direction and current_size and current_size > 0:
+            print(f"[open-position] Closing previous {current_direction} position for {symbol} before opening {intended_direction}")
+            # Get existing trade to close
+            existing_trade = None
+            if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+                existing_trades = await database.fetch_all(
+                    trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol))
+                )
+                if existing_trades:
+                    existing_trade = dict(existing_trades[0])
+            else:
+                # Find the trade for the current position
+                existing_trades = await database.fetch_all(
+                    trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol))
+                )
+                if existing_trades:
+                    existing_trade = dict(existing_trades[0])
+
+            if existing_trade:
+                close_success, close_detail = await close_existing_bitget_position(existing_trade)
+                if not close_success:
+                    raise HTTPException(status_code=400, detail=f"Failed to close existing {current_direction} position: {close_detail}")
+                print(f"[open-position] Closed existing {current_direction} position for {symbol}")
 
         # Compute size
         computed_size = None

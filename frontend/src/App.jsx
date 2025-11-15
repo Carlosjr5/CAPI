@@ -165,6 +165,13 @@ function App() {
     return { value: formatted, className: colorClass }
   }, [])
 
+  const formatCurrencyWithSign = useCallback((value) => {
+    const num = Number(value)
+    if (!Number.isFinite(num)) return EM_DASH
+    const sign = num > 0 ? '+' : num < 0 ? '-' : ''
+    return `${sign}~${currencyFormatter.format(Math.abs(num))}`
+  }, [])
+
   const formatUsdt = useCallback((value) => {
     const num = Number(value)
     return Number.isFinite(num) ? `${usdtFormatter.format(num)} USDT` : EM_DASH
@@ -561,7 +568,15 @@ function App() {
     const statusKey = mapStatus(trade.status)
     const entryPrice = Number(trade.price)
     let sizeValue = Number(trade.size)
-    const multiplier = trade.signal?.toUpperCase() === 'BUY' ? 1 : -1
+    // Ensure size value uses absolute magnitude only - direction is handled via `multiplier`.
+    if (Number.isFinite(sizeValue)) {
+      sizeValue = Math.abs(sizeValue)
+    }
+    // Determine the directional multiplier based on the trade signal.
+    // Keep this consistent with the logic used in `PnlChart` to avoid sign
+    // mismatches across the UI. BUY/LONG = 1, SELL/SHORT = -1.
+    const upperSignal = trade.signal?.toUpperCase();
+    const multiplier = (upperSignal === 'BUY' || upperSignal === 'LONG') ? 1 : (upperSignal === 'SELL' || upperSignal === 'SHORT') ? -1 : 1
 
     if(!Number.isFinite(sizeValue)){
       const sizeUsd = Number(trade.size_usd ?? trade.sizeUsd)
@@ -577,14 +592,16 @@ function App() {
       }
       const exitPrice = Number(trade.exit_price ?? trade.exitPrice)
       if(Number.isFinite(exitPrice) && Number.isFinite(entryPrice) && Number.isFinite(sizeValue)){
-        return (exitPrice - entryPrice) * sizeValue * multiplier
+        const r = (exitPrice - entryPrice) * sizeValue * multiplier
+        return Number.isFinite(r) ? r : null
       }
       return null
     }
 
     const currentPrice = Number(prices[trade.symbol])
     if(!Number.isFinite(currentPrice) || !Number.isFinite(entryPrice) || !Number.isFinite(sizeValue)) return null
-    return (currentPrice - entryPrice) * sizeValue * multiplier
+    const openR = (currentPrice - entryPrice) * sizeValue * multiplier
+    return Number.isFinite(openR) ? openR : null
   }
 
   function mapStatus(s){
@@ -774,13 +791,13 @@ function App() {
   const totalUnrealizedPnL = trades
     .filter(t => mapStatus(t.status) === 'open')
     .map(t => calculatePnL(t))
-    .filter(pnl => pnl !== null)
+    .filter(pnl => Number.isFinite(Number(pnl)))
     .reduce((sum, pnl) => sum + pnl, 0)
 
   const totalRealizedPnL = trades
     .filter(t => mapStatus(t.status) === 'closed')
     .map(t => calculatePnL(t))
-    .filter(pnl => pnl !== null)
+    .filter(pnl => Number.isFinite(Number(pnl)))
     .reduce((sum, pnl) => sum + pnl, 0)
 
   const totalPnL = totalUnrealizedPnL + totalRealizedPnL
@@ -903,7 +920,7 @@ function App() {
       sizeUsdDisplay,
       pnlDisplay,
       sideDisplay: `${(latestOpenTrade.signal || '').toUpperCase()} ${baseSymbol}`,
-      sideTone: latestOpenTrade.signal?.toUpperCase() === 'BUY' ? 'long' : 'short',
+      sideTone: (latestOpenTrade.signal?.toUpperCase() === 'BUY' || latestOpenTrade.signal?.toUpperCase() === 'LONG') ? 'long' : 'short',
       pnlTone: positionPnL > 0 ? 'positive' : positionPnL < 0 ? 'negative' : 'neutral'
     }
   }, [latestOpenTrade, positionMetrics, formatNumber, formatCurrency, positionPnL])
@@ -1029,23 +1046,23 @@ function App() {
                   <span className="label">Total Unrealized</span>
                   <span className="value">
                     <span className={totalUnrealizedPnL > 0 ? 'positive' : totalUnrealizedPnL < 0 ? 'negative' : 'neutral'}>
-                      {formatCurrency(Math.abs(totalUnrealizedPnL))}
+                      {formatCurrencyWithSign(totalUnrealizedPnL)}
                     </span>
                   </span>
                 </div>
                 <div className="pnl-block">
                   <span className="label">Total Realized</span>
                   <span className="value">
-                    <span className={totalRealizedPnL > 0 ? 'positive' : totalRealizedPnL < 0 ? 'negative' : 'neutral'}>
-                      {formatCurrency(Math.abs(totalRealizedPnL))}
+                        <span className={totalRealizedPnL > 0 ? 'positive' : totalRealizedPnL < 0 ? 'negative' : 'neutral'}>
+                          {formatCurrencyWithSign(totalRealizedPnL)}
                     </span>
                   </span>
                 </div>
                 <div className="pnl-block">
                   <span className="label">Total P&L</span>
                   <span className="value">
-                    <span className={totalPnL > 0 ? 'positive' : totalPnL < 0 ? 'negative' : 'neutral'}>
-                      {formatCurrency(Math.abs(totalPnL))}
+                        <span className={totalPnL > 0 ? 'positive' : totalPnL < 0 ? 'negative' : 'neutral'}>
+                          {formatCurrencyWithSign(totalPnL)}
                     </span>
                   </span>
                 </div>
@@ -1055,7 +1072,7 @@ function App() {
             <div style={{display: 'flex', flexDirection: 'row', gap: '16px', width: '100%'}}>
               <div className="card pnl-chart-card" style={{height: isMobile ? '400px' : '650px', flex: '0 0 calc(50% - 8px)'}}>
                 <div className="chart-body">
-                  <PnlChart trades={trades} currentPrices={currentPrices} bitgetPositions={bitgetPositions} />
+                  <PnlChart trades={trades} currentPrices={currentPrices} bitgetPositions={bitgetPositions} totalPnL={totalPnL} />
                 </div>
               </div>
 
@@ -1162,7 +1179,7 @@ function App() {
                    <div key={tradeId} className="card current-position-card">
                      <div className="position-content">
                        <div className="position-hero" style={{ textAlign: 'center', padding: isMobile ? '8px 6px' : '12px 10px' }}>
-                         <div className={`side-badge badge-${bitgetSide === 'LONG' ? 'long' : bitgetSide === 'SHORT' ? 'short' : (trade?.signal || '').toUpperCase() === 'BUY' ? 'long' : 'short'}`} style={{ margin: isMobile ? '0 auto 12px auto' : '0 auto 20px auto', display: 'block', fontSize: isMobile ? '10px' : '12px', padding: isMobile ? '2px 6px' : '4px 8px' }}>
+                         <div className={`side-badge badge-${bitgetSide === 'LONG' ? 'long' : bitgetSide === 'SHORT' ? 'short' : (trade?.signal || '').toUpperCase() === 'LONG' ? 'long' : (trade?.signal || '').toUpperCase() === 'SHORT' ? 'short' : 'long'}`} style={{ margin: isMobile ? '0 auto 12px auto' : '0 auto 20px auto', display: 'block', fontSize: isMobile ? '10px' : '12px', padding: isMobile ? '2px 6px' : '4px 8px' }}>
                            {bitgetSide || (trade?.signal || '').toUpperCase()}
                          </div>
                          <div className="hero-stats" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>

@@ -66,6 +66,7 @@ function plotTradeSignals(chart, trades) {
     const timestamp = trade.created_at * 1000 // Convert to milliseconds
     const price = parseFloat(trade.price)
     const signal = trade.signal.toUpperCase()
+    const isBuy = signal === 'BUY' || signal === 'LONG'
 
     if (isNaN(timestamp) || isNaN(price)) {
       console.log('[TradingView] Skipping trade - invalid timestamp/price:', trade?.id, timestamp, price)
@@ -76,10 +77,10 @@ function plotTradeSignals(chart, trades) {
       // Create a marker for each trade - adjust shape based on signal
       const marker = {
         time: timestamp / 1000, // TradingView expects seconds, not milliseconds
-        position: signal === 'BUY' ? 'belowBar' : 'aboveBar',
-        color: signal === 'BUY' ? '#4ade80' : '#f87171', // Green for BUY, Red for SELL
-        shape: signal === 'BUY' ? 'arrowUp' : 'arrowDown', // Arrow up for BUY, down for SELL
-        text: signal === 'BUY' ? 'LONG' : 'SHORT', // Show LONG/SHORT instead of BUY/SELL
+        position: isBuy ? 'belowBar' : 'aboveBar',
+        color: isBuy ? '#4ade80' : '#f87171', // Green for BUY/LONG, Red for SELL/SHORT
+        shape: isBuy ? 'arrowUp' : 'arrowDown', // Arrow up for BUY/LONG, down for SELL/SHORT
+        text: isBuy ? 'LONG' : 'SHORT', // Show LONG/SHORT instead of BUY/SELL
         size: 1, // Smaller size as requested
         id: `trade-signal-${trade.id}`
       }

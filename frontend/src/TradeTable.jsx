@@ -13,6 +13,14 @@ function getStatusClass(s){
   return ''
 }
 
+function getDisplaySignal(signal) {
+  if (!signal) return signal;
+  const upper = signal.toUpperCase();
+  if (upper === 'LONG') return 'LONG';
+  if (upper === 'SHORT') return 'SHORT';
+  return signal;
+}
+
 function calculateROE(it, pnlValue, currentPrices, bitgetPositions) {
   // ROE comes directly from Bitget position data - no calculations
   const normalizedKey = (it.symbol || '').replace(/[^A-Z0-9]/gi, '').toUpperCase()
@@ -88,7 +96,11 @@ export default function TradeTable({items, onRefresh, calculatePnL, formatCurren
                     <strong>{it.symbol}</strong>
                     <div className="muted id">{it.id?.slice(0,10)}</div>
                   </td>
-                  <td data-label="Signal">{it.signal}</td>
+                  <td data-label="Signal">
+                    <span className={`signal-tag ${it.signal?.toUpperCase() === 'LONG' ? 'signal-long' : it.signal?.toUpperCase() === 'SHORT' ? 'signal-short' : ''}`}>
+                      {getDisplaySignal(it.signal)}
+                    </span>
+                  </td>
                   <td data-label="Price">{it.price!=null? Number(it.price).toFixed(2):'-'}</td>
                   <td data-label="Size (USD)">{it.size_usd!=null? formatCurrency(it.size_usd):'-'}</td>
                   <td className={pnlClass} data-label="PnL">

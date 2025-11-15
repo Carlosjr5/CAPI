@@ -397,5 +397,43 @@ button:disabled{opacity:0.6;cursor:not-allowed;filter:none;transform:none}
   border: 1px solid rgba(255, 255, 255, 0.5);
   transform: translateY(-1px);
 }
+/* Signal tag colors for LONG/SHORT */
+.signal-tag {
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 50px;
+}
+
+.signal-long {
+  background: rgba(34, 197, 94, 0.2);
+  color: #bbf7d0;
+  border: 1px solid rgba(34, 197, 94, 0.45);
+}
+
+.signal-short {
+  background: rgba(248, 113, 113, 0.2);
+  color: #fecaca;
+  border: 1px solid rgba(248, 113, 113, 0.45);
+}
+
+/* Current positions LONG/SHORT tag colors */
+.badge-long {
+  background: rgba(34, 197, 94, 0.22);
+  color: #bbf7d0;
+  border: 1px solid rgba(34, 197, 94, 0.45);
+}
+
+.badge-short {
+  background: rgba(248, 113, 113, 0.22);
+  color: #fecaca;
+  border: 1px solid rgba(248, 113, 113, 0.45);
+}
 
 .dashboard-secondary .positions-grid{display:none}

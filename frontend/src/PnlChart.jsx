@@ -1,29 +1,31 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 
-const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
-   const [selectedInterval, setSelectedInterval] = useState('live');
-   const [liveData, setLiveData] = useState([]);
-   const [tick, setTick] = useState(0);
-   const [chartHeight, setChartHeight] = useState(250);
-   const [chartWidth, setChartWidth] = useState(400);
-   const [isMobile, setIsMobile] = useState(false);
-   const chartRef = useRef();
+const PnlChart = ({ trades = [], currentPrices = {}, bitgetPositions = {}, totalPnL }) => {
+  const [selectedInterval, setSelectedInterval] = useState('1MIN');
+  const [tick, setTick] = useState(0);
+  const [chartHeight, setChartHeight] = useState(250);
+  const [chartWidth, setChartWidth] = useState(400);
+  const [zoomLevel, setZoomLevel] = useState(1); // 1 = default, >1 = zoomed in, <1 = zoomed out
+  const [isMobile, setIsMobile] = useState(false);
+  // Tooltip state: index of the active dot, or null
+  const [activeTooltipIndex, setActiveTooltipIndex] = useState(null);
+  const chartRef = useRef();
 
-   useEffect(() => {
-     const interval = setInterval(() => setTick(t => t + 1), 1000);
-     return () => clearInterval(interval);
-   }, []);
+  useEffect(() => {
+    const interval = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(interval);
+  }, []);
 
-   useEffect(() => {
+  useEffect(() => {
      const updateDimensions = () => {
        if (chartRef.current) {
          const height = chartRef.current.clientHeight;
          const width = chartRef.current.clientWidth;
          setIsMobile(window.innerWidth < 768);
-         const marginX = isMobile ? 60 : 80;
+         const marginX = isMobile ? 85 : 105; // Y-axis label width + padding
          const marginY = isMobile ? 40 : 50;
          if (height > 0) setChartHeight(height - marginY);
-         if (width > 0) setChartWidth(width - marginX);
+         if (width > 0) setChartWidth((width - marginX) * zoomLevel);
        }
      };
      updateDimensions();
@@ -32,7 +34,6 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
    }, [isMobile]);
 
   const intervals = [
-    { key: 'live', label: 'LIVE' },
     { key: '1MIN', label: '1M' },
     { key: '15MIN', label: '15M' },
     { key: '30MIN', label: '30M' },
@@ -42,17 +43,41 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
     { key: '1M', label: '1M' }
   ];
 
-  const mapStatus = (s) => {
-    if (!s) return 'other';
-    const v = s.toLowerCase();
-    if (v === 'placed') return 'open';
-    if (v.includes('filled') || v.includes('closed') || v.includes('rejected') || v.includes('error') || v.includes('ignored') || v === 'signal') return 'closed';
+  const mapStatus = (status) => {
+    if (!status) return 'other';
+    const statusValue = status.toLowerCase();
+    if (statusValue === 'placed') return 'open';
+    if (
+      statusValue.includes('filled') ||
+      statusValue.includes('closed') ||
+      statusValue.includes('rejected') ||
+      statusValue.includes('error') ||
+      statusValue.includes('ignored') ||
+      statusValue === 'signal'
+    )
+      return 'closed';
     return 'other';
+  };
+
+  // Helper function to get the direction multiplier for a trade
+  const getTradeMultiplier = (signal) => {
+    if (!signal) return 1; // Default to positive for unknown signals
+    const upperSignal = signal.toUpperCase();
+    // Positive multiplier for BUY/LONG positions (profit when price goes up)
+    if (upperSignal === 'BUY' || upperSignal === 'LONG') {
+      return 1;
+    }
+    // Negative multiplier for SELL/SHORT positions (profit when price goes down)
+    if (upperSignal === 'SELL' || upperSignal === 'SHORT') {
+      return -1;
+    }
+    return 1; // Default to positive for unknown signals
   };
 
   // Helper function to calculate P&L for a trade
   const calculateTradePnL = (trade) => {
     const statusKey = mapStatus(trade.status);
+    const multiplier = getTradeMultiplier(trade.signal);
 
     if (statusKey === 'closed') {
       // For closed trades, use stored realized_pnl
@@ -64,7 +89,10 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
       const exitPrice = Number(trade.exit_price ?? trade.exitPrice);
       const entryPrice = Number(trade.price);
       let sizeValue = Number(trade.size);
-      const multiplier = trade.signal?.toUpperCase() === 'BUY' ? 1 : -1;
+      // Use absolute size magnitude. Direction is applied via multiplier based on signal.
+      if (Number.isFinite(sizeValue)) {
+        sizeValue = Math.abs(sizeValue);
+      }
 
       if (!Number.isFinite(sizeValue)) {
         const sizeUsd = Number(trade.size_usd ?? trade.sizeUsd);
@@ -74,14 +102,17 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
       }
 
       if (Number.isFinite(exitPrice) && Number.isFinite(entryPrice) && Number.isFinite(sizeValue)) {
-        return (exitPrice - entryPrice) * sizeValue * multiplier;
+        const r = (exitPrice - entryPrice) * sizeValue * multiplier;
+        return Number.isFinite(r) ? r : 0;
       }
-      return 0;
     } else {
       // For open trades, calculate based on current market price
       const entryPrice = Number(trade.price);
       let sizeValue = Number(trade.size);
-      const multiplier = trade.signal?.toUpperCase() === 'BUY' ? 1 : -1;
+      // Use absolute size magnitude. Direction is applied via multiplier based on signal.
+      if (Number.isFinite(sizeValue)) {
+        sizeValue = Math.abs(sizeValue);
+      }
       const currentPrice = Number(currentPrices[trade.symbol]);
 
       if (!Number.isFinite(sizeValue)) {
@@ -92,221 +123,108 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
       }
 
       if (Number.isFinite(currentPrice) && Number.isFinite(entryPrice) && Number.isFinite(sizeValue)) {
-        return (currentPrice - entryPrice) * sizeValue * multiplier;
+        const r = (currentPrice - entryPrice) * sizeValue * multiplier;
+        return Number.isFinite(r) ? r : 0;
       }
 
       // Fallback to stored unrealized_pnl if available
-      return Number(trade.unrealized_pnl || 0);
+      const fallback = Number(trade.unrealized_pnl || 0);
+      return Number.isFinite(fallback) ? fallback : 0;
     }
-  };
-
-  // Calculate cumulative P&L for all trades
-  const allCumulativePnls = useMemo(() => {
-    const sorted = [...trades].sort((a, b) => a.created_at - b.created_at);
-    const cumul = [];
-    let total = 0;
-    for (const trade of sorted) {
-      total += calculateTradePnL(trade);
-      cumul.push({ time: trade.created_at * 1000, pnl: total });
-    }
-    return cumul;
-  }, [trades]);
-
-  // Helper function to get total P&L at a specific time
-  const getTotalPnLAtTime = (timeMs) => {
-    // Find the last cumulative where time <= timeMs
-    for (let i = allCumulativePnls.length - 1; i >= 0; i--) {
-      if (allCumulativePnls[i].time <= timeMs) {
-        return allCumulativePnls[i].pnl;
-      }
-    }
-    return 0; // No trades before this time
   };
 
   // Calculate cumulative P&L over time with time-based aggregation
   const staticChartData = useMemo(() => {
     if (trades.length === 0) return [];
+    const sortedTrades = [...trades].sort((tradeA, tradeB) => tradeA.created_at - tradeB.created_at);
+    let intervalMs = 60000; // default 1 minute
+    if (selectedInterval === '15MIN') intervalMs = 15 * 60000;
+    if (selectedInterval === '30MIN') intervalMs = 30 * 60000;
+    if (selectedInterval === '1H') intervalMs = 60 * 60000;
+    if (selectedInterval === '1D') intervalMs = 24 * 60 * 60000;
+    if (selectedInterval === '1W') intervalMs = 7 * 24 * 60 * 60000;
+    if (selectedInterval === '1M') intervalMs = 30 * 24 * 60 * 60000;
 
-    // Sort trades by creation time
-    const sortedTrades = [...trades].sort((a, b) => a.created_at - b.created_at);
-
-    if (selectedInterval !== 'live') {
-      // Aggregated mode: group trades by time intervals and create continuous data
-      const intervalMs = {
-        '1MIN': 60 * 1000,
-        '15MIN': 15 * 60 * 1000,
-        '30MIN': 30 * 60 * 1000,
-        '1H': 60 * 60 * 1000,
-        '1D': 24 * 60 * 60 * 1000,
-        '1W': 7 * 24 * 60 * 60 * 1000,
-        '1M': 30 * 24 * 60 * 60 * 1000
-      };
-
-      const bucketSize = intervalMs[selectedInterval];
-      const buckets = new Map();
-
-      // Find the time range
-      const startTime = Math.min(...sortedTrades.map(t => t.created_at * 1000));
-      const endTime = Math.max(...sortedTrades.map(t => t.created_at * 1000));
-      const now = Date.now();
-
-      // Create buckets for the entire time range
-      const rangeEnd = Math.max(endTime, now);
-      let currentTime = Math.floor(startTime / bucketSize) * bucketSize;
-
-      while (currentTime <= rangeEnd) {
-        buckets.set(currentTime, {
-          time: currentTime,
-          pnlChange: 0,
-          tradeCount: 0,
-          trades: []
-        });
-        currentTime += bucketSize;
-      }
-
-      // Add trades to their respective buckets
-      sortedTrades.forEach((trade) => {
-        const tradeTime = trade.created_at * 1000;
-        const bucketStart = Math.floor(tradeTime / bucketSize) * bucketSize;
-        const pnl = calculateTradePnL(trade);
-
-        if (buckets.has(bucketStart)) {
-          const bucket = buckets.get(bucketStart);
-          bucket.pnlChange += pnl;
-          bucket.tradeCount += 1;
-          bucket.trades.push(trade);
-        }
-      });
-
-      // Convert to cumulative data points
-      const sortedBuckets = Array.from(buckets.entries())
-        .sort(([a], [b]) => a - b);
-
-      const data = [];
-      let cumulativePnl = 0;
-
-      sortedBuckets.forEach(([bucketTime, bucket], index) => {
-        cumulativePnl += bucket.pnlChange;
-
-        data.push({
-          time: new Date(bucketTime),
-          pnl: cumulativePnl,
-          change: bucket.pnlChange,
-          index,
-          tradeCount: bucket.tradeCount,
-          hasTrades: bucket.tradeCount > 0
-        });
-      });
-
-      return data;
-    }
-  }, [trades, selectedInterval, currentPrices, bitgetPositions]);
-
-  // Live data calculation - show only last 5 minutes of data
-  useEffect(() => {
-    if (selectedInterval !== 'live') return;
-
-    const sortedTrades = [...trades].sort((a, b) => a.created_at - b.created_at);
-    const now = Date.now() / 1000;
-    const fiveMinutesAgo = now - (5 * 60); // 5 minutes in seconds
-
-    // For live mode, show compressed time view - last 5 minutes at 15-second intervals
+    // Find the start and end time for the chart
+    const startTime = sortedTrades.length > 0 ? sortedTrades[0].created_at * 1000 : Date.now();
+    const endTime = Date.now();
     const data = [];
-    let cumulativePnl = 0;
-
-    if (sortedTrades.length === 0) {
-      // No trades at all
-      setLiveData([]);
-      return;
-    }
-
-    // Get trades from last 5 minutes
-    const recentTrades = sortedTrades.filter(trade => trade.created_at >= fiveMinutesAgo);
-
-    if (recentTrades.length === 0) {
-      // No recent trades, show last 5 trades for context
-      const lastTrades = sortedTrades.slice(-5);
-      lastTrades.forEach((trade, index) => {
-        const pnl = getTotalPnLAtTime(trade.created_at * 1000);
-        const change = index === 0 ? pnl : pnl - data[data.length - 1].pnl;
-
-        data.push({
-          time: new Date(trade.created_at * 1000),
-          pnl: pnl,
-          change: change,
-          index,
-          tradeCount: 1
-        });
-      });
-    } else {
-      // Group recent trades into 15-second buckets for better visualization
-      const bucketSize = 15; // 15 seconds
-      const buckets = new Map();
-
-      recentTrades.forEach(trade => {
-        const bucketTime = Math.floor(trade.created_at / bucketSize) * bucketSize;
-        if (!buckets.has(bucketTime)) {
-          buckets.set(bucketTime, { trades: [], time: bucketTime });
+    for (let t = startTime; t <= endTime; t += intervalMs) {
+      // Find all trades up to this time
+      const tradesUpToT = sortedTrades.filter(trade => trade.created_at * 1000 <= t);
+      let totalPnl = 0;
+        for (const trade of tradesUpToT) {
+          const tradePnl = calculateTradePnL(trade);
+          if (Number.isFinite(Number(tradePnl))) {
+            totalPnl += tradePnl;
+          }
         }
-        buckets.get(bucketTime).trades.push(trade);
-      });
-
-      // Create data points from buckets
-      const sortedBuckets = Array.from(buckets.entries()).sort(([a], [b]) => a - b);
-
-      sortedBuckets.forEach(([bucketTime, bucket], index) => {
-        const pnl = getTotalPnLAtTime(bucketTime * 1000);
-        const change = index === 0 ? pnl : pnl - data[data.length - 1].pnl;
-
-        data.push({
-          time: new Date(bucketTime * 1000),
-          pnl: pnl,
-          change: change,
-          index: data.length,
-          tradeCount: bucket.trades.length
-        });
+      data.push({
+        time: new Date(t),
+        pnl: totalPnl,
+        change: 0,
+        index: data.length,
+        tradeCount: tradesUpToT.length,
+        hasTrades: tradesUpToT.length > 0
       });
     }
+    return data;
+  }, [trades, selectedInterval, currentPrices, totalPnL]);
 
-    // For live mode, add dummy points at the start and end of the 5-minute window to make the line span full width
-    if (selectedInterval === 'live' && data.length > 0) {
-      const now = Date.now();
-      const fiveMinutesMs = 5 * 60 * 1000;
-      const minTime = now - fiveMinutesMs;
-      const maxTime = now;
+  // Helper function to calculate total P&L at a specific time
+  const getTotalPnLAtTime = (timestampMs) => {
+    const sortedTrades = [...trades].sort((tradeA, tradeB) => tradeA.created_at - tradeB.created_at);
+    let totalPnl = 0;
 
-      // Add start point if the first data point is not at the beginning of the window
-      if (data[0].time.getTime() > minTime + 1000) { // small buffer
-        const pnl = getTotalPnLAtTime(minTime);
-        data.unshift({
-          time: new Date(minTime),
-          pnl: pnl,
-          change: 0,
-          index: -1,
-          tradeCount: 0
-        });
-      }
+    for (const trade of sortedTrades) {
+      const tradeTime = trade.created_at * 1000; // Convert to milliseconds
+      if (tradeTime <= timestampMs) {
+        // For closed trades, use realized P&L
+        if (mapStatus(trade.status) === 'closed') {
+          const realized = Number(trade.realized_pnl ?? trade.realizedPnl);
+          if (Number.isFinite(realized)) {
+            totalPnl += realized;
+          } else {
+            // Fallback calculation
+            totalPnl += calculateTradePnL(trade);
+          }
+        } else {
+          // For open trades, calculate current P&L at this timestamp
+          const entryPrice = Number(trade.price);
+          let sizeValue = Number(trade.size);
+          if (Number.isFinite(sizeValue)) {
+            sizeValue = Math.abs(sizeValue);
+          }
+          const multiplier = getTradeMultiplier(trade.signal);
 
-      // Add end point if the last data point is not at the current time
-      if (data[data.length - 1].time.getTime() < maxTime - 1000) { // small buffer
-        const pnl = getTotalPnLAtTime(maxTime);
-        data.push({
-          time: new Date(maxTime),
-          pnl: pnl,
-          change: 0,
-          index: data.length,
-          tradeCount: 0
-        });
+          if (!Number.isFinite(sizeValue)) {
+            const sizeUsd = Number(trade.size_usd ?? trade.sizeUsd);
+            if (Number.isFinite(sizeUsd) && Number.isFinite(entryPrice) && entryPrice !== 0) {
+              sizeValue = sizeUsd / entryPrice;
+            }
+          }
+
+          // Use historical price if available, otherwise current price
+          const priceToUse = currentPrices[trade.symbol] || entryPrice;
+          if (Number.isFinite(Number(priceToUse)) && Number.isFinite(Number(entryPrice)) && Number.isFinite(Number(sizeValue))) {
+            totalPnl += (Number(priceToUse) - Number(entryPrice)) * Number(sizeValue) * multiplier;
+          }
+        }
       }
     }
 
-    setLiveData(data);
-  }, [trades, currentPrices, bitgetPositions, tick]);
+    return totalPnl;
+  };
 
-  const chartData = selectedInterval === 'live' ? liveData : staticChartData;
+  const chartData = staticChartData;
 
+  const EM_DASH = '\u2014'
   const formatCurrency = (value) => {
-    return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(value);
+    const num = Number(value)
+    if (!Number.isFinite(num)) return EM_DASH
+    const formatted = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(Math.abs(num));
+    // Only show '-' for negative values, never for positive
+    return num < 0 ? `-${formatted}` : formatted;
   };
 
   const formatTimeAgo = (minutes) => {
@@ -338,25 +256,64 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
     }
   };
 
+  // Cleaned up rendering logic for graph and axis
+  if (chartData.length === 0 && trades.length > 0) {
+    // Use the same logic as the main chart for total P&L
+    const latestPnl = trades.length > 0 ? trades
+      .map(t => calculateTradePnL(t))
+      .filter(p => Number.isFinite(Number(p)))
+      .reduce((sum, pnl) => sum + pnl, 0) : 0;
+    const trueTotalPnL = typeof totalPnL === 'number' ? totalPnL : latestPnl;
+    return (
+      <div ref={chartRef} style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden' }}>
+        <div style={{ display: 'flex', gap: isMobile ? '4px' : '8px', marginBottom: isMobile ? '8px' : '10px', flexWrap: 'wrap', justifyContent: 'center' }}>
+          {intervals.map((interval) => (
+            <button
+              key={interval.key}
+              onClick={() => setSelectedInterval(interval.key)}
+              style={{
+                padding: isMobile ? '4px 8px' : '6px 12px',
+                border: '1px solid rgba(148, 163, 184, 0.3)',
+                borderRadius: '6px',
+                background: selectedInterval === interval.key ? 'rgba(96, 165, 250, 0.2)' : 'rgba(15, 23, 42, 0.5)',
+                color: selectedInterval === interval.key ? '#60a5fa' : 'rgba(148, 163, 184, 0.8)',
+                fontSize: isMobile ? '11px' : '12px',
+                fontWeight: selectedInterval === interval.key ? '600' : '400',
+                cursor: 'pointer',
+                transition: 'all 0.2s ease',
+                boxShadow: selectedInterval === interval.key ? '0 0 10px rgba(96, 165, 250, 0.3)' : 'none'
+              }}
+            >
+              {interval.label}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'row', width: '100%', height: 'calc(100% - 50px)', borderRadius: '8px', background: 'linear-gradient(180deg, rgba(15, 23, 42, 0.3) 0%, rgba(15, 23, 42, 0.1) 100%)', boxShadow: 'inset 0 0 20px rgba(0, 0, 0, 0.1)' }}>
+          <div style={{ position: 'relative', flex: 1, height: '100%', borderBottom: '2px solid rgba(148, 163, 184, 0.4)', overflow: 'hidden' }}>
+            <div style={{ position: 'absolute', right: '0', top: '0', height: '100%', width: isMobile ? '75px' : '95px', minWidth: isMobile ? '75px' : '95px', borderLeft: '2px solid rgba(148, 163, 184, 0.4)', background: 'rgba(15, 23, 42, 0.08)', zIndex: 10, pointerEvents: 'none', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', padding: '20px 0' }}>
+              <div style={{ fontWeight: '700', color: '#fff', background: 'rgba(15, 23, 42, 0.95)', borderRadius: '8px', padding: '8px 12px', fontSize: isMobile ? '12px' : '14px', border: '2px solid rgba(148, 163, 184, 0.4)', fontFamily: 'monospace', boxShadow: '0 4px 20px rgba(0,0,0,0.5)', textAlign: 'center' }}>
+                {formatCurrency(trueTotalPnL)}
+              </div>
+            </div>
+            <svg width="100%" height="100%" viewBox={`0 0 ${chartWidth} ${chartHeight}`} style={{ overflow: 'visible' }}>
+              <circle
+                cx={chartWidth / 2}
+                cy={chartHeight / 2}
+                r="6"
+                fill={trueTotalPnL >= 0 ? '#10b981' : '#ef4444'}
+                stroke="#fff"
+                strokeWidth="2"
+              />
+            </svg>
+          </div>
+        </div>
+      </div>
+    );
+  }
   if (chartData.length === 0) {
     return (
-      <div style={{
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        justifyContent: 'center',
-        height: '350px',
-        color: 'rgba(148, 163, 184, 0.7)',
-        fontSize: '14px'
-      }}>
-        {/* Interval selector */}
-        <div style={{
-          display: 'flex',
-          gap: isMobile ? '4px' : '8px',
-          marginBottom: '20px',
-          flexWrap: 'wrap',
-          justifyContent: 'center'
-        }}>
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '350px', color: 'rgba(148, 163, 184, 0.7)', fontSize: '14px' }}>
+        <div style={{ display: 'flex', gap: isMobile ? '4px' : '8px', marginBottom: '20px', flexWrap: 'wrap', justifyContent: 'center' }}>
           {intervals.map((interval) => (
             <button
               key={interval.key}
@@ -386,9 +343,50 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
   const timeStamps = chartData.map(d => d.time.getTime());
   let minTime = Math.min(...timeStamps);
   let maxTime = Math.max(...timeStamps);
-  let timeRange = maxTime - minTime || 1;
+  let timeRange = maxTime - minTime;
+  // Adjust timeRange for zoom
+  if (zoomLevel !== 1 && timeRange > 0) {
+    const center = minTime + timeRange / 2;
+    const newRange = timeRange / zoomLevel;
+    minTime = center - newRange / 2;
+    maxTime = center + newRange / 2;
+    timeRange = maxTime - minTime;
+  }
+  // Ensure timeRange is never zero or negative
+  timeRange = Math.max(timeRange, 1);
+  // Ensure minTime and maxTime are valid
+  if (isNaN(minTime) || isNaN(maxTime)) {
+    minTime = Date.now() - 5 * 60 * 1000;
+    maxTime = Date.now();
+    timeRange = maxTime - minTime;
+  }
 
   // For live mode, force the time range to be the full 5-minute window plus buffer to expand the line across the X-axis
+  let minPnl, maxPnl, range;
+  // Use the passed totalPnL prop for the true Total P&L (realized + unrealized)
+  const latestPnl = chartData.length > 0 ? chartData[chartData.length - 1].pnl : 0;
+  const trueTotalPnL = typeof totalPnL === 'number' ? totalPnL : latestPnl;
+
+  // Calculate Y-axis range to center on current total P&L with proportional movement
+  const allPnls = chartData.map(d => d.pnl).filter(v => !isNaN(v) && isFinite(v));
+  let dataMin = trueTotalPnL;
+  let dataMax = trueTotalPnL;
+  if (allPnls.length > 0) {
+    dataMin = Math.min(...allPnls, trueTotalPnL);
+    dataMax = Math.max(...allPnls, trueTotalPnL);
+  }
+  // Fallback if min/max are NaN or equal
+  if (!isFinite(dataMin) || !isFinite(dataMax) || dataMin === dataMax) {
+    dataMin = trueTotalPnL - 10;
+    dataMax = trueTotalPnL + 10;
+  }
+  const deviationAbove = Math.max(0, dataMax - trueTotalPnL);
+  const deviationBelow = Math.max(0, trueTotalPnL - dataMin);
+  const maxDeviation = Math.max(deviationAbove, deviationBelow, 10);
+  minPnl = trueTotalPnL - maxDeviation;
+  maxPnl = trueTotalPnL + maxDeviation;
+  range = Math.max(maxPnl - minPnl, 0.01);
+
   if (selectedInterval === 'live') {
     const now = Date.now();
     const fiveMinutesMs = 5 * 60 * 1000;
@@ -397,34 +395,21 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
     maxTime = now + bufferMs;
     timeRange = maxTime - minTime;
   } else {
-    // For other modes, set maxTime to now for relative time display
-    maxTime = Date.now();
-    timeRange = maxTime - minTime;
-  }
-
-  // Simple HTML/CSS chart implementation
-  const allPnls = chartData.map(d => d.pnl);
-  let minPnl = Math.min(...allPnls);
-  let maxPnl = Math.max(...allPnls);
-  let range = maxPnl - minPnl || 1;
-
-  // Add padding to Y-axis range
-  if (chartData.length > 0) {
-    const padding = Math.max((maxPnl - minPnl) * 0.1, 1); // 10% padding or minimum 1 USD
-    minPnl = minPnl - padding;
-    maxPnl = maxPnl + padding;
-    range = maxPnl - minPnl;
+    // For other modes, set maxTime to the last data point for proper time scaling
+    maxTime = chartData.length > 0 ? chartData[chartData.length - 1].time.getTime() : Date.now();
+    timeRange = maxTime - minTime || 1;
   }
 
   return (
     <div ref={chartRef} style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden' }}>
-      {/* Interval selector */}
+      {/* Interval selector and zoom controls */}
       <div style={{
         display: 'flex',
         gap: isMobile ? '4px' : '8px',
         marginBottom: isMobile ? '8px' : '10px',
         flexWrap: 'wrap',
-        justifyContent: 'center'
+        justifyContent: 'center',
+        alignItems: 'center'
       }}>
         {intervals.map((interval) => (
           <button
@@ -446,171 +431,302 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
             {interval.label}
           </button>
         ))}
+        {/* Zoom controls */}
+        <button
+          onClick={() => setZoomLevel(z => Math.min(z + 0.5, 5))}
+          style={{
+            marginLeft: '12px',
+            padding: isMobile ? '4px 8px' : '6px 12px',
+            border: '1px solid #60a5fa',
+            borderRadius: '6px',
+            background: 'rgba(96, 165, 250, 0.15)',
+            color: '#60a5fa',
+            fontSize: isMobile ? '13px' : '15px',
+            fontWeight: '600',
+            cursor: 'pointer',
+            transition: 'all 0.2s ease',
+            boxShadow: '0 0 6px rgba(96, 165, 250, 0.1)'
+          }}
+          title="Zoom In"
+        >
+          +
+        </button>
+        <button
+          onClick={() => setZoomLevel(z => Math.max(z - 0.5, 0.5))}
+          style={{
+            marginLeft: '4px',
+            padding: isMobile ? '4px 8px' : '6px 12px',
+            border: '1px solid #60a5fa',
+            borderRadius: '6px',
+            background: 'rgba(96, 165, 250, 0.10)',
+            color: '#60a5fa',
+            fontSize: isMobile ? '13px' : '15px',
+            fontWeight: '600',
+            cursor: 'pointer',
+            transition: 'all 0.2s ease',
+            boxShadow: '0 0 6px rgba(96, 165, 250, 0.1)'
+          }}
+          title="Zoom Out"
+        >
+          -
+        </button>
+        <button
+          onClick={() => setZoomLevel(1)}
+          style={{
+            marginLeft: '4px',
+            padding: isMobile ? '4px 8px' : '6px 12px',
+            border: '1px solid #60a5fa',
+            borderRadius: '6px',
+            background: 'rgba(96, 165, 250, 0.08)',
+            color: '#60a5fa',
+            fontSize: isMobile ? '13px' : '15px',
+            fontWeight: '600',
+            cursor: 'pointer',
+            transition: 'all 0.2s ease',
+            boxShadow: '0 0 6px rgba(96, 165, 250, 0.1)'
+          }}
+          title="Reset Zoom"
+        >
+          Reset
+        </button>
       </div>
 
       <div style={{
-        position: 'relative',
+        display: 'flex',
+        flexDirection: 'row',
         width: '100%',
-        height: 'calc(100% - 50px)', // Increased chart area
-        borderLeft: '2px solid rgba(148, 163, 184, 0.4)',
-        borderBottom: '2px solid rgba(148, 163, 184, 0.4)',
+        height: 'calc(100% - 50px)',
         borderRadius: '8px',
         background: 'linear-gradient(180deg, rgba(15, 23, 42, 0.3) 0%, rgba(15, 23, 42, 0.1) 100%)',
         boxShadow: 'inset 0 0 20px rgba(0, 0, 0, 0.1)'
       }}>
-        {/* Y-axis labels */}
-        <div style={{
-          position: 'absolute',
-          left: '5px',
-          top: '0',
-          height: '100%',
-          display: 'flex',
-          flexDirection: 'column',
-          justifyContent: 'space-between',
-          fontSize: isMobile ? '10px' : '11px',
-          color: 'rgba(148, 163, 184, 0.8)',
-          padding: '0 4px',
-          width: isMobile ? '50px' : '60px',
-          zIndex: 10,
-          pointerEvents: 'none'
-        }}>
-          <div style={{ fontSize: isMobile ? '8px' : '9px', color: 'rgba(148, 163, 184, 0.6)', marginBottom: '4px' }}>
-            Updated: {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-          </div>
-          <span style={{
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-            textAlign: 'right',
-            width: '100%',
-            fontWeight: '500'
-          }}>
-            {formatCurrency(maxPnl)}
-          </span>
-          <span style={{
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-            textAlign: 'right',
-            width: '100%',
-            fontWeight: '500'
-          }}>
-            {formatCurrency((maxPnl + minPnl) / 2)}
-          </span>
-          <span style={{
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-            textAlign: 'right',
-            width: '100%',
-            fontWeight: '500'
-          }}>
-            {formatCurrency(minPnl)}
-          </span>
-        </div>
 
         {/* Chart area */}
         <div style={{
-          position: 'absolute',
-          left: isMobile ? '60px' : '80px',
-          top: '0',
-          right: '0',
-          bottom: isMobile ? '20px' : '15px', // Increased for mobile X-axis visibility
+          position: 'relative',
+          flex: 1,
+          height: '100%',
+          borderBottom: '2px solid rgba(148, 163, 184, 0.4)',
           overflow: 'hidden'
         }}>
-          <svg width="100%" height="100%" viewBox={`0 0 ${chartWidth} ${chartHeight}`} style={{ overflow: 'visible' }}>
-          <defs>
-            <linearGradient id="pnlGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-              <stop offset="0%" stopColor="#60a5fa" stopOpacity="0.8" />
-              <stop offset="100%" stopColor="#60a5fa" stopOpacity="0.2" />
-            </linearGradient>
-            <linearGradient id="positiveGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-              <stop offset="0%" stopColor="#4ade80" stopOpacity="0.8" />
-              <stop offset="100%" stopColor="#4ade80" stopOpacity="0.3" />
-            </linearGradient>
-            <linearGradient id="negativeGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-              <stop offset="0%" stopColor="#f87171" stopOpacity="0.8" />
-              <stop offset="100%" stopColor="#f87171" stopOpacity="0.3" />
-            </linearGradient>
-          </defs>
+        {/* Y-axis labels on the right side - perfectly centered */}
+        <div style={{
+          position: 'absolute',
+          right: '0',
+          top: '0',
+          height: '100%',
+          width: '0',
+          minWidth: isMobile ? '75px' : '95px',
+          borderLeft: '2px solid rgba(148, 163, 184, 0.4)',
+          background: 'rgba(15, 23, 42, 0.08)',
+          zIndex: 10,
+          pointerEvents: 'none'
+        }}>
+            {/* Y-axis: max, current, min */}
+            <div style={{
+              position: 'absolute',
+              top: '5px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              fontWeight: '500',
+              color: 'rgba(148, 163, 184, 0.9)',
+              fontSize: isMobile ? '9px' : '10px',
+              fontFamily: 'monospace',
+              background: 'rgba(15, 23, 42, 0.6)',
+              borderRadius: '4px',
+              padding: '2px 6px',
+              border: '1px solid rgba(148, 163, 184, 0.2)'
+            }}>
+              {maxPnl >= 0 ? formatCurrency(maxPnl) : formatCurrency(maxPnl)}
+            </div>
 
-          {/* Grid lines */}
-          <line x1="0" y1="0" x2={chartWidth} y2="0" stroke="rgba(148, 163, 184, 0.3)" strokeWidth="1" strokeDasharray="3,3" />
-          <line x1="0" y1={chartHeight/2} x2={chartWidth} y2={chartHeight/2} stroke="rgba(148, 163, 184, 0.2)" strokeWidth="1" strokeDasharray="3,3" />
-          <line x1="0" y1={chartHeight} x2={chartWidth} y2={chartHeight} stroke="rgba(148, 163, 184, 0.3)" strokeWidth="1" strokeDasharray="3,3" />
-          {/* Vertical grid lines */}
-          <line x1="0" y1="0" x2="0" y2={chartHeight} stroke="rgba(148, 163, 184, 0.2)" strokeWidth="1" strokeDasharray="3,3" />
-          <line x1={chartWidth/4} y1="0" x2={chartWidth/4} y2={chartHeight} stroke="rgba(148, 163, 184, 0.2)" strokeWidth="1" strokeDasharray="3,3" />
-          <line x1={chartWidth/2} y1="0" x2={chartWidth/2} y2={chartHeight} stroke="rgba(148, 163, 184, 0.2)" strokeWidth="1" strokeDasharray="3,3" />
-          <line x1={3*chartWidth/4} y1="0" x2={3*chartWidth/4} y2={chartHeight} stroke="rgba(148, 163, 184, 0.2)" strokeWidth="1" strokeDasharray="3,3" />
-          <line x1={chartWidth} y1="0" x2={chartWidth} y2={chartHeight} stroke="rgba(148, 163, 184, 0.2)" strokeWidth="1" strokeDasharray="3,3" />
+            <div style={{
+              position: 'absolute',
+              top: '50%',
+              left: '50%',
+              transform: 'translate(-50%, -50%)',
+              fontWeight: '700',
+              color: '#fff',
+              background: 'rgba(15, 23, 42, 0.95)',
+              borderRadius: '8px',
+              padding: '8px 12px',
+              fontSize: isMobile ? '12px' : '14px',
+              border: '2px solid rgba(148, 163, 184, 0.4)',
+              fontFamily: 'monospace',
+              boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
+              textAlign: 'center'
+            }}>
+              {trueTotalPnL >= 0 ? formatCurrency(trueTotalPnL) : formatCurrency(trueTotalPnL)}
+            </div>
+
+            <div style={{
+              position: 'absolute',
+              bottom: '5px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              fontWeight: '500',
+              color: 'rgba(148, 163, 184, 0.9)',
+              fontSize: isMobile ? '9px' : '10px',
+              fontFamily: 'monospace',
+              background: 'rgba(15, 23, 42, 0.6)',
+              borderRadius: '4px',
+              padding: '2px 6px',
+              border: '1px solid rgba(148, 163, 184, 0.2)'
+            }}>
+              {minPnl >= 0 ? formatCurrency(minPnl) : formatCurrency(minPnl)}
+            </div>
+
+            {/* Removed Updated timestamp from chart */}
+          </div>
+          <svg width="100%" height="100%" viewBox={`0 0 ${chartWidth + (isMobile ? 75 : 95)} ${chartHeight}`} style={{ overflow: 'visible' }}>
+            <defs>
+              <linearGradient id="positiveGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor="#10b981" stopOpacity="0.4" />
+                <stop offset="50%" stopColor="#10b981" stopOpacity="0.2" />
+                <stop offset="100%" stopColor="#10b981" stopOpacity="0.05" />
+              </linearGradient>
+              <linearGradient id="negativeGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor="#ef4444" stopOpacity="0.4" />
+                <stop offset="50%" stopColor="#ef4444" stopOpacity="0.2" />
+                <stop offset="100%" stopColor="#ef4444" stopOpacity="0.05" />
+              </linearGradient>
+            </defs>
+            {/* Only keep grid lines, no extra axis or border */}
+            {Array.from({ length: 5 }).map((_, i) => {
+              const y = (chartHeight / 4) * i;
+              return (
+                <line key={`ygrid-${i}`} x1={0} y1={y} x2={chartWidth} y2={y} stroke="rgba(148, 163, 184, 0.2)" strokeWidth="1" strokeDasharray="3,3" />
+              );
+            })}
+            {Array.from({ length: 9 }).map((_, i) => {
+              // 9 intervals, closer together
+              if (i === 4) return null; // skip center for clarity
+              const x = (chartWidth / 8) * i;
+              const timeAtFraction = minTime + (timeRange * i / 8);
+              return (
+                <g key={`xgrid-${i}`}>
+                  <line x1={x} y1={0} x2={x} y2={chartHeight} stroke="rgba(148, 163, 184, 0.2)" strokeWidth="1" strokeDasharray="3,3" />
+                  <text x={x} y={chartHeight + 18} fontSize={isMobile ? 10 : 12} fill="#94a3b8" fontFamily="monospace" textAnchor="middle">
+                    {formatTimeLabel(new Date(timeAtFraction), selectedInterval)}
+                  </text>
+                </g>
+              );
+            })}
+          {/* Add more vertical grid lines for compactness */}
+          {Array.from({ length: 9 }).map((_, i) => {
+            if (i === 0) return null;
+            const x = (chartWidth / 8) * i;
+            return (
+              <line key={`vgrid-${i}`} x1={x} y1="0" x2={x} y2={chartHeight} stroke="rgba(148, 163, 184, 0.2)" strokeWidth="1" strokeDasharray="3,3" />
+            );
+          })}
+          <line x1={chartWidth + (isMobile ? 75 : 95)} y1="0" x2={chartWidth + (isMobile ? 75 : 95)} y2={chartHeight} stroke="rgba(148, 163, 184, 0.2)" strokeWidth="1" strokeDasharray="3,3" />
 
           {/* Area fill based on P&L sign */}
-          <polygon
-            fill={chartData.length > 0 && chartData[chartData.length - 1].pnl >= 0 ? "url(#positiveGradient)" : "url(#negativeGradient)"}
-            stroke="none"
-            points={`0,${chartHeight} ${chartData.map((point, index) => {
-              const x = ((point.time.getTime() - minTime) / timeRange) * chartWidth;
-              const y = Math.max(0, Math.min(chartHeight, chartHeight - ((point.pnl - minPnl) / range) * chartHeight));
+          {/* Horizontal line for current P&L value */}
+          {chartData.length > 0 && (
+            <>
+              {/* Removed blue horizontal line after the dot */}
+              {/* No dot or text label needed since we have it properly displayed in Y-axis */}
+            </>
+          )}
+          {(() => {
+            const polygonPoints = chartData.map((point) => {
+              const x = ((point.time.getTime() - minTime) / Math.max(timeRange, 1)) * chartWidth;
+              const y = chartHeight - ((point.pnl - minPnl) / Math.max(range, 0.01)) * chartHeight;
+              if (isNaN(x) || isNaN(y)) return null;
               return `${x},${y}`;
-            }).join(' ')} ${selectedInterval === 'live' ? ((Date.now() - minTime) / timeRange) * chartWidth : chartWidth},${chartHeight}`}
-          />
+            }).filter(Boolean).join(' ');
+            const endX = chartWidth;
+            return (
+              <polygon
+                fill={chartData.length > 0 && chartData[chartData.length - 1].pnl >= 0 ? "url(#positiveGradient)" : "url(#negativeGradient)"}
+                stroke="none"
+                points={`0,${chartHeight} ${polygonPoints} ${endX},${chartHeight}`}
+              />
+            );
+          })()}
 
-          {/* P&L line segments with color based on P&L */}
+          {/* P&L line segments with color based on current total P&L */}
           {chartData.map((point, index) => {
             if (index === 0) return null;
             const prevPoint = chartData[index - 1];
-            const x1 = ((prevPoint.time.getTime() - minTime) / timeRange) * chartWidth;
-            const y1 = Math.max(0, Math.min(chartHeight, chartHeight - ((prevPoint.pnl - minPnl) / range) * chartHeight));
-            const x2 = ((point.time.getTime() - minTime) / timeRange) * chartWidth;
-            const y2 = Math.max(0, Math.min(chartHeight, chartHeight - ((point.pnl - minPnl) / range) * chartHeight));
-            const isPositive = point.pnl >= 0;
-
+            const x1 = ((prevPoint.time.getTime() - minTime) / Math.max(timeRange, 1)) * chartWidth;
+            const y1 = chartHeight - ((prevPoint.pnl - minPnl) / Math.max(range, 0.01)) * chartHeight;
+            const x2 = ((point.time.getTime() - minTime) / Math.max(timeRange, 1)) * chartWidth;
+            const y2 = chartHeight - ((point.pnl - minPnl) / Math.max(range, 0.01)) * chartHeight;
+            const isPositive = trueTotalPnL >= 0;
+            if (isNaN(x1) || isNaN(x2)) return null;
             return (
-              <line
-                key={`line-${index}`}
-                x1={x1}
-                y1={y1}
-                x2={x2}
-                y2={y2}
-                stroke={isPositive ? '#4ade80' : '#f87171'}
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
+              <g key={`line-${index}`}>
+                <line
+                  x1={x1}
+                  y1={y1}
+                  x2={x2}
+                  y2={y2}
+                  stroke={isPositive ? '#10b981' : '#ef4444'}
+                  strokeWidth="3"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  style={{ filter: 'drop-shadow(0 0 3px rgba(0,0,0,0.5))' }}
+                />
+                <circle
+                  cx={x1}
+                  cy={y1}
+                  r="3"
+                  fill={isPositive ? '#10b981' : '#ef4444'}
+                  stroke="#fff"
+                  strokeWidth="1"
+                  style={{ cursor: 'pointer' }}
+                  onClick={() => setActiveTooltipIndex(`prev-${index}`)}
+                  onMouseLeave={() => setActiveTooltipIndex(null)}
+                />
+                {activeTooltipIndex === `prev-${index}` && (
+                  <foreignObject x={x1 - 30} y={y1 - 40} width="60" height="30">
+                    <div style={{
+                      background: 'rgba(15,23,42,0.95)',
+                      color: '#fff',
+                      borderRadius: '6px',
+                      padding: '4px 8px',
+                      fontSize: '12px',
+                      textAlign: 'center',
+                      boxShadow: '0 2px 8px rgba(0,0,0,0.3)'
+                    }}>
+                      {formatCurrency(prevPoint.pnl)}
+                    </div>
+                  </foreignObject>
+                )}
+                <circle
+                  cx={x2}
+                  cy={y2}
+                  r={index === chartData.length - 1 ? "5" : "3"}
+                  fill={isPositive ? '#10b981' : '#ef4444'}
+                  stroke="#fff"
+                  strokeWidth={index === chartData.length - 1 ? "2" : "1"}
+                  style={{ cursor: 'pointer' }}
+                  onClick={() => setActiveTooltipIndex(`curr-${index}`)}
+                  onMouseLeave={() => setActiveTooltipIndex(null)}
+                />
+                {activeTooltipIndex === `curr-${index}` && (
+                  <foreignObject x={x2 - 30} y={y2 - 40} width="60" height="30">
+                    <div style={{
+                      background: 'rgba(15,23,42,0.95)',
+                      color: '#fff',
+                      borderRadius: '6px',
+                      padding: '4px 8px',
+                      fontSize: '12px',
+                      textAlign: 'center',
+                      boxShadow: '0 2px 8px rgba(0,0,0,0.3)'
+                    }}>
+                      {formatCurrency(point.pnl)}
+                    </div>
+                  </foreignObject>
+                )}
+              </g>
             );
           })}
 
-          {/* Circular dot at the last point for LIVE mode */}
-          {selectedInterval === 'live' && chartData.length > 0 && (
-            <>
-              <circle
-                cx={((Date.now() - minTime) / timeRange) * chartWidth}
-                cy={Math.max(8, Math.min(chartHeight - 8, chartHeight - ((chartData[chartData.length - 1].pnl - minPnl) / range) * chartHeight))}
-                r="6"
-                fill={chartData[chartData.length - 1].pnl >= 0 ? '#4ade80' : '#f87171'}
-                stroke="#ffffff"
-                strokeWidth="2"
-                style={{ filter: 'drop-shadow(0 0 6px rgba(0,0,0,0.3))', animation: 'pulse 1s infinite' }}
-              />
-              {/* Invisible hover area for the dot */}
-              <circle
-                cx={((Date.now() - minTime) / timeRange) * chartWidth}
-                cy={Math.max(8, Math.min(chartHeight - 8, chartHeight - ((chartData[chartData.length - 1].pnl - minPnl) / range) * chartHeight))}
-                r="10"
-                fill="transparent"
-                style={{ cursor: 'pointer' }}
-                onMouseEnter={(e) => {
-                  const tooltip = e.target.parentElement.querySelector(`#tooltip-${chartData.length - 1}`);
-                  if (tooltip) tooltip.style.display = 'block';
-                }}
-                onMouseLeave={(e) => {
-                  const tooltip = e.target.parentElement.querySelector(`#tooltip-${chartData.length - 1}`);
-                  if (tooltip) tooltip.style.display = 'none';
-                }}
-              />
-            </>
-          )}
+          {/* Remove duplicate dot, keep only the one at the end of the horizontal line */}
 
           <style>{`
             @keyframes pulse {
@@ -624,22 +740,31 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
           {chartData.map((point, index) => {
             if (index === 0) return null;
             const prevPoint = chartData[index - 1];
-            const x1 = ((prevPoint.time.getTime() - minTime) / timeRange) * chartWidth;
-            const y1 = chartHeight - ((prevPoint.pnl - minPnl) / range) * chartHeight;
-            const x2 = ((point.time.getTime() - minTime) / timeRange) * chartWidth;
-            const y2 = chartHeight - ((point.pnl - minPnl) / range) * chartHeight;
+            const x1 = ((prevPoint.time.getTime() - minTime) / Math.max(timeRange, 1)) * chartWidth;
+            const y1 = Math.max(0, Math.min(chartHeight, chartHeight - ((prevPoint.pnl - minPnl) / Math.max(range, 0.01)) * chartHeight));
+            const x2 = ((point.time.getTime() - minTime) / Math.max(timeRange, 1)) * chartWidth;
+            const y2 = Math.max(0, Math.min(chartHeight, chartHeight - ((point.pnl - minPnl) / Math.max(range, 0.01)) * chartHeight));
 
-            // Create hover area for this line segment
+            // Invert Y coordinates for hover positioning
+            const invertedY1 = chartHeight - y1;
+            const invertedY2 = chartHeight - y2;
+
+            // Skip invalid coordinates
+            if (isNaN(x1) || isNaN(y1) || isNaN(x2) || isNaN(y2)) {
+              return null;
+            }
+
+            // Create hover area for this line segment (using inverted Y coordinates)
             const midX = (x1 + x2) / 2;
-            const midY = (y1 + y2) / 2;
+            const midY = (Math.min(invertedY1, invertedY2) + Math.max(invertedY1, invertedY2)) / 2;
 
             return (
               <rect
                 key={`hover-${index}`}
                 x={midX - 2}
-                y={Math.min(y1, y2) - 8}
+                y={Math.min(invertedY1, invertedY2) - 8}
                 width="4"
-                height={Math.abs(y2 - y1) + 16}
+                height={Math.abs(invertedY2 - invertedY1) + 16}
                 fill="transparent"
                 style={{ cursor: 'pointer' }}
                 onMouseEnter={(e) => {
@@ -656,52 +781,20 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
         </svg>
         </div>
 
-        {/* X-axis labels */}
-        <div style={{
-          position: 'absolute',
-          bottom: '0',
-          left: isMobile ? '60px' : '80px',
-          right: '0',
-          height: isMobile ? '18px' : '15px', // Increased height for mobile
-          display: 'flex',
-          justifyContent: 'space-between',
-          fontSize: isMobile ? '9px' : '11px', // Slightly smaller font for mobile
-          color: '#94a3b8',
-          padding: '0 2px', // Reduced padding for mobile
-          fontWeight: '500',
-          zIndex: 10,
-          background: isMobile ? 'rgba(15, 23, 42, 0.8)' : 'transparent', // Background for mobile visibility
-          borderRadius: isMobile ? '4px' : '0'
-        }}>
-          {selectedInterval === 'live' ? (
-            // For live mode, show relative time labels - fewer for mobile
-            (isMobile ? [5, 3, 1, 0] : [5, 4, 3, 2, 1, 0]).map((minutesAgo) => {
-              const timeMs = maxTime - minutesAgo * 60 * 1000;
-              const label = minutesAgo === 0 ? 'now' : `${minutesAgo}m ago`;
-              return (
-                <span key={minutesAgo} style={{ margin: isMobile ? '0 1px' : '0 2px' }}>
-                  {label}
-                </span>
-              );
-            })
-          ) : (
-            // For other modes, show absolute time labels at start, middle, end
-            [0, 0.5, 1].map((fraction) => {
-              const timeAtFraction = minTime + fraction * timeRange;
-              const label = formatTimeLabel(new Date(timeAtFraction), selectedInterval);
-              return (
-                <span key={fraction} style={{ margin: isMobile ? '0 1px' : '0 2px' }}>
-                  {label}
-                </span>
-              );
-            })
-          )}
-        </div>
+      {/* Removed X-axis labels at the bottom for a cleaner chart */}
 
         {/* Tooltips */}
         {chartData.map((point, index) => {
-          const x = ((point.time.getTime() - minTime) / timeRange) * chartWidth;
-          const y = chartHeight - ((point.pnl - minPnl) / range) * chartHeight;
+          const x = ((point.time.getTime() - minTime) / Math.max(timeRange, 1)) * chartWidth;
+          const y = Math.max(0, Math.min(chartHeight, chartHeight - ((point.pnl - minPnl) / Math.max(range, 0.01)) * chartHeight));
+          // Invert Y coordinate for tooltip positioning
+          const invertedY = chartHeight - y;
+
+          // Skip invalid coordinates
+          if (isNaN(x) || isNaN(y)) {
+            return null;
+          }
+
           return (
             <div
               key={`tooltip-${index}`}
@@ -709,7 +802,7 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
               style={{
                 position: 'absolute',
                 left: `${80 + (x / chartWidth) * 100}%`,
-                top: `${y - 80}px`,
+                top: `${invertedY - 80}px`,
                 transform: 'translateX(-50%)',
                 background: 'rgba(15, 23, 42, 0.95)',
                 border: '1px solid rgba(148, 163, 184, 0.3)',
@@ -753,3 +846,4 @@ const PnlChart = ({ trades, currentPrices = {}, bitgetPositions = {} }) => {
 };
 
 export default PnlChart;
+
