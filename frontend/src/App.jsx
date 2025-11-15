@@ -65,6 +65,7 @@ function App() {
   const [currentPrices, setCurrentPrices] = useState({})
   const [bitgetPositions, setBitgetPositions] = useState({})
   const [usdToEurRate, setUsdToEurRate] = useState(null)
+  const [isMobile, setIsMobile] = useState(false)
 
   // Form states for admin
   const [formSecret, setFormSecret] = useState('')
@@ -76,6 +77,24 @@ function App() {
   const [lastOrderQuery, setLastOrderQuery] = useState(null)
 
   const [selectedChartSymbol, setSelectedChartSymbol] = useState('BTC')
+  const [sidebarExpanded, setSidebarExpanded] = useState(false)
+
+  // Handle outside click to close sidebar
+  useEffect(() => {
+    const handleOutsideClick = (event) => {
+      if (sidebarExpanded && !event.target.closest('.dashboard-secondary') && !event.target.closest('.sidebar-toggle')) {
+        setSidebarExpanded(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handleOutsideClick)
+    document.addEventListener('touchstart', handleOutsideClick)
+
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideClick)
+      document.removeEventListener('touchstart', handleOutsideClick)
+    }
+  }, [sidebarExpanded])
 
   // Refs
   const wsRef = useRef(null)
@@ -280,6 +299,13 @@ function App() {
       }
     }
   }, [authChecked, token, fetchUsdToEur])
+
+  useEffect(() => {
+    const checkMobile = () => setIsMobile(window.innerWidth < 768)
+    checkMobile()
+    window.addEventListener('resize', checkMobile)
+    return () => window.removeEventListener('resize', checkMobile)
+  }, [])
 
   async function fetchTrades(){
     if (!token) return
@@ -952,17 +978,35 @@ function App() {
   
     return (
       <div className="app">
-        <header className="app-header">
-          <div className="brand">CAPI Dashboard</div>
-          <div className="header-actions">
-            <div className={`status-chip status-${status.toLowerCase()}`}>{status}</div>
-            <div className="user-info">
-              <span className="role-pill">{role || 'user'}</span>
-              <button type="button" onClick={handleLogout}>Logout</button>
-            </div>
-          </div>
-        </header>
-        <main className="dashboard-layout" style={{ width: '100%', maxWidth: '100%' }}>
+        <main className={`dashboard-layout ${sidebarExpanded ? 'menu-expanded' : 'menu-collapsed'}`} style={{ width: '100%', maxWidth: '100%' }}>
+          {/* Toggle Button for Mobile/Small Screens */}
+          {isAdmin && (
+          <button
+            className="sidebar-toggle"
+            onClick={() => setSidebarExpanded(!sidebarExpanded)}
+            style={{
+              position: 'fixed',
+              top: '20px',
+              right: '20px',
+              zIndex: 1000,
+              background: 'rgba(15, 23, 42, 0.9)',
+              border: '1px solid rgba(148, 163, 184, 0.3)',
+              borderRadius: '8px',
+              color: '#e2e8f0',
+              padding: '8px 12px',
+              cursor: 'pointer',
+              fontSize: '14px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              backdropFilter: 'blur(10px)'
+            }}
+          >
+            <span>{sidebarExpanded ? '◁' : '▷'}</span>
+            <span>Menu</span>
+          </button>
+          )}
+
           <section className="dashboard-primary" style={{ width: '100%', flex: '1' }}>
             <div className="metric-grid metric-grid-above-chart">
               <div className="metric-card">
@@ -980,9 +1024,6 @@ function App() {
             </div>
 
             <div className="card overall-pnl-card">
-              <div className="card-heading">
-                <h3>OVERALL PNL</h3>
-              </div>
               <div className="overall-pnl-grid">
                 <div className="pnl-block">
                   <span className="label">Total Unrealized</span>
@@ -1011,16 +1052,45 @@ function App() {
               </div>
             </div>
 
-            <div className="card pnl-chart-card">
-              <div className="card-heading">
-                <h3>P&L OVER TIME</h3>
+            <div style={{display: 'flex', flexDirection: 'row', gap: '16px', width: '100%'}}>
+              <div className="card pnl-chart-card" style={{height: isMobile ? '400px' : '650px', flex: '0 0 calc(50% - 8px)'}}>
+                <div className="chart-body">
+                  <PnlChart trades={trades} currentPrices={currentPrices} bitgetPositions={bitgetPositions} />
+                </div>
               </div>
-              <div className="chart-body">
-                <PnlChart trades={trades} />
+
+              <div className="card graph-card" style={{height: isMobile ? '400px' : '650px', flex: '0 0 calc(50% - 8px)'}}>
+                <div className="graph-heading">
+                  <h3>Market Structure</h3>
+                  <div className="symbol-selector">
+                    <div className="toggle-container">
+                      <button
+                        className={`symbol-toggle ${selectedChartSymbol === 'BTC' ? 'active' : ''}`}
+                        onClick={() => setSelectedChartSymbol('BTC')}
+                      >
+                        BTC
+                      </button>
+                      <button
+                        className={`symbol-toggle ${selectedChartSymbol === 'ETH' ? 'active' : ''}`}
+                        onClick={() => setSelectedChartSymbol('ETH')}
+                      >
+                        ETH
+                      </button>
+                    </div>
+                    <span className="muted">/USDT • TradingView</span>
+                  </div>
+                </div>
+                <div className="graph-body">
+                  <TradingViewChart
+                    latestOpenTrade={latestOpenTrade}
+                    trades={trades}
+                    symbol={selectedChartSymbol}
+                  />
+                </div>
               </div>
             </div>
 
-            <div className="positions-grid">
+            <div className="positions-grid" style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: '8px' }}>
              {(() => {
                // Create a combined list of trades and Bitget positions
                const combinedPositions = []
@@ -1057,15 +1127,14 @@ function App() {
                  })
                })
 
+               // Sort positions alphabetically by symbol for better organization
+               combinedPositions.sort((a, b) => a.symbol.localeCompare(b.symbol))
+
+               // Sort positions by symbol (BTC left, ETH right)
+               combinedPositions.sort((a, b) => a.symbol.localeCompare(b.symbol))
+
                if (combinedPositions.length === 0) {
-                 return (
-                   <div className="card current-position-card">
-                     <div className="card-heading">
-                       <h3>Current Positions</h3>
-                     </div>
-                     <div className="empty-state">No open positions. When a new TradingView alert arrives, trades are placed and positions appear here.</div>
-                   </div>
-                 )
+                 return null;
                }
 
                return combinedPositions.map(item => {
@@ -1091,15 +1160,12 @@ function App() {
 
                  return (
                    <div key={tradeId} className="card current-position-card">
-                     <div className="card-heading">
-                       <h3>{symbol}</h3>
-                     </div>
                      <div className="position-content">
-                       <div className="position-hero" style={{ textAlign: 'center', padding: '24px 20px' }}>
-                         <div className={`side-badge badge-${bitgetSide === 'LONG' ? 'long' : bitgetSide === 'SHORT' ? 'short' : (trade?.signal || '').toUpperCase() === 'BUY' ? 'long' : 'short'}`} style={{ margin: '0 auto 16px auto', display: 'block' }}>
+                       <div className="position-hero" style={{ textAlign: 'center', padding: isMobile ? '8px 6px' : '12px 10px' }}>
+                         <div className={`side-badge badge-${bitgetSide === 'LONG' ? 'long' : bitgetSide === 'SHORT' ? 'short' : (trade?.signal || '').toUpperCase() === 'BUY' ? 'long' : 'short'}`} style={{ margin: isMobile ? '0 auto 12px auto' : '0 auto 20px auto', display: 'block', fontSize: isMobile ? '10px' : '12px', padding: isMobile ? '2px 6px' : '4px 8px' }}>
                            {bitgetSide || (trade?.signal || '').toUpperCase()}
                          </div>
-                         <div className="hero-stats" style={{ justifyContent: 'center' }}>
+                         <div className="hero-stats" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                            <div className={`hero-stat pnl ${pnlTone}`}>
                              <span className="stat-label">P&L @ 10x</span>
                              <span className="stat-value">
@@ -1120,9 +1186,45 @@ function App() {
                                })()}
                              </span>
                            </div>
+                           {isAdmin && trade && (
+                             <button
+                               type="button"
+                               className="close-position-button"
+                               style={{
+                                 background: 'rgba(239, 68, 68, 0.1)',
+                                 border: '1px solid rgba(239, 68, 68, 0.3)',
+                                 color: '#ef4444',
+                                 padding: '6px 12px',
+                                 borderRadius: '6px',
+                                 cursor: 'pointer',
+                                 fontSize: '12px',
+                                 fontWeight: '500',
+                                 transition: 'all 0.2s ease',
+                                 backdropFilter: 'blur(10px)'
+                               }}
+                               onClick={async () => {
+                                 try {
+                                   const res = await fetch(buildApiUrl(`/close/${trade.id}`), {
+                                     method: 'POST',
+                                     headers: authHeaders()
+                                   })
+                                   if (res.ok) {
+                                     pushEvent('Position closed successfully')
+                                     fetchTrades()
+                                   } else {
+                                     pushEvent(`Failed to close position: ${res.status}`)
+                                   }
+                                 } catch (error) {
+                                   pushEvent(`Error closing position: ${error.message}`)
+                                 }
+                               }}
+                             >
+                               Close
+                             </button>
+                           )}
                          </div>
                          {hasSnapshot && (
-                           <div className="position-metric-grid" style={{ marginTop: '20px', justifyContent: 'center' }}>
+                           <div className="position-metric-grid" style={{ marginTop: '10px', justifyContent: 'center' }}>
                              <div className="position-metric">
                                <span className="label">Size</span>
                                <span className="value">
@@ -1149,8 +1251,8 @@ function App() {
                              </div>
                            </div>
                          )}
-                         <div className="muted" style={{ marginTop: '12px', fontSize: '13px' }}>
-                           {type === 'bitget-only'
+                         <div className="muted" style={{ marginTop: '6px', fontSize: '11px' }}>
+                           {symbol} - {type === 'bitget-only'
                              ? 'Live position from Bitget'
                              : hasSnapshot
                                ? 'Live position from Bitget'
@@ -1158,32 +1260,6 @@ function App() {
                            }
                          </div>
                        </div>
-                       {isAdmin && trade && (
-                         <div style={{ textAlign: 'center', padding: '12px 0' }}>
-                           <button
-                             type="button"
-                             className="close-position-button"
-                             onClick={async () => {
-                               try {
-                                 const res = await fetch(buildApiUrl(`/close/${trade.id}`), {
-                                   method: 'POST',
-                                   headers: authHeaders()
-                                 })
-                                 if (res.ok) {
-                                   pushEvent('Position closed successfully')
-                                   fetchTrades()
-                                 } else {
-                                   pushEvent(`Failed to close position: ${res.status}`)
-                                 }
-                               } catch (error) {
-                                 pushEvent(`Error closing position: ${error.message}`)
-                               }
-                             }}
-                           >
-                             Close Position
-                           </button>
-                         </div>
-                       )}
                      </div>
                    </div>
                  )
@@ -1191,42 +1267,12 @@ function App() {
              })()}
            </div>
 
-           <div className="card graph-card">
-            <div className="graph-heading">
-              <h3>Market Structure</h3>
-              <div className="symbol-selector">
-                <div className="toggle-container">
-                  <button
-                    className={`symbol-toggle ${selectedChartSymbol === 'BTC' ? 'active' : ''}`}
-                    onClick={() => setSelectedChartSymbol('BTC')}
-                  >
-                    BTC
-                  </button>
-                  <button
-                    className={`symbol-toggle ${selectedChartSymbol === 'ETH' ? 'active' : ''}`}
-                    onClick={() => setSelectedChartSymbol('ETH')}
-                  >
-                    ETH
-                  </button>
-                </div>
-                <span className="muted">/USDT • TradingView</span>
-              </div>
-            </div>
-            <div className="graph-body">
-              <TradingViewChart
-                latestOpenTrade={latestOpenTrade}
-                trades={trades}
-                symbol={selectedChartSymbol}
-              />
-            </div>
-          </div>
-
- <div className="card current-position-card">
-
+           <div className="card trade-history-card">
             <TradeTable items={trades} onRefresh={fetchTrades} calculatePnL={calculatePnL} formatCurrency={formatCurrency} currentPrices={currentPrices} positionMetrics={positionMetrics} bitgetPositions={bitgetPositions} />
           </div>
           </section>
   
+          {sidebarExpanded && (
           <aside className="dashboard-secondary">
   
             <div className="card status-card">
@@ -1366,7 +1412,12 @@ function App() {
                 )}
               </>
             )}
+            <div className="menu-footer">
+              <button type="button" onClick={() => setSidebarExpanded(false)} className="logout-button" style={{marginRight: '10px'}}>Close Menu</button>
+              <button type="button" onClick={handleLogout} className="logout-button">Logout</button>
+            </div>
           </aside>
+          )}
         </main>
       </div>
     )
