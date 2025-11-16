@@ -1,6 +1,6 @@
 
 
-import React, { useEffect, useMemo, useRef } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 
 const DEFAULT_SYMBOL = 'BITGET:BTCUSDT.P'
 
@@ -13,6 +13,10 @@ function normalizeSymbol(rawSymbol) {
     return 'BITGET:BTCUSDT.P'
   } else if (trimmed === 'ETH') {
     return 'BITGET:ETHUSDT.P'
+  } else if (trimmed === 'SOL') {
+    return 'BITGET:SOLUSDT.P'
+  } else if (trimmed === 'XRP') {
+    return 'BITGET:XRPUSDT.P'
   }
   return `BITGET:${trimmed}.P`
 }
@@ -128,10 +132,18 @@ export default function TradingViewChart({
    return DEFAULT_SYMBOL
  }, [symbolProp, latestOpenTrade])
 
- // Filter trades for current symbol
+  // Allow quick local chart symbol selection via small buttons
+  const [selectedSymbol, setSelectedSymbol] = useState(resolvedSymbol)
+
+  useEffect(() => {
+    // If parent changes resolvedSymbol, update local selection
+    setSelectedSymbol(resolvedSymbol)
+  }, [resolvedSymbol])
+
+ // Filter trades for current selected symbol
  const symbolTrades = useMemo(() => {
-   return trades.filter(trade => normalizeSymbol(trade.symbol) === resolvedSymbol)
- }, [trades, resolvedSymbol])
+   return trades.filter(trade => normalizeSymbol(trade.symbol) === selectedSymbol)
+ }, [trades, selectedSymbol])
 
   useEffect(() => {
     let mounted = true
@@ -140,6 +152,36 @@ export default function TradingViewChart({
       if (saveTimerRef.current) {
         clearTimeout(saveTimerRef.current)
         saveTimerRef.current = null
+      }
+
+      // Helper to set a visible chart range with fallbacks for multiple widget versions
+      const trySetVisibleRange = (chart, minutes = 60) => {
+        if (!chart) return
+        try {
+          const nowSec = Math.floor(Date.now() / 1000)
+          const from = nowSec - (minutes * 60)
+          // Try newer API: timeScale().setVisibleRange
+          try {
+            if (chart.timeScale && typeof chart.timeScale === 'function') {
+              const ts = chart.timeScale()
+              if (ts && typeof ts.setVisibleRange === 'function') {
+                ts.setVisibleRange({ from, to: nowSec })
+                return true
+              }
+            }
+          } catch (e) {
+            // ignore
+          }
+
+          // Fallback older API: setVisibleRange
+          if (typeof chart.setVisibleRange === 'function') {
+            chart.setVisibleRange({ from, to: nowSec })
+            return true
+          }
+        } catch (err) {
+          console.warn('[TradingView] trySetVisibleRange failed', err)
+        }
+        return false
       }
       if (widgetRef.current && widgetRef.current.remove) {
         widgetRef.current.remove()
@@ -192,8 +234,8 @@ export default function TradingViewChart({
 
       widgetRef.current = new window.TradingView.widget({
         autosize: true,
-        symbol: resolvedSymbol,
-        interval: '60',
+        symbol: selectedSymbol,
+        interval: '1',
         timezone: 'Etc/UTC',
         theme: 'dark',
         style: '1',
@@ -218,6 +260,7 @@ export default function TradingViewChart({
       })
 
       if (typeof widgetRef.current?.onChartReady === 'function') {
+                 // When chart ready, ensure the selectedSymbol is applied and plot signals
         widgetRef.current.onChartReady(() => {
          enqueuePersist()
 
@@ -227,6 +270,8 @@ export default function TradingViewChart({
              chart.onIntervalChanged().subscribe(null, enqueuePersist)
              chart.onSymbolChanged().subscribe(null, enqueuePersist)
              chart.onDataLoaded().subscribe(enqueuePersist)
+            // Attempt to set a zoomed-in visible range (last 60 minutes)
+            trySetVisibleRange(chart, 60)
            } catch (error) {
              console.warn('[TradingView] Failed to wire chart events', error)
            }
@@ -278,6 +323,23 @@ export default function TradingViewChart({
       teardownWidget()
     }
   }, [resolvedSymbol, symbolTrades])
+
+  // When user selects a symbol from the overlay buttons, update the TradingView chart
+  useEffect(() => {
+    if (!widgetRef.current || !selectedSymbol) return
+    const chart = widgetRef.current.activeChart?.()
+    if (!chart) return
+    try {
+      // TradingView expects symbol like 'BITGET:BTCUSDT.P' and an optional interval
+      chart.setSymbol(selectedSymbol, '1')
+      layoutKeyRef.current = `tv-chart-layout-${selectedSymbol.replace(/[^A-Za-z0-9:_-]/g, '-')}`
+      enqueuePersist()
+      // Also attempt to set visible range to last 60 minutes when changing the symbol
+      trySetVisibleRange(chart, 60)
+    } catch (error) {
+      console.warn('[TradingView] Failed to set chart symbol', error)
+    }
+  }, [selectedSymbol])
 
   // Re-plot signals when trades update
   useEffect(() => {

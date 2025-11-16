@@ -793,7 +793,7 @@ function App() {
       openTrades: [],
       latestOpenTrade: null,
       lastClosedTrade: null,
-      counts: { open: 0, closed: 0, other: 0, total: 0 }
+      counts: { open: 0, closed: 0, other: 0, total: 0, profitable: 0 }
     }
     // First pass: determine live open trades by symbol and side so we can
     // ignore any incoming signals/received alerts that would duplicate them
@@ -809,21 +809,15 @@ function App() {
     }
 
     for (const trade of trades){
-      // If this trade is a received/signal alert which would duplicate an
-      // existing open position on the same symbol AND same direction, hide it
-      const tradeStatusKey = mapStatus(trade.status)
-      const isSignalOrReceived = ['signal','received'].includes((trade.status||'').toLowerCase())
-      if (isSignalOrReceived && trade.symbol){
-        const key = normalizeSymbolKey(trade.symbol)
-        const existingSides = liveOpenMap.get(key)
-        const mySide = (trade.signal || '').toUpperCase()
-        if (existingSides && existingSides.has(mySide)){
-          // Skip adding this trade to the UI summary on purpose to avoid
-          // duplicate display of an already open same-side trade
-          continue
-        }
+      // Skip pure signal or received alerts - they are not positions.
+      // The UI should only display actual placed/closed positions.
+      const statusLower = (trade.status || '').toLowerCase()
+      if (statusLower === 'signal' || statusLower === 'received') {
+        continue
       }
-      const statusKey = mapStatus(trade.status)
+      // Determine statusKey for counting (open/closed/other)
+      const tradeStatusKey = mapStatus(trade.status)
+      const statusKey = tradeStatusKey
       summary.counts[statusKey] = (summary.counts[statusKey] || 0) + 1
       summary.counts.total += 1
       if(statusKey === 'open'){
@@ -831,12 +825,22 @@ function App() {
         if(!summary.latestOpenTrade){
           summary.latestOpenTrade = trade
         }
-      }else if(statusKey === 'closed' && !summary.lastClosedTrade){
-        summary.lastClosedTrade = trade
+      } else if (statusKey === 'closed'){
+        if (!summary.lastClosedTrade) summary.lastClosedTrade = trade
+        // Count profitable closed trades using realized PnL if present, or computed realized value
+        // Compute a realized PnL using the same logic as calculatePnL so we handle both realized_pnl field and computed values from exit_price
+        try {
+          const realizedComputed = calculatePnL(trade, currentPrices)
+          if (Number.isFinite(realizedComputed) && realizedComputed > 0) {
+            summary.counts.profitable = (summary.counts.profitable || 0) + 1
+          }
+        } catch (e) {
+          // fallback: don't increment if we can't compute
+        }
       }
     }
     return summary
-  }, [trades])
+  }, [trades, currentPrices])
 
   const { openTrades, latestOpenTrade, lastClosedTrade, counts } = tradeSummary
 
@@ -853,8 +857,10 @@ function App() {
         openMap.get(key).add(side)
       }
     }
+    // Exclude 'signal' and 'received' statuses from the table entirely.
     return trades.filter(trade => {
       const s = (trade.status || '').toLowerCase()
+      if (s === 'signal' || s === 'received') return false
       if (s === 'received' || s === 'signal'){
         const key = normalizeSymbolKey(trade.symbol)
         const sides = openMap.get(key)
@@ -1119,6 +1125,11 @@ function App() {
                 <span className="metric-label">Total</span>
                 <span className="metric-value">{counts.total}</span>
               </div>
+              <div className="metric-card">
+                <span className="metric-label">Profitable</span>
+                <span className="metric-value">{(counts.profitable || 0)}/{counts.closed || 0}</span>
+                <span className="muted" style={{fontSize: 12}}>{counts.closed ? `${(((counts.profitable || 0) / counts.closed) * 100).toFixed(1)}%` : '—'}</span>
+              </div>
             </div>
 
             <div className="card overall-pnl-card">
@@ -1159,7 +1170,6 @@ function App() {
 
               <div className="card graph-card" style={{height: isMobile ? '400px' : '650px', flex: '0 0 calc(50% - 8px)'}}>
                 <div className="graph-heading">
-                  <h3>Market Structure</h3>
                   <div className="symbol-selector">
                     <div className="toggle-container">
                       <button
@@ -1174,9 +1184,22 @@ function App() {
                       >
                         ETH
                       </button>
+                      <button
+                        className={`symbol-toggle ${selectedChartSymbol === 'SOL' ? 'active' : ''}`}
+                        onClick={() => setSelectedChartSymbol('SOL')}
+                      >
+                        SOL
+                      </button>
+                      <button
+                        className={`symbol-toggle ${selectedChartSymbol === 'XRP' ? 'active' : ''}`}
+                        onClick={() => setSelectedChartSymbol('XRP')}
+                      >
+                        XRP
+                      </button>
                     </div>
                     <span className="muted">/USDT • TradingView</span>
                   </div>
+                  <h3 style={{marginLeft: '12px'}}>Market Structure</h3>
                 </div>
                 <div className="graph-body">
                   <TradingViewChart
@@ -1259,6 +1282,8 @@ function App() {
 
                return combinedPositions.map(item => {
                  const { type, symbol, trade, bitgetPosition } = item
+                 const entryPrice = (bitgetPosition && (bitgetPosition.entry_price || bitgetPosition.entryPrice)) || (trade && trade.price) || null
+                 const entryLabel = entryPrice ? ` • Entry ${formatCurrency(Number(entryPrice))}` : ''
                  const tradeId = trade?.id || `bitget-${symbol}`
                  const hasSnapshot = bitgetPosition?.found
                  const bitgetSide = bitgetPosition?.side?.toUpperCase()
@@ -1332,7 +1357,27 @@ function App() {
                                      pushEvent('Position closed successfully')
                                      fetchTrades()
                                    } else {
-                                     pushEvent(`Failed to close position: ${res.status}`)
+                                    // If the close request failed due to external errors, allow force-close overlay
+                                    const retry = window.confirm(`Failed to close position (status ${res.status}). Try force close?`)
+                                    if (retry) {
+                                      try {
+                                        const res2 = await fetch(buildApiUrl(`/close/${trade.id}`), {
+                                          method: 'POST',
+                                          headers: authHeaders({ 'Content-Type': 'application/json' }),
+                                          body: JSON.stringify({ force: true })
+                                        })
+                                        if (res2.ok) {
+                                          pushEvent('Position force-closed successfully')
+                                          fetchTrades()
+                                        } else {
+                                          pushEvent(`Force close failed: ${res2.status}`)
+                                        }
+                                      } catch (er2) {
+                                        pushEvent(`Error force-closing position: ${er2.message}`)
+                                      }
+                                    } else {
+                                      pushEvent(`Failed to close position: ${res.status}`)
+                                    }
                                    }
                                  } catch (error) {
                                    pushEvent(`Error closing position: ${error.message}`)
@@ -1372,12 +1417,7 @@ function App() {
                            </div>
                          )}
                          <div className="muted" style={{ marginTop: '6px', fontSize: '11px' }}>
-                           {symbol} - {type === 'bitget-only'
-                             ? 'Live position from Bitget'
-                             : hasSnapshot
-                               ? 'Live position from Bitget'
-                               : `Opened ${new Date((trade?.created_at || 0)*1000).toLocaleString()}`
-                           }
+                           {symbol} - {(type === 'bitget-only' || hasSnapshot) ? `Live position from Bitget${entryLabel}` : `Opened ${new Date((trade?.created_at || 0)*1000).toLocaleString()}${entryLabel}`}
                          </div>
                        </div>
                      </div>
@@ -1388,7 +1428,7 @@ function App() {
            </div>
 
            <div className="card trade-history-card">
-            <TradeTable items={displayTrades} onRefresh={fetchTrades} calculatePnL={calculatePnL} formatCurrency={formatCurrency} currentPrices={currentPrices} positionMetrics={positionMetrics} bitgetPositions={bitgetPositions} />
+            <TradeTable items={displayTrades} onRefresh={fetchTrades} calculatePnL={calculatePnL} formatCurrency={formatCurrency} currentPrices={currentPrices} positionMetrics={positionMetrics} bitgetPositions={bitgetPositions} rawCount={trades.length} />
           </div>
           </section>
   

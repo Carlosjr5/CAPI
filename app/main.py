@@ -63,6 +63,7 @@ BITGET_POSITION_MODE = os.getenv("BITGET_POSITION_MODE", "single")  # optional: 
 BITGET_POSITION_TYPE = os.getenv("BITGET_POSITION_TYPE")  # optional: try values like 'unilateral' or 'one-way' if Bitget expects 'positionType'
 BITGET_POSITION_SIDE = os.getenv("BITGET_POSITION_SIDE")  # optional: explicit position side e.g. 'long' or 'short'
 BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN")
+PLACE_ON_SIGNAL = os.getenv("PLACE_ON_SIGNAL", "0")
 
 DEFAULT_LEVERAGE_RAW = os.getenv("DEFAULT_LEVERAGE")
 try:
@@ -213,6 +214,20 @@ def compute_size_usd(size_value: Optional[float], price_value: Optional[float], 
     return None
 
 
+def map_status(s: Optional[str]) -> str:
+    """Normalize a trade status into one of 'open', 'closed', or 'other'.
+    Mirrors the frontend `mapStatus` mapping so backend and frontend behave the same.
+    """
+    if not s:
+        return 'other'
+    v = str(s).lower()
+    if v == 'placed':
+        return 'open'
+    if any(k in v for k in ('filled', 'closed', 'rejected', 'error', 'ignored')):
+        return 'closed'
+    return 'other'
+
+
 def resolve_trade_dimensions(price_value, computed_size, explicit_size, provided_size_usd, payload):
     size_value = computed_size if computed_size is not None else safe_float(explicit_size)
     if size_value is None:
@@ -323,6 +338,7 @@ trades = sqlalchemy.Table(
     sqlalchemy.Column("status", sqlalchemy.String),  # placed, filled, rejected
     sqlalchemy.Column("response", sqlalchemy.Text),
     sqlalchemy.Column("created_at", sqlalchemy.Float),
+    sqlalchemy.Column("external_ref", sqlalchemy.String),
 )
 # Configure engine based on database type
 if DATABASE_URL.startswith("sqlite"):
@@ -339,24 +355,56 @@ if not os.getenv("RAILWAY_ENVIRONMENT"):
 
 
 def ensure_trade_table_columns():
+    """
+    Ensure legacy/missing columns are present in the `trades` table.
+    This uses SQLAlchemy inspector so it works across SQLite and PostgreSQL.
+
+    NOTE: We add columns conservatively (using ALTER TABLE ADD COLUMN). For
+    complex migrations, prefer Alembic or a proper migration tooling.
+    """
     try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("PRAGMA table_info(trades)")).fetchall()
-            existing = {row[1] for row in rows}
-            if "size" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN size REAL"))
-            if "size_usd" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN size_usd REAL"))
-            if "leverage" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN leverage REAL"))
-            if "margin" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN margin REAL"))
-            if "liquidation_price" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN liquidation_price REAL"))
-            if "exit_price" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN exit_price REAL"))
-            if "realized_pnl" not in existing:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN realized_pnl REAL"))
+        inspector = sqlalchemy.inspect(engine)
+        if not inspector.has_table("trades"):
+            return
+        existing = {col["name"] for col in inspector.get_columns("trades")}
+
+        # Define required columns and desired SQL types. Use types compatible with
+        # both SQLite and PostgreSQL. For PostgreSQL, DOUBLE PRECISION is preferred
+        # for floating values; we'll use DOUBLE PRECISION when the DB dialect is
+        # postgresql, otherwise FALLBACK to REAL for sqlite.
+        dialect = engine.dialect.name if hasattr(engine, "dialect") else "sqlite"
+        float_type = "DOUBLE PRECISION" if dialect.startswith("postgres") else "REAL"
+        text_type = "TEXT"
+
+        statements = []
+        if "size" not in existing:
+            statements.append(f"ALTER TABLE trades ADD COLUMN size {float_type}")
+        if "size_usd" not in existing:
+            statements.append(f"ALTER TABLE trades ADD COLUMN size_usd {float_type}")
+        if "leverage" not in existing:
+            statements.append(f"ALTER TABLE trades ADD COLUMN leverage {float_type}")
+        if "margin" not in existing:
+            statements.append(f"ALTER TABLE trades ADD COLUMN margin {float_type}")
+        if "liquidation_price" not in existing:
+            statements.append(f"ALTER TABLE trades ADD COLUMN liquidation_price {float_type}")
+        if "exit_price" not in existing:
+            statements.append(f"ALTER TABLE trades ADD COLUMN exit_price {float_type}")
+        if "realized_pnl" not in existing:
+            statements.append(f"ALTER TABLE trades ADD COLUMN realized_pnl {float_type}")
+        if "external_ref" not in existing:
+            statements.append(f"ALTER TABLE trades ADD COLUMN external_ref {text_type}")
+
+        if statements:
+            with engine.connect() as conn:
+                for sql in statements:
+                    try:
+                        conn.execute(text(sql))
+                        print(f"[startup] applied schema change: {sql}")
+                    except Exception as apply_exc:
+                        # If the column was added by another instance concurrently or
+                        # if types mismatch, log and continue - we don't want to crash
+                        # the whole startup just because of a non-critical schema change.
+                        print(f"[startup] failed to apply schema change '{sql}': {apply_exc}")
     except Exception as exc:
         try:
             print(f"[startup] failed to ensure trades table columns: {exc}")
@@ -442,6 +490,32 @@ async def root_index():
     if os.path.exists(index_path):
         return FileResponse(index_path)
     return {"ok": False, "message": "Static site not built. Run the frontend build to generate static/index.html before starting the server."}
+
+
+@app.get('/meta')
+async def meta_status():
+    """Return basic runtime metadata to help verify DB, app, and environment setup."""
+    try:
+        dialect = getattr(engine, "dialect", None)
+        dialect_name = dialect.name if dialect else "sqlite"
+    except Exception:
+        dialect_name = "sqlite"
+    try:
+        inspector = sqlalchemy.inspect(engine)
+        tables = inspector.get_table_names()
+        trades_exists = "trades" in tables
+    except Exception as e:
+        tables = []
+        trades_exists = False
+    # Don't return full DATABASE_URL for security but indicate whether it's set
+    has_db_env = bool(os.getenv("DATABASE_URL"))
+    return {
+        "ok": True,
+        "database_env_present": has_db_env,
+        "database_dialect": dialect_name,
+        "trades_table_present": trades_exists,
+        "rails_env": bool(os.getenv("RAILWAY_ENVIRONMENT")),
+    }
 
 # helper: send message to all connected frontends
 async def broadcast(event: dict):
@@ -1801,7 +1875,18 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
         # Construct the payload for reporting back to the caller (helps debugging)
         constructed_payload = construct_bitget_payload(symbol=symbol, side=side, size=computed_size)
 
-        status_code, resp_text = await place_demo_order(symbol=symbol, side=side, price=price, size=computed_size)
+        # Check if trade already exists and was placed (e.g. we placed earlier on SIGNAL)
+        existing_trade_row = None
+        try:
+            existing_trade_row = await database.fetch_one(trades.select().where(trades.c.id == trade_id))
+        except Exception:
+            existing_trade_row = None
+        if existing_trade_row and existing_trade_row.get("status") == "placed":
+            # Already placed — use stored response
+            status_code = 200
+            resp_text = existing_trade_row.get("response")
+        else:
+            status_code, resp_text = await place_demo_order(symbol=symbol, side=side, price=price, size=computed_size)
 
         # Normalize the Bitget response so the frontend can easily show whether
         # a real order was sent and what the order id is.
@@ -2170,6 +2255,19 @@ async def startup():
 
     await database.connect()
 
+    # Print info about DB dialect (helps operator verify what's running)
+    try:
+        db_dialect = getattr(engine, "dialect", None)
+        dialect_name = db_dialect.name if db_dialect else "sqlite"
+    except Exception:
+        dialect_name = "sqlite"
+
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        if dialect_name and dialect_name.startswith("sqlite"):
+            print("[startup] Warning: running on Railway with SQLite backend. Ensure /data is a persistent volume or switch to PostgreSQL for persistence across redeploys.")
+        else:
+            print(f"[startup] Using persistent database dialect '{dialect_name}' (DATABASE_URL provided). This will persist trades across redeploys.")
+
     # For Railway deployments, be more conservative with schema changes
     # Only create tables if they don't exist, never drop them
     if os.getenv("RAILWAY_ENVIRONMENT"):
@@ -2246,6 +2344,18 @@ async def webhook(req: Request):
     payload["raw_symbol"] = raw_symbol
     payload["symbol"] = symbol
     price = payload.get("price")
+    # optional external ref (e.g. bar_index) used to link signal->entry events
+    bar_index_from_payload = payload.get("bar_index") or payload.get("barIndex") or payload.get("bar_index_str")
+    external_ref = None
+    if bar_index_from_payload:
+        try:
+            external_ref = f"{symbol}:{int(bar_index_from_payload)}"
+        except Exception:
+            external_ref = f"{symbol}:{str(bar_index_from_payload)}"
+    if not external_ref and payload.get("trade_ref"):
+        external_ref = str(payload.get("trade_ref"))
+    # configure whether we place on SIGNAL events
+    place_on_signal_flag = str(PLACE_ON_SIGNAL).lower() in ("1", "true", "yes", "on")
 
     # Support explicit size or USD-based size from TradingView payload.
     # You can send {"size": 0.1} to place a quantity, or {"size_usd": 50} to indicate $50 worth.
@@ -2328,7 +2438,7 @@ async def webhook(req: Request):
             or payload.get("liquidation")
         )
 
-    if event == "SIGNAL":
+    if event == "SIGNAL" and not place_on_signal_flag:
         # Decide if we need to log this signal. If a same-side position is
         # already open, we will ignore the incoming signal to prevent duplicate
         # entries in the database.
@@ -2371,7 +2481,7 @@ async def webhook(req: Request):
         if current_direction and current_direction == ("long" if signal == "LONG" else "short") and current_size and current_size > 0:
             await broadcast({"type":"ignored","id":trade_id,"symbol":symbol,"reason":f"Ignored signal: already have {current_direction} open for {symbol}"})
             return {"ok": False, "id": trade_id, "ignored": True, "detail": "already have open position"}
-        # Otherwise, record the signal
+        # Otherwise, record the signal (non-placement)
         await database.execute(trades.insert().values(
             id=trade_id,
             signal=signal,
@@ -2388,6 +2498,9 @@ async def webhook(req: Request):
             response="",
             created_at=now
         ))
+        # Store external reference for linking ENTRY events back to this SIGNAL
+        if external_ref:
+            await database.execute(trades.update().where(trades.c.id == trade_id).values(external_ref=external_ref))
         await broadcast({"type":"signal","id":trade_id,"signal":signal,"symbol":symbol,"price":price, "at":now})
         return {"ok": True, "id": trade_id, "note": "signal logged"}
 
@@ -2502,23 +2615,84 @@ async def webhook(req: Request):
         return {"ok": False, "id": tmp_id, "ignored": True, "detail": f"Already have an open {current_direction} position for {symbol}."}
 
     # Save incoming alert to DB as pending (use discovered price when available)
+    # If we have an external_ref, try to find an existing DB row and update it
+    # instead of inserting a new one
     trade_id = trade_id_from_payload or str(uuid.uuid4())
-    await database.execute(trades.insert().values(
-        id=trade_id,
-        signal=signal,
-        symbol=symbol,
-        price=float(price_numeric) if price_numeric is not None else 0.0,
-        size=trade_size_value,
-        size_usd=trade_size_usd_value,
-        leverage=leverage_value,
-        margin=margin_value,
-        liquidation_price=liquidation_price_value,
-        exit_price=None,
-        realized_pnl=None,
-        status="received",
-        response="",
-        created_at=now
-    ))
+    if external_ref:
+        existing_by_ref = await database.fetch_all(
+            trades.select().where((trades.c.external_ref == external_ref) & (trades.c.symbol == symbol)).order_by(trades.c.created_at.desc())
+        )
+        if existing_by_ref:
+            existing_trade = dict(existing_by_ref[0])
+            trade_id = existing_trade.get("id")
+            # If we find a signal record, update it to 'received' and enrich the data
+            # Only update status to 'received' if an existing trade is not already 'placed'
+            if existing_trade and existing_trade.get('status') == 'placed':
+                await database.execute(trades.update().where(trades.c.id == trade_id).values(
+                    signal=signal,
+                    price=float(price_numeric) if price_numeric is not None else 0.0,
+                    size=trade_size_value,
+                    size_usd=trade_size_usd_value,
+                    leverage=leverage_value,
+                    margin=margin_value,
+                    liquidation_price=liquidation_price_value,
+                    exit_price=None,
+                    realized_pnl=None,
+                    response="",
+                    created_at=now,
+                    external_ref=external_ref,
+                ))
+            else:
+                await database.execute(trades.update().where(trades.c.id == trade_id).values(
+                    signal=signal,
+                    price=float(price_numeric) if price_numeric is not None else 0.0,
+                    size=trade_size_value,
+                    size_usd=trade_size_usd_value,
+                    leverage=leverage_value,
+                    margin=margin_value,
+                    liquidation_price=liquidation_price_value,
+                    exit_price=None,
+                    realized_pnl=None,
+                    status="received",
+                    response="",
+                    created_at=now,
+                    external_ref=external_ref,
+                ))
+        else:
+            await database.execute(trades.insert().values(
+                id=trade_id,
+                signal=signal,
+                symbol=symbol,
+                price=float(price_numeric) if price_numeric is not None else 0.0,
+                size=trade_size_value,
+                size_usd=trade_size_usd_value,
+                leverage=leverage_value,
+                margin=margin_value,
+                liquidation_price=liquidation_price_value,
+                exit_price=None,
+                realized_pnl=None,
+                status="received",
+                response="",
+                created_at=now,
+                external_ref=external_ref,
+            ))
+    else:
+        await database.execute(trades.insert().values(
+            id=trade_id,
+            signal=signal,
+            symbol=symbol,
+            price=float(price_numeric) if price_numeric is not None else 0.0,
+            size=trade_size_value,
+            size_usd=trade_size_usd_value,
+            leverage=leverage_value,
+            margin=margin_value,
+            liquidation_price=liquidation_price_value,
+            exit_price=None,
+            realized_pnl=None,
+            status="received",
+            response="",
+            created_at=now,
+        ))
     try:
         print(f"[webhook] inserted pending trade id={trade_id} price={price_for_db}")
     except Exception:
@@ -2653,16 +2827,56 @@ async def close_position(trade_id: str, current_user: Dict[str, str] = Depends(r
         if not trade:
             raise HTTPException(status_code=404, detail="Trade not found")
 
-        if trade['status'] != 'placed':
-            raise HTTPException(status_code=400, detail="Trade is not in open state")
+        # Accept closing if the trade status maps to 'open' (placed), or if caller sends force=true
+        body_data = None
+        try:
+            body_data = await request.json()
+        except Exception:
+            body_data = {}
+        force_close = bool(body_data.get('force')) if isinstance(body_data, dict) else False
+        if not force_close and map_status(trade['status']) != 'open':
+                raise HTTPException(status_code=400, detail="Trade is not in open state")
 
         # Close the position on Bitget
         success, detail = await close_existing_bitget_position(dict(trade))
 
-        if success:
-            # Broadcast the close event
-            await broadcast({"type": "closed", "id": trade_id})
-            return {"ok": True, "message": "Position closed successfully"}
+        if success or force_close:
+            # Try to compute exit price and realized PnL for DB storage
+            symbol = trade.get('symbol')
+            exit_price = None
+            realized_pnl = None
+            try:
+                if symbol:
+                    exit_price = await get_market_price_with_retries(symbol)
+                entry_price = safe_float(trade.get('price'))
+                size_value = safe_float(trade.get('size'))
+                if (not size_value or size_value <= 0) and entry_price:
+                    size_usd_val = safe_float(trade.get('size_usd'))
+                    if size_usd_val is not None and entry_price not in (None, 0):
+                        try:
+                            size_value = float(size_usd_val) / float(entry_price)
+                        except Exception:
+                            size_value = None
+                if exit_price is not None and entry_price is not None and size_value is not None and size_value != 0:
+                    direction = 1 if str(trade.get('signal') or '').upper() in ("BUY", "LONG") else -1
+                    realized_pnl = float((exit_price - entry_price) * size_value * direction)
+            except Exception as e:
+                try:
+                    print(f"[close_position] failed to compute exit/realized: {e}")
+                except Exception:
+                    pass
+
+            # Update DB with close status and computed values (if present)
+            update_values = {"status": "closed"}
+            if exit_price is not None:
+                update_values["exit_price"] = exit_price
+            if realized_pnl is not None:
+                update_values["realized_pnl"] = realized_pnl
+            await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_values))
+
+            # Broadcast the close event with details
+            await broadcast({"type": "closed", "id": trade_id, "exit_price": exit_price, "realized_pnl": realized_pnl})
+            return {"ok": True, "message": "Position closed successfully", "exit_price": exit_price, "realized_pnl": realized_pnl}
         else:
             raise HTTPException(status_code=500, detail=detail or "Failed to close position on Bitget")
 

@@ -4,6 +4,7 @@ httpx
 python-dotenv
 databases[sqlite,postgresql]
 sqlalchemy
+psycopg2-binary
 websockets
 python-multipart
 requests

@@ -35,7 +35,7 @@ function calculateROE(it, pnlValue, currentPrices, bitgetPositions) {
 
 const ITEMS_PER_PAGE = 10
 
-export default function TradeTable({items, onRefresh, calculatePnL, formatCurrency, currentPrices, bitgetPositions}){
+export default function TradeTable({items, onRefresh, calculatePnL, formatCurrency, currentPrices, bitgetPositions, rawCount}){
   const [currentPage, setCurrentPage] = useState(1)
 
   // Calculate pagination
@@ -70,6 +70,9 @@ export default function TradeTable({items, onRefresh, calculatePnL, formatCurren
           <div className="pagination-info">
             Page {currentPage} of {totalPages} ({totalItems} total)
           </div>
+        )}
+        {typeof rawCount === 'number' && rawCount > totalItems && (
+          <div style={{ marginLeft: 12, fontSize: 12 }} className="muted">Signals/received alerts omitted from table ({rawCount - totalItems})</div>
         )}
       </div>
       <div className="table-scroller" tabIndex={0} aria-label="Trade history">
