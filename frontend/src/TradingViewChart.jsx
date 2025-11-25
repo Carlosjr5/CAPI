@@ -13,6 +13,10 @@ function normalizeSymbol(rawSymbol) {
     return 'BITGET:BTCUSDT.P'
   } else if (trimmed === 'ETH') {
     return 'BITGET:ETHUSDT.P'
+  } else if (trimmed === 'SOL') {
+    return 'BITGET:SOLUSDT.P'
+  } else if (trimmed === 'XRP') {
+    return 'BITGET:XRPUSDT.P'
   }
   return `BITGET:${trimmed}.P`
 }
@@ -99,6 +103,7 @@ export default function TradingViewChart({
   symbol: symbolProp = DEFAULT_SYMBOL,
   height = '100%',
 }) {
+  const [localSymbol, setLocalSymbol] = React.useState(null)
   const containerRef = useRef(null)
   const widgetRef = useRef(null)
   const saveTimerRef = useRef(null)
@@ -122,16 +127,25 @@ export default function TradingViewChart({
    if (symbolProp) {
      return normalizeSymbol(symbolProp)
    }
+   // If parent did not force a symbol, prefer a locally-selected symbol
+   if (localSymbol) {
+     return normalizeSymbol(localSymbol)
+   }
    if (latestOpenTrade?.symbol) {
      return normalizeSymbol(latestOpenTrade.symbol)
    }
    return DEFAULT_SYMBOL
  }, [symbolProp, latestOpenTrade])
 
+  // Available quick-select symbols shown as small buttons
+  const quickSymbols = ['BTC', 'ETH', 'SOL', 'XRP']
+
  // Filter trades for current symbol
  const symbolTrades = useMemo(() => {
    return trades.filter(trade => normalizeSymbol(trade.symbol) === resolvedSymbol)
  }, [trades, resolvedSymbol])
+
+  
 
   useEffect(() => {
     let mounted = true
@@ -193,7 +207,7 @@ export default function TradingViewChart({
       widgetRef.current = new window.TradingView.widget({
         autosize: true,
         symbol: resolvedSymbol,
-        interval: '60',
+        interval: '1',
         timezone: 'Etc/UTC',
         theme: 'dark',
         style: '1',
@@ -233,6 +247,34 @@ export default function TradingViewChart({
 
            // Plot trade signals on chart initially
            plotTradeSignals(chart, symbolTrades)
+
+           // Zoom to last minute (best-effort; use multiple API fallbacks)
+           try {
+             const zoomToLastMinute = (c) => {
+               try {
+                 const now = Math.floor(Date.now() / 1000)
+                 const from = now - 60
+                 const to = now
+                 if (c && c.timeScale && typeof c.timeScale().setVisibleRange === 'function') {
+                   c.timeScale().setVisibleRange({ from, to })
+                   return
+                 }
+                 if (c && typeof c.setVisibleRange === 'function') {
+                   c.setVisibleRange({ from, to })
+                   return
+                 }
+                 if (c && typeof c.setVisibleTimeRange === 'function') {
+                   c.setVisibleTimeRange({ from, to })
+                   return
+                 }
+               } catch (err) {
+                 console.warn('[TradingView] zoomToLastMinute attempt failed', err)
+               }
+             }
+             zoomToLastMinute(chart)
+           } catch (err) {
+             console.warn('[TradingView] Failed to zoom to last minute', err)
+           }
          }
 
          try {
@@ -279,6 +321,10 @@ export default function TradingViewChart({
     }
   }, [resolvedSymbol, symbolTrades])
 
+  // When localSymbol changes (quick selector), trigger widget recreation by
+  // updating a memo'd resolvedSymbol via local state; the effect above will
+  // recreate the widget because resolvedSymbol is in its dependency list.
+
   // Re-plot signals when trades update
   useEffect(() => {
     if (widgetRef.current?.activeChart && symbolTrades.length > 0) {
@@ -292,6 +338,9 @@ export default function TradingViewChart({
   return (
     <div className="tradingview-widget-wrapper" style={{ height: resolvedHeightValue, width: '100%', position: 'relative', overflow: 'hidden', minHeight }}>
       <div className="tradingview-widget-container" style={{ height: '100%', width: '100%', position: 'relative', minHeight }}>
+        
+        {/* Chart-level quick selector removed — app-level Market Structure controls are the canonical UI */}
+        {/* Market Structure moved to the app-level; chart-level header removed */}
         <div
           id={containerIdRef.current}
           className="tradingview-widget-container__widget"

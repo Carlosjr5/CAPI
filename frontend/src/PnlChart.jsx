@@ -256,6 +256,14 @@ const PnlChart = ({ trades = [], currentPrices = {}, bitgetPositions = {}, total
     }
   };
 
+  const formatDateTime = (date) => {
+    try {
+      return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (e) {
+      return String(date);
+    }
+  };
+
   // Cleaned up rendering logic for graph and axis
   if (chartData.length === 0 && trades.length > 0) {
     // Use the same logic as the main chart for total P&L
@@ -290,7 +298,7 @@ const PnlChart = ({ trades = [], currentPrices = {}, bitgetPositions = {}, total
         </div>
         <div style={{ display: 'flex', flexDirection: 'row', width: '100%', height: 'calc(100% - 50px)', borderRadius: '8px', background: 'linear-gradient(180deg, rgba(15, 23, 42, 0.3) 0%, rgba(15, 23, 42, 0.1) 100%)', boxShadow: 'inset 0 0 20px rgba(0, 0, 0, 0.1)' }}>
           <div style={{ position: 'relative', flex: 1, height: '100%', borderBottom: '2px solid rgba(148, 163, 184, 0.4)', overflow: 'hidden' }}>
-            <div style={{ position: 'absolute', right: '0', top: '0', height: '100%', width: isMobile ? '75px' : '95px', minWidth: isMobile ? '75px' : '95px', borderLeft: '2px solid rgba(148, 163, 184, 0.4)', background: 'rgba(15, 23, 42, 0.08)', zIndex: 10, pointerEvents: 'none', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', padding: '20px 0' }}>
+            <div style={{ position: 'absolute', right: '0', top: '0', height: '100%', width: isMobile ? '75px' : '95px', minWidth: isMobile ? '75px' : '95px', borderLeft: '2px solid rgba(148, 163, 184, 0.4)', background: 'rgba(15, 23, 42, 0.08)', zIndex: 10, pointerEvents: 'none', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', padding: isMobile ? '8px 0' : '20px 0' }}>
               <div style={{ fontWeight: '700', color: '#fff', background: 'rgba(15, 23, 42, 0.95)', borderRadius: '8px', padding: '8px 12px', fontSize: isMobile ? '12px' : '14px', border: '2px solid rgba(148, 163, 184, 0.4)', fontFamily: 'monospace', boxShadow: '0 4px 20px rgba(0,0,0,0.5)', textAlign: 'center' }}>
                 {formatCurrency(trueTotalPnL)}
               </div>
@@ -670,57 +678,44 @@ const PnlChart = ({ trades = [], currentPrices = {}, bitgetPositions = {}, total
                   strokeLinejoin="round"
                   style={{ filter: 'drop-shadow(0 0 3px rgba(0,0,0,0.5))' }}
                 />
-                <circle
-                  cx={x1}
-                  cy={y1}
-                  r="3"
-                  fill={isPositive ? '#10b981' : '#ef4444'}
-                  stroke="#fff"
-                  strokeWidth="1"
-                  style={{ cursor: 'pointer' }}
-                  onClick={() => setActiveTooltipIndex(`prev-${index}`)}
-                  onMouseLeave={() => setActiveTooltipIndex(null)}
-                />
-                {activeTooltipIndex === `prev-${index}` && (
-                  <foreignObject x={x1 - 30} y={y1 - 40} width="60" height="30">
-                    <div style={{
-                      background: 'rgba(15,23,42,0.95)',
-                      color: '#fff',
-                      borderRadius: '6px',
-                      padding: '4px 8px',
-                      fontSize: '12px',
-                      textAlign: 'center',
-                      boxShadow: '0 2px 8px rgba(0,0,0,0.3)'
-                    }}>
-                      {formatCurrency(prevPoint.pnl)}
-                    </div>
-                  </foreignObject>
-                )}
-                <circle
-                  cx={x2}
-                  cy={y2}
-                  r={index === chartData.length - 1 ? "5" : "3"}
-                  fill={isPositive ? '#10b981' : '#ef4444'}
-                  stroke="#fff"
-                  strokeWidth={index === chartData.length - 1 ? "2" : "1"}
-                  style={{ cursor: 'pointer' }}
-                  onClick={() => setActiveTooltipIndex(`curr-${index}`)}
-                  onMouseLeave={() => setActiveTooltipIndex(null)}
-                />
-                {activeTooltipIndex === `curr-${index}` && (
-                  <foreignObject x={x2 - 30} y={y2 - 40} width="60" height="30">
-                    <div style={{
-                      background: 'rgba(15,23,42,0.95)',
-                      color: '#fff',
-                      borderRadius: '6px',
-                      padding: '4px 8px',
-                      fontSize: '12px',
-                      textAlign: 'center',
-                      boxShadow: '0 2px 8px rgba(0,0,0,0.3)'
-                    }}>
-                      {formatCurrency(point.pnl)}
-                    </div>
-                  </foreignObject>
+                {/* Only render a dot for the previous point if you specifically need it. We only show dots
+                    when the P&L changes between consecutive points. The dot is rendered on the current point (x2)
+                    below; removing the prev dot avoids duplicate markers. */}
+                {/** Render dot + tooltip only when P&L changed from prevPoint to point **/}
+                {prevPoint && Number(prevPoint.pnl) !== Number(point.pnl) && (
+                  <>
+                    <circle
+                      cx={x2}
+                      cy={y2}
+                      r={index === chartData.length - 1 ? "5" : "3"}
+                      fill={isPositive ? '#10b981' : '#ef4444'}
+                      stroke="#fff"
+                      strokeWidth={index === chartData.length - 1 ? "2" : "1"}
+                      style={{ cursor: 'pointer' }}
+                      onClick={() => setActiveTooltipIndex(`dot-${index}`)}
+                      onMouseLeave={() => setActiveTooltipIndex(null)}
+                    />
+                    {activeTooltipIndex === `dot-${index}` && (
+                      <foreignObject x={x2 - 60} y={y2 - 56} width="120" height="44">
+                        <div style={{
+                          background: 'rgba(15,23,42,0.95)',
+                          color: '#fff',
+                          borderRadius: '6px',
+                          padding: '6px 8px',
+                          fontSize: '11px',
+                          textAlign: 'center',
+                          boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '4px',
+                          alignItems: 'center'
+                        }}>
+                          <div style={{ color: '#cbd5e1', fontSize: '11px', fontWeight: 600 }}>{formatDateTime(point.time)}</div>
+                          <div style={{ color: point.pnl >= 0 ? '#4ade80' : '#f87171', fontWeight: 700 }}>{formatCurrency(point.pnl)}</div>
+                        </div>
+                      </foreignObject>
+                    )}
+                  </>
                 )}
               </g>
             );

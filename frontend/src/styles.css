@@ -240,6 +240,69 @@ button:disabled{opacity:0.6;cursor:not-allowed;filter:none;transform:none}
 	.dashboard-secondary.expanded{display:flex}
 }
 
+/* Ensure PnL and Market Structure/chart stack nicely on smaller devices regardless of JS width checks */
+@media (max-width: 768px) {
+	.stack-on-mobile {
+		display: flex !important;
+		flex-direction: column !important;
+		align-items: stretch !important;
+	}
+	.stack-on-mobile .pnl-chart-card,
+	.stack-on-mobile .graph-card {
+		flex: 1 1 100% !important;
+		height: auto !important;
+		min-height: 320px;
+	}
+	.graph-body .tradingview-widget-container__widget {
+		min-height: 360px !important;
+	}
+ 
+}
+
+/* Wider mobile / small tablet fallback: ensure stacking up to 900px to catch device/zoom differences */
+@media (max-width: 900px) {
+	.stack-on-mobile {
+		display: flex !important;
+		flex-direction: column !important;
+		align-items: stretch !important;
+	}
+	.stack-on-mobile .graph-card,
+	.stack-on-mobile .pnl-chart-card {
+		width: 100% !important;
+		min-width: 100% !important;
+		flex: 1 1 100% !important;
+		order: 0 !important;
+	}
+	/* Ensure Market Structure (graph-card) appears first, then pnl-chart-card */
+	.stack-on-mobile .graph-card { order: 1 !important; }
+	.stack-on-mobile .pnl-chart-card { order: 2 !important; }
+
+	/* Prevent absolute positioning from collapsing layout on small screens */
+	.graph-body .tradingview-widget-wrapper { position: relative !important; height: 360px !important; }
+	.graph-body .tradingview-widget-container__widget { position: relative !important; min-height: 320px !important; }
+}
+
+/* Desktop layout for the stacked container: side-by-side */
+.stack-on-mobile {
+	display: flex;
+	gap: 16px;
+}
+.stack-on-mobile .pnl-chart-card,
+.stack-on-mobile .graph-card {
+	flex: 0 0 calc(50% - 8px);
+	height: 650px;
+}
+
+/* Extra safety: apply ordering and full-width when JS detects mobile */
+.mobile-force-column {
+	display: flex !important;
+	flex-direction: column !important;
+}
+.mobile-force-column .graph-card { order: 1 !important; }
+.mobile-force-column .pnl-chart-card { order: 2 !important; }
+.mobile-force-column .graph-card,
+.mobile-force-column .pnl-chart-card { flex: 1 1 100% !important; width: 100% !important; min-height: 320px !important; }
+
 @media (max-width:768px){
 	.app{margin:24px auto;padding:0 16px 36px}
 	.app-header{flex-direction:column;align-items:flex-start;gap:16px;padding:16px 18px}

@@ -70,7 +70,7 @@ function App() {
   // Form states for admin
   const [formSecret, setFormSecret] = useState('')
   const [formSymbol, setFormSymbol] = useState('BTCUSDT')
-  const [formSide, setFormSide] = useState('BUY')
+  const [formSide, setFormSide] = useState('LONG')
   const [formSizeUsd, setFormSizeUsd] = useState('100')
   const [placing, setPlacing] = useState(false)
   const [lastOrderResult, setLastOrderResult] = useState(null)
@@ -912,6 +912,19 @@ function App() {
 
   const totalROI = totalMarginUsed > 0 ? (totalPnL / totalMarginUsed) * 100 : 0
 
+  // Profitable trades statistics (for closed trades)
+  const closedTradesForStats = trades.filter(t => mapStatus(t.status) === 'closed')
+  const profitableCount = closedTradesForStats.filter(t => {
+    try {
+      const pnl = calculatePnL(t)
+      return Number.isFinite(Number(pnl)) && Number(pnl) > 0
+    } catch (e) {
+      return false
+    }
+  }).length
+  const closedTotalForStats = closedTradesForStats.length
+  const profitablePct = closedTotalForStats > 0 ? Math.round((profitableCount / closedTotalForStats) * 100) : null
+
   const positionMetrics = useMemo(() => {
     if (!latestOpenTrade) return null
 
@@ -1105,6 +1118,18 @@ function App() {
           </button>
           )}
 
+          {/* Small logout button for non-admin users (visible top-right) */}
+          {!isAdmin && (
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="logout-button"
+              style={{ position: 'fixed', top: '20px', right: '20px', zIndex: 1000 }}
+            >
+              Logout
+            </button>
+          )}
+
           <section className="dashboard-primary" style={{ width: '100%', flex: '1' }}>
             <div className="metric-grid metric-grid-above-chart">
               <div className="metric-card">
@@ -1118,6 +1143,16 @@ function App() {
               <div className="metric-card">
                 <span className="metric-label">Total</span>
                 <span className="metric-value">{counts.total}</span>
+              </div>
+              <div className="metric-card">
+                <span className="metric-label">Profitable</span>
+                <span className="metric-value">
+                  {closedTotalForStats > 0 ? (
+                    `${profitableCount}/${closedTotalForStats}${profitablePct !== null ? ` (${profitablePct}%)` : ''}`
+                  ) : (
+                    '—'
+                  )}
+                </span>
               </div>
             </div>
 
@@ -1150,14 +1185,8 @@ function App() {
               </div>
             </div>
 
-            <div style={{display: 'flex', flexDirection: 'row', gap: '16px', width: '100%'}}>
-              <div className="card pnl-chart-card" style={{height: isMobile ? '400px' : '650px', flex: '0 0 calc(50% - 8px)'}}>
-                <div className="chart-body">
-                  <PnlChart trades={displayTrades} currentPrices={currentPrices} bitgetPositions={bitgetPositions} totalPnL={totalPnL} />
-                </div>
-              </div>
-
-              <div className="card graph-card" style={{height: isMobile ? '400px' : '650px', flex: '0 0 calc(50% - 8px)'}}>
+            <div className={`stack-on-mobile ${isMobile ? 'mobile-force-column' : ''}`}>
+              <div className="card graph-card">
                 <div className="graph-heading">
                   <h3>Market Structure</h3>
                   <div className="symbol-selector">
@@ -1174,6 +1203,18 @@ function App() {
                       >
                         ETH
                       </button>
+                      <button
+                        className={`symbol-toggle ${selectedChartSymbol === 'SOL' ? 'active' : ''}`}
+                        onClick={() => setSelectedChartSymbol('SOL')}
+                      >
+                        SOL
+                      </button>
+                      <button
+                        className={`symbol-toggle ${selectedChartSymbol === 'XRP' ? 'active' : ''}`}
+                        onClick={() => setSelectedChartSymbol('XRP')}
+                      >
+                        XRP
+                      </button>
                     </div>
                     <span className="muted">/USDT • TradingView</span>
                   </div>
@@ -1184,6 +1225,12 @@ function App() {
                     trades={displayTrades}
                     symbol={selectedChartSymbol}
                   />
+                </div>
+              </div>
+
+              <div className="card pnl-chart-card">
+                <div className="chart-body">
+                  <PnlChart trades={displayTrades} currentPrices={currentPrices} bitgetPositions={bitgetPositions} totalPnL={totalPnL} />
                 </div>
               </div>
             </div>
@@ -1388,7 +1435,18 @@ function App() {
            </div>
 
            <div className="card trade-history-card">
-            <TradeTable items={displayTrades} onRefresh={fetchTrades} calculatePnL={calculatePnL} formatCurrency={formatCurrency} currentPrices={currentPrices} positionMetrics={positionMetrics} bitgetPositions={bitgetPositions} />
+                  <TradeTable
+                    items={displayTrades}
+                    onRefresh={fetchTrades}
+                    calculatePnL={calculatePnL}
+                    formatCurrency={formatCurrency}
+                    currentPrices={currentPrices}
+                    positionMetrics={positionMetrics}
+                    bitgetPositions={bitgetPositions}
+                    isAdmin={isAdmin}
+                    authHeaders={authHeaders}
+                    buildApiUrl={buildApiUrl}
+                  />
           </div>
           </section>
   
@@ -1437,13 +1495,15 @@ function App() {
                       <select value={formSymbol} onChange={e=>setFormSymbol(e.target.value)}>
                         <option value="BTCUSDT">BTC/USDT</option>
                         <option value="ETHUSDT">ETH/USDT</option>
+                        <option value="SOLUSDT">SOL/USDT</option>
+                        <option value="XRPUSDT">XRP/USDT</option>
                       </select>
                     </label>
                     <label className="field">
                       <span className="field-label">Side</span>
                       <select value={formSide} onChange={e=>setFormSide(e.target.value)}>
-                        <option>BUY</option>
-                        <option>SELL</option>
+                        <option>LONG</option>
+                        <option>SHORT</option>
                       </select>
                     </label>
                     <label className="field">
@@ -1486,7 +1546,7 @@ function App() {
                     <button
                       type="button"
                       className="ghost-button"
-                      onClick={()=>{ setFormSecret(''); setFormSizeUsd('100'); setFormSymbol('BTCUSDT'); setFormSide('BUY') }}
+                      onClick={()=>{ setFormSecret(''); setFormSizeUsd('100'); setFormSymbol('BTCUSDT'); setFormSide('LONG') }}
                     >
                       Reset
                     </button>

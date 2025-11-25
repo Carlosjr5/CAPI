@@ -322,6 +322,8 @@ trades = sqlalchemy.Table(
     sqlalchemy.Column("realized_pnl", sqlalchemy.Float),
     sqlalchemy.Column("status", sqlalchemy.String),  # placed, filled, rejected
     sqlalchemy.Column("response", sqlalchemy.Text),
+    sqlalchemy.Column("reservation_key", sqlalchemy.String),
+    sqlalchemy.Column("pine_trade_index", sqlalchemy.Integer),
     sqlalchemy.Column("created_at", sqlalchemy.Float),
 )
 # Configure engine based on database type
@@ -357,6 +359,15 @@ def ensure_trade_table_columns():
                 conn.execute(text("ALTER TABLE trades ADD COLUMN exit_price REAL"))
             if "realized_pnl" not in existing:
                 conn.execute(text("ALTER TABLE trades ADD COLUMN realized_pnl REAL"))
+            if "reservation_key" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN reservation_key TEXT"))
+            if "pine_trade_index" not in existing:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN pine_trade_index INTEGER"))
+            # Create a unique index on reservation_key to prevent concurrent reservations
+            try:
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_reservation_key_unique ON trades(reservation_key)"))
+            except Exception:
+                pass
     except Exception as exc:
         try:
             print(f"[startup] failed to ensure trades table columns: {exc}")
@@ -568,7 +579,26 @@ async def close_existing_bitget_position(trade_row) -> Tuple[bool, Optional[str]
 
         if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
             print(f"[close_position] DRY-RUN: would close position for trade {trade_id}")
-            await database.execute(trades.update().where(trades.c.id == trade_id).values(status="closed"))
+            # In dry-run, mark closed and attempt to set exit_price/realized_pnl using market price
+            try:
+                closing_price = await get_market_price_with_retries(symbol)
+            except Exception:
+                closing_price = None
+            update_vals = {"status": "closed"}
+            try:
+                entry_price = safe_float(trade_row.get('price'))
+                size_val = safe_float(trade_row.get('size'))
+                if (not size_val or size_val <= 0) and safe_float(trade_row.get('size_usd')) and entry_price:
+                    size_val = float(trade_row.get('size_usd')) / float(entry_price)
+            except Exception:
+                size_val = None
+                entry_price = None
+            if closing_price is not None and entry_price is not None and size_val is not None:
+                direction = 1 if str(trade_row.get('signal') or '').upper() in ("BUY", "LONG") else -1
+                update_vals['exit_price'] = float(closing_price)
+                update_vals['realized_pnl'] = float((closing_price - entry_price) * size_val * direction)
+
+            await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_vals))
             return True, None
 
         # Determine opposite side for closing
@@ -605,7 +635,49 @@ async def close_existing_bitget_position(trade_row) -> Tuple[bool, Optional[str]
                     parsed = None
 
             if status_code == 200 and isinstance(parsed, dict) and parsed.get("code") == "00000":
-                await database.execute(trades.update().where(trades.c.id == trade_id).values(status="closed"))
+                # Update DB status and attempt to record exit price / realized PnL
+                try:
+                    # Try to determine a closing price: prefer order response if available, else fetch market price
+                    closing_price = None
+                    # Attempt to extract price from parsed response if present
+                    if isinstance(parsed, dict):
+                        # Different Bitget responses may include filledAvgPrice or avgFillPrice
+                        for key in ("filledAvgPrice", "avgFillPrice", "avgPrice", "price", "lastPrice"):
+                            if parsed.get('data') and isinstance(parsed.get('data'), dict) and parsed['data'].get(key) is not None:
+                                try:
+                                    closing_price = float(parsed['data'].get(key))
+                                    break
+                                except Exception:
+                                    closing_price = None
+                    if closing_price is None:
+                        try:
+                            closing_price = await get_market_price_with_retries(symbol)
+                        except Exception:
+                            closing_price = None
+
+                    entry_price = safe_float(trade_row.get('price'))
+                    size_val = safe_float(trade_row.get('size'))
+                    if (size_val is None or size_val <= 0) and safe_float(trade_row.get('size_usd')) and entry_price:
+                        try:
+                            size_val = float(trade_row.get('size_usd')) / float(entry_price)
+                        except Exception:
+                            size_val = None
+
+                    update_vals = {"status": "closed"}
+                    if closing_price is not None and entry_price is not None and size_val is not None:
+                        direction = 1 if str(trade_row.get('signal') or '').upper() in ("BUY", "LONG") else -1
+                        update_vals['exit_price'] = float(closing_price)
+                        update_vals['realized_pnl'] = float((closing_price - entry_price) * size_val * direction)
+
+                    # Clear reservation when marking closed
+                    update_vals['reservation_key'] = None
+                    await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_vals))
+                except Exception as e:
+                    try:
+                        print(f"[close_position] failed to set exit/realized for {trade_id}: {e}")
+                    except Exception:
+                        pass
+
                 print(f"[close_position] Successfully closed position for trade {trade_id} (reduceOnly={reduce_flag})")
                 return True, None
 
@@ -640,7 +712,7 @@ async def close_existing_bitget_position(trade_row) -> Tuple[bool, Optional[str]
             if remaining is None and normalized.get("signed_size") is not None:
                 remaining = abs(normalized.get("signed_size"))
             if remaining is not None and abs(float(remaining)) < 1e-8:
-                await database.execute(trades.update().where(trades.c.id == trade_id).values(status="closed"))
+                await database.execute(trades.update().where(trades.c.id == trade_id).values(status="closed", reservation_key=None))
                 note = "No remaining Bitget position detected after close attempt"
                 print(f"[close_position] treating trade {trade_id} as closed: {note}")
                 return True, note
@@ -697,7 +769,8 @@ async def place_demo_order(
         body_obj["positionSide"] = BITGET_POSITION_SIDE
     elif "positionSide" not in body_obj:
         try:
-            inferred = "short" if side_key == "buy" else "long"
+            # Ensure positionSide matches order side: buy -> long, sell -> short
+            inferred = "long" if side_key == "buy" else "short"
             body_obj["positionSide"] = inferred
         except Exception:
             pass
@@ -1248,6 +1321,8 @@ async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_
         if realized_pnl is not None:
             update_values["realized_pnl"] = realized_pnl
 
+        # Clear reservation key when marking closed from rotation
+        update_values["reservation_key"] = None
         await database.execute(trades.update().where(trades.c.id == row["id"]).values(**update_values))
         closed_ids.append(row.get("id"))
 
@@ -1549,25 +1624,29 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
     size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
 
     # determine side from normalized payload
-    # BUY/LONG signals open LONG positions (side="sell"), SELL/SHORT signals open SHORT positions (side="buy")
+    # Map inputs so that BUY/LONG => side='buy' (open long), SELL/SHORT => side='sell' (open short)
     user_side = side  # capture user input for intended direction calculation
     if side:
-        if side.upper() in ("SELL", "SHORT"):
-            side = "buy"
-            signal = "SHORT"
-        elif side.upper() in ("BUY", "LONG"):
+        # `side` may come from normalize_signal_payload as 'buy' or 'sell' or be a hint like 'BUY'/'SELL'/'LONG'/'SHORT'
+        s = str(side).lower()
+        if s in ("sell", "short"):
             side = "sell"
+            signal = "SHORT"
+            user_side = "sell"
+        else:
+            side = "buy"
             signal = "LONG"
+            user_side = "buy"
     else:
-        # No side_hint provided, infer from signal
+        # No explicit side hint provided, infer from signal
         if signal and str(signal).upper() in ("SELL", "SHORT"):
-            side = "buy"
-            signal = "SHORT"
-            user_side = "sell"  # assume user meant sell
-        elif signal and str(signal).upper() in ("BUY", "LONG"):
             side = "sell"
+            signal = "SHORT"
+            user_side = "sell"
+        elif signal and str(signal).upper() in ("BUY", "LONG"):
+            side = "buy"
             signal = "LONG"
-            user_side = "buy"  # assume user meant buy
+            user_side = "buy"
 
     if not side:
         raise HTTPException(status_code=400, detail="Unknown signal; must be BUY or SELL")
@@ -1650,11 +1729,19 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
         if existing_trades:
             # Take the first one (should be only one)
             existing_trade = dict(existing_trades[0])
-            db_signal = str(existing_trade.get("signal") or "").upper()
-            if db_signal == "LONG":
+            db_signal = str(existing_trade.get("signal") or "" ).upper()
+            # Accept multiple possible signal representations
+            if db_signal in ("LONG", "BUY"):
                 current_direction = "long"
-            elif db_signal == "SHORT":
+            elif db_signal in ("SHORT", "SELL"):
                 current_direction = "short"
+            else:
+                # Also check if the DB row stored a side field like 'buy'/'sell'
+                db_side = str(existing_trade.get("side") or "").lower()
+                if db_side in ("buy", "long"):
+                    current_direction = "long"
+                elif db_side in ("sell", "short"):
+                    current_direction = "short"
             current_size = safe_float(existing_trade.get("size")) or 1.0  # Simulate size
         print(f"[debug/place-test] DRY-RUN: Database position - direction: {current_direction}, size: {current_size}")
     else:
@@ -1675,32 +1762,78 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
                     current_direction = "short"
                 current_size = sz
 
+        # If Bitget reports no active position (or size 0), fall back to DB 'placed' trades
+        # This covers propagation latency where Bitget hasn't reflected a newly-placed position yet.
+        try:
+            need_db_fallback = not (normalized_position and safe_float(normalized_position.get("size")) and safe_float(normalized_position.get("size")) > 0)
+        except Exception:
+            need_db_fallback = True
+
+        if need_db_fallback:
+            try:
+                recent_trades = await database.fetch_all(
+                    trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol)).order_by(trades.c.created_at.desc()).limit(1)
+                )
+                if recent_trades:
+                    recent = dict(recent_trades[0])
+                    db_signal = str(recent.get("signal") or "").upper()
+                    if db_signal in ("LONG", "BUY"):
+                        current_direction = "long"
+                    elif db_signal in ("SHORT", "SELL"):
+                        current_direction = "short"
+                    else:
+                        db_side = str(recent.get("side") or "").lower()
+                        if db_side in ("buy", "long"):
+                            current_direction = "long"
+                        elif db_side in ("sell", "short"):
+                            current_direction = "short"
+                    # Use stored size if available
+                    current_size = current_size or safe_float(recent.get("size"))
+                    print(f"[debug/place-test] DB fallback detected placed trade id={recent.get('id')} direction={current_direction} size={current_size}")
+            except Exception as e:
+                print(f"[debug/place-test] DB fallback detection error: {e}")
+
     intended_direction = "short" if user_side and user_side.upper() in ("SELL", "SHORT") else "long"
     print(f"[debug/place-test] Current direction: {current_direction}, Current size: {current_size}, Intended direction: {intended_direction}")
 
     # Logic: For demo/test orders, allow switching positions (close existing and open opposite direction)
-    # Only reject if trying to open same direction as existing position
+    # If there's already an open position in the SAME direction, ignore the new request (no-op)
     if current_direction and current_direction == intended_direction and current_size and current_size > 0:
+        # Reject repeated same-direction demo orders with a clear 400 error so callers keep the existing position
         raise HTTPException(status_code=400, detail=f"Already have an open {current_direction} position for {symbol}. Close it first or use opposite direction to switch.")
 
     # If opposite direction, close existing and open new
     if current_direction and current_direction != intended_direction and current_size and current_size > 0:
         print(f"[debug/place-test] Closing previous {current_direction} position for {symbol} before opening {intended_direction}")
-        # Get existing trade to close
+        # Get existing trade to close. Prefer the placed trade that matches the current direction
         existing_trade = None
-        if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
-            existing_trades = await database.fetch_all(
-                trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol))
-            )
-            if existing_trades:
-                existing_trade = dict(existing_trades[0])
-        else:
-            # Find the trade for the current position
-            existing_trades = await database.fetch_all(
-                trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol))
-            )
-            if existing_trades:
-                existing_trade = dict(existing_trades[0])
+        target_signal = "LONG" if current_direction == "long" else "SHORT"
+        try:
+            if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
+                # Try to find the placed trade that matches the current direction first
+                existing_trades = await database.fetch_all(
+                    trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol) & (trades.c.signal == target_signal))
+                )
+                # Fallback: if none found, pick any placed trade for this symbol
+                if not existing_trades:
+                    existing_trades = await database.fetch_all(
+                        trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol))
+                    )
+                if existing_trades:
+                    existing_trade = dict(existing_trades[0])
+            else:
+                # Live: try to find the matching placed trade in DB first, otherwise fallback to any placed trade
+                existing_trades = await database.fetch_all(
+                    trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol) & (trades.c.signal == target_signal))
+                )
+                if not existing_trades:
+                    existing_trades = await database.fetch_all(
+                        trades.select().where((trades.c.status == "placed") & (trades.c.symbol == symbol))
+                    )
+                if existing_trades:
+                    existing_trade = dict(existing_trades[0])
+        except Exception:
+            existing_trade = None
 
         if existing_trade:
             close_success, close_detail = await close_existing_bitget_position(existing_trade)
@@ -1764,7 +1897,7 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
             normalized_symbol = normalize_exchange_symbol(symbol).replace("/", "").replace(".", "").upper()
             fake_position = {
                 "found": True,
-                "side": "short" if signal == "BUY" else "long",
+                "side": "long" if str(signal).upper() in ("BUY", "LONG") else "short",
                 "size": trade_size_value,
                 "avg_open_price": price_numeric,
                 "margin": margin_value,
@@ -1868,6 +2001,7 @@ async def debug_place_test(req: Request, _: Dict[str, str] = Depends(require_rol
                 realized_pnl=None,
                 status=trade_status,
                 response=resp_text,
+                reservation_key=None,
                 created_at=time.time()
             ))
             updates = {}
@@ -2328,7 +2462,12 @@ async def webhook(req: Request):
             or payload.get("liquidation")
         )
 
-    if event == "SIGNAL":
+    # Treat TradingView 'SIGNAL' alerts and 'ENTRY_FALLBACK' as log-only signals.
+    # Only explicit ENTRY alerts (sent when TradingView records the filled trade)
+    # will proceed to attempt order placement. This keeps the webhook in sync
+    # with the strategy tester's authoritative trade list and avoids acting on
+    # fallback alerts that may be sent when TradingView state is uncertain.
+    if event and str(event).upper() in ("SIGNAL", "ENTRY_FALLBACK"):
         # Decide if we need to log this signal. If a same-side position is
         # already open, we will ignore the incoming signal to prevent duplicate
         # entries in the database.
@@ -2389,12 +2528,14 @@ async def webhook(req: Request):
             created_at=now
         ))
         await broadcast({"type":"signal","id":trade_id,"signal":signal,"symbol":symbol,"price":price, "at":now})
+        # Note: ENTRY_FALLBACK will be logged but not executed. Only
+        # explicit ENTRY alerts (event == 'ENTRY') will open positions.
         return {"ok": True, "id": trade_id, "note": "signal logged"}
 
     elif event == "EXIT":
         # Close the specific trade
         if trade_id_from_payload:
-            await database.execute(trades.update().where(trades.c.id == trade_id_from_payload).values(status="closed"))
+            await database.execute(trades.update().where(trades.c.id == trade_id_from_payload).values(status="closed", reservation_key=None))
             await broadcast({"type":"closed","id":trade_id_from_payload})
         return {"ok": True, "note": "exit processed"}
 
@@ -2403,6 +2544,33 @@ async def webhook(req: Request):
     # - If alert is 'short' and current position is 'long' or 'none', close long (if any) and open short.
     # - If alert is 'long' and current position is 'long', ignore.
     # - If alert is 'long' and current position is 'short' or 'none', close short (if any) and open long.
+    # Enforce execution only on authoritative ENTRY alerts from TradingView's
+    # strategy tester. If the incoming payload is not an ENTRY (for example
+    # SIGNAL, ENTRY_FALLBACK, or has no event), log it and do not attempt
+    # to place or rotate positions. This ensures the backend mirrors the
+    # strategy tester's actual opened positions instead of acting on
+    # speculative alerts.
+    if not (event and str(event).upper() == "ENTRY"):
+        trade_id = trade_id_from_payload or str(uuid.uuid4())
+        await database.execute(trades.insert().values(
+            id=trade_id,
+            signal=signal,
+            symbol=symbol,
+            price=float(price_numeric) if price_numeric is not None else 0.0,
+            size=trade_size_value,
+            size_usd=trade_size_usd_value,
+            leverage=leverage_value,
+            margin=margin_value,
+            liquidation_price=liquidation_price_value,
+            exit_price=None,
+            realized_pnl=None,
+            status="signal",
+            response="",
+            created_at=now
+        ))
+        await broadcast({"type":"signal","id":trade_id,"signal":signal,"symbol":symbol,"price":price, "at":now})
+        return {"ok": True, "id": trade_id, "note": "logged (only ENTRY events execute)"}
+
     intended_direction = None
     if signal and signal.upper() in ("BUY", "LONG"):
         intended_direction = "long"
@@ -2411,7 +2579,7 @@ async def webhook(req: Request):
         intended_direction = "short"
         side = "sell"
     else:
-        await database.execute(trades.update().where(trades.c.id==trade_id_from_payload).values(status="ignored", response="Unknown signal"))
+        await database.execute(trades.update().where(trades.c.id==trade_id_from_payload).values(status="ignored", response="Unknown signal", reservation_key=None))
         await broadcast({"type":"ignored","id":trade_id_from_payload,"reason":"unknown signal"})
         return {"ok": False, "reason": "unknown signal"}
 
@@ -2503,22 +2671,64 @@ async def webhook(req: Request):
 
     # Save incoming alert to DB as pending (use discovered price when available)
     trade_id = trade_id_from_payload or str(uuid.uuid4())
-    await database.execute(trades.insert().values(
-        id=trade_id,
-        signal=signal,
-        symbol=symbol,
-        price=float(price_numeric) if price_numeric is not None else 0.0,
-        size=trade_size_value,
-        size_usd=trade_size_usd_value,
-        leverage=leverage_value,
-        margin=margin_value,
-        liquidation_price=liquidation_price_value,
-        exit_price=None,
-        realized_pnl=None,
-        status="received",
-        response="",
-        created_at=now
-    ))
+    # Support PineScript-provided trade index so we can ignore stale entries
+    pine_idx = None
+    for k in ("pine_trade_index", "tv_trade_index", "trade_index", "pine_index"):
+        if isinstance(payload.get(k), (int, float)):
+            try:
+                pine_idx = int(payload.get(k))
+                break
+            except Exception:
+                pine_idx = None
+
+    # If Pine trade index supplied, ignore if it's older than the latest we know for this symbol
+    if pine_idx is not None:
+        try:
+            q = sqlalchemy.select([sqlalchemy.func.max(trades.c.pine_trade_index)]).where(trades.c.symbol == symbol)
+            row = await database.fetch_one(q)
+            if row is not None:
+                existing_max = row[0]
+                if existing_max is not None and pine_idx < int(existing_max):
+                    tmp_id = trade_id
+                    await broadcast({"type": "ignored", "id": tmp_id, "symbol": symbol, "reason": f"Stale Pine trade index {pine_idx} < existing {existing_max}. Ignored."})
+                    return {"ok": False, "id": tmp_id, "ignored": True, "detail": "stale pine trade index"}
+        except Exception:
+            pass
+
+    # Reservation key prevents concurrent duplicate placements for same symbol+direction
+    reservation_key = f"{symbol}:{intended_direction}"
+    try:
+        await database.execute(trades.insert().values(
+            id=trade_id,
+            signal=signal,
+            symbol=symbol,
+            price=float(price_numeric) if price_numeric is not None else 0.0,
+            size=trade_size_value,
+            size_usd=trade_size_usd_value,
+            leverage=leverage_value,
+            margin=margin_value,
+            liquidation_price=liquidation_price_value,
+            exit_price=None,
+            realized_pnl=None,
+            status="received",
+            response="",
+            reservation_key=reservation_key,
+            pine_trade_index=pine_idx,
+            created_at=now
+        ))
+    except Exception as e:
+        # Detect unique constraint violation (concurrent reservation) and ignore
+        msg = str(e).lower()
+        if "unique" in msg or "constraint" in msg:
+            tmp_id = trade_id
+            await broadcast({"type": "ignored", "id": tmp_id, "symbol": symbol, "reason": "Concurrent reservation exists; ignored"})
+            try:
+                print(f"[webhook] reservation conflict for {reservation_key}: {e}")
+            except Exception:
+                pass
+            return {"ok": False, "id": tmp_id, "ignored": True, "detail": "concurrent reservation"}
+        # Other errors: re-raise
+        raise
     try:
         print(f"[webhook] inserted pending trade id={trade_id} price={price_for_db}")
     except Exception:
@@ -2555,7 +2765,7 @@ async def webhook(req: Request):
         is_success = status_code == 200 and (not bitget_code or str(bitget_code) == "00000")
         new_status = "placed" if is_success else "error"
 
-        await database.execute(trades.update().where(trades.c.id==trade_id).values(status=new_status, response=resp_text))
+        await database.execute(trades.update().where(trades.c.id==trade_id).values(status=new_status, response=resp_text, reservation_key=None))
         await broadcast({
             "type": "placed" if is_success else "error",
             "id": trade_id,
@@ -2574,7 +2784,7 @@ async def webhook(req: Request):
 
         return {"ok": True, "id": trade_id, "status_code": status_code, "response": parsed_resp}
     except Exception as e:
-        await database.execute(trades.update().where(trades.c.id==trade_id).values(status="error", response=str(e)))
+        await database.execute(trades.update().where(trades.c.id==trade_id).values(status="error", response=str(e), reservation_key=None))
         await broadcast({"type": "error", "id": trade_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2670,6 +2880,31 @@ async def close_position(trade_id: str, current_user: Dict[str, str] = Depends(r
         raise
     except Exception as e:
         print(f"[close_position] Error closing trade {trade_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/delete-trade/{trade_id}")
+async def delete_trade(trade_id: str, current_user: Dict[str, str] = Depends(require_role(["admin"]))):
+    """Admin endpoint to delete a trade row from the database."""
+    try:
+        # Ensure trade exists
+        t = await database.fetch_one(trades.select().where(trades.c.id == trade_id))
+        if not t:
+            raise HTTPException(status_code=404, detail="Trade not found")
+
+        await database.execute(trades.delete().where(trades.c.id == trade_id))
+
+        # Notify connected clients that the trade was deleted
+        try:
+            await broadcast({"type": "deleted", "id": trade_id})
+        except Exception:
+            pass
+
+        return {"ok": True, "message": "Trade deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[delete_trade] Error deleting trade {trade_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3127,6 +3362,8 @@ async def close_position(request: Request, current_user: Dict[str, str] = Depend
     if realized_pnl is not None:
         update_values["realized_pnl"] = realized_pnl
 
+    # Clear reservation when marking external close
+    update_values["reservation_key"] = None
     await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_values))
 
     # Broadcast the close event
