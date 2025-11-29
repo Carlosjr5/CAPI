@@ -55,7 +55,7 @@ BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")  # Use pr
 
 # For Railway deployment, override with correct values
 if os.getenv("RAILWAY_ENVIRONMENT"):
-    BITGET_PRODUCT_TYPE = "USDT-FUTURES"
+    BITGET_PRODUCT_TYPE = "UMCBL"
     BITGET_MARGIN_COIN = "USDT"
     BITGET_POSITION_MODE = "single"
 BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN")
@@ -601,17 +601,23 @@ async def close_existing_bitget_position(trade_row) -> Tuple[bool, Optional[str]
             await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_vals))
             return True, None
 
+        # Skip closing in demo mode as close-positions API may not be supported
+        paptrading = os.getenv("PAPTRADING", "1")
+        product_type = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")
+        print(f"[close_position] PAPTRADING={paptrading}, BITGET_PRODUCT_TYPE={product_type}")
+        if paptrading == "1" or product_type == "UMCBL":
+            print(f"[close_position] Skipping close in demo mode for trade {trade_id}")
+            # Mark as closed without actually closing
+            update_vals = {"status": "closed", "reservation_key": None}
+            await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_vals))
+            return True, "Skipped in demo mode"
+
         # Determine opposite side for closing
         close_side = "sell" if signal.upper() in ("BUY", "LONG") else "buy"
 
         original_side = str(signal or "").upper()
         hold_side = "long" if original_side in ("BUY", "LONG") else "short"
-        overrides = {k: v for k, v in {"holdSide": hold_side, "positionSide": hold_side}.items() if v}
-        # Swap the holdSide and positionSide to match the reversed logic
-        if "holdSide" in overrides:
-            overrides["holdSide"] = "short" if hold_side == "long" else "long"
-        if "positionSide" in overrides:
-            overrides["positionSide"] = "short" if hold_side == "long" else "long"
+        overrides = {"holdSide": hold_side}
 
         parsed = None
         last_resp_text: Optional[str] = None
@@ -737,8 +743,18 @@ async def place_demo_order(
     Place an order on Bitget demo futures (v2 mix order)
     We'll place a market order by default. Modify `orderType` to 'limit' if you want limit.
     """
+    # Use Bitget mix API for futures order placement
+    if close_position:
+        candidates = [
+            BITGET_BASE + "/api/v2/mix/order/close-positions",
+        ]
+    else:
+        candidates = [
+            BITGET_BASE + "/api/v2/mix/order/place-order",
+        ]
+
     # Use Bitget mix API for futures trading (v2 mix API is more reliable for paper trading)
-    request_path = "/api/mix/v1/order/placeOrder"
+    request_path = candidates[0].replace(BITGET_BASE, "")
     url = BITGET_BASE + request_path
 
     # For v5 API, we don't need contract discovery - just use the symbol directly
@@ -817,12 +833,6 @@ async def place_demo_order(
 
     print(f"[bitget] Using API key {key_index + 1}/{len(BITGET_API_KEYS)}")
 
-    # Use v2 mix API for futures order placement
-    candidates = [
-        BITGET_BASE + "/api/mix/v1/order/placeOrder",
-        BITGET_BASE + "/api/v2/mix/order/place-order",
-    ]
-
     last_exc = None
     async with httpx.AsyncClient(timeout=10.0) as client:
         for u in candidates:
@@ -835,13 +845,13 @@ async def place_demo_order(
 
                 # Build fresh timestamp and signature for this specific requestPath
                 ts = str(int(time.time() * 1000))
-                sign = build_signature(ts, "POST", request_path, body, BITGET_SECRET)
+                sign = build_signature(ts, "POST", request_path, body, current_secret)
 
                 headers = {
-                    "ACCESS-KEY": BITGET_API_KEY,
+                    "ACCESS-KEY": current_api_key,
                     "ACCESS-SIGN": sign,
                     "ACCESS-TIMESTAMP": ts,
-                    "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+                    "ACCESS-PASSPHRASE": current_passphrase,
                     "Content-Type": "application/json",
                     "paptrading": PAPTRADING,
                     "locale": "en-US",
@@ -1032,9 +1042,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
 
         # Try multiple Bitget API endpoints for positions
         endpoints_to_try = [
-            "/api/mix/v1/position/singlePosition",  # Mix API v1 single position
-            "/api/mix/v1/position/allPosition",  # Mix API v1 all positions
-            "/api/v5/position/list",  # Unified API
+            "/api/v2/mix/position/single-position",  # V2 mix single position
         ]
     
         successful_positions = []
@@ -1042,7 +1050,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
         for endpoint in endpoints_to_try:
             try:
                 if endpoint == "/api/v5/position/list":
-                    body = {}
+                    body = {"productType": "USDT-FUTURES"}
                 else:
                     # For mix API, use product type in body
                     body = {"productType": "USDT-FUTURES"}
@@ -1371,9 +1379,9 @@ async def fetch_market_price(symbol: str):
     candidates = []
     candidates.append(f"https://api.binance.com/api/v3/ticker/price?symbol={s}")
     try:
-        # e.g. https://api.bitget.com/api/mix/v1/market/ticker?symbol=BTCUSDT
-        candidates.append(f"{BITGET_BASE}/api/mix/v1/market/ticker?symbol={s}")
-        candidates.append(f"{BITGET_BASE}/api/spot/v1/market/ticker?symbol={s}")
+        # e.g. https://api.bitget.com/api/mix/v2/market/ticker?symbol=BTCUSDT
+        candidates.append(f"{BITGET_BASE}/api/mix/v2/market/ticker?symbol={s}")
+        candidates.append(f"{BITGET_BASE}/api/spot/v2/market/ticker?symbol={s}")
     except Exception:
         pass
 
@@ -1478,21 +1486,30 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     # Initialize body_obj with default values - use the working parameters from debug_order.py
     client_oid = f"capi-{uuid.uuid4().hex[:20]}"
 
-    body_obj = {
-        "symbol": "",  # Will be set below
-        "productType": local_product,  # Add required productType
-        "orderType": "market",
-        "size": str(size) if size is not None else "0.001",  # Smaller default size like debug script
-        "marginCoin": use_margin_coin,
-        "marginMode": "crossed",  # Use crossed like the working debug script
-        "clientOid": client_oid  # Unique per order to avoid Bitget duplicate errors
-    }
-
-    # reduceOnly/closePosition signals from caller if provided
-    if reduce_only:
-        body_obj["reduceOnly"] = "true"
     if close_position:
-        body_obj["closePosition"] = "true"
+        # For close position, use different payload
+        body_obj = {
+            "symbol": "",  # Will be set below
+            "productType": local_product,  # Use UMCBL for demo
+            "marginCoin": use_margin_coin,
+        }
+        if extra_fields:
+            body_obj.update(extra_fields)
+    else:
+        body_obj = {
+            "symbol": "",  # Will be set below
+            "productType": local_product,  # Add required productType
+            "orderType": "market",
+            "size": str(size) if size is not None else "0.001",  # Smaller default size like debug script
+            "marginCoin": use_margin_coin,
+            "marginMode": "crossed",  # Use crossed like the working debug script
+            "clientOid": client_oid  # Unique per order to avoid Bitget duplicate errors
+        }
+
+        # reduceOnly/closePosition signals from caller if provided
+        if reduce_only:
+            body_obj["reduceOnly"] = "YES"
+
     if extra_fields:
         for key, value in extra_fields.items():
             body_obj[key] = value
@@ -1505,26 +1522,27 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     if "productType" not in body_obj:
         body_obj["productType"] = local_product
 
-    # Map side for single/unilateral accounts when necessary
-    side_key = side.lower()
-    pm = str(BITGET_POSITION_MODE or "").lower()
-    pt = str(BITGET_POSITION_TYPE or "").lower()
-    single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way", "oneway")
-    if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way", "oneway")):
-        # Use buy/sell for unilateral mode - the positionMode handles the unilateral aspect
-        body_obj["side"] = side_key
-    else:
-        body_obj["side"] = side_key
+    if not close_position:
+        # Map side for single/unilateral accounts when necessary
+        side_key = side.lower()
+        pm = str(BITGET_POSITION_MODE or "").lower()
+        pt = str(BITGET_POSITION_TYPE or "").lower()
+        single_indicators = ("single", "single_hold", "unilateral", "one-way", "one_way", "oneway")
+        if any(x in pm for x in single_indicators) or any(x in pt for x in ("unilateral", "one-way", "one_way", "oneway")):
+            # Use buy/sell for unilateral mode - the positionMode handles the unilateral aspect
+            body_obj["side"] = side_key
+        else:
+            body_obj["side"] = side_key
 
-    # positionSide inference - include long/short hint unless explicitly overridden
-    if BITGET_POSITION_SIDE:
-        body_obj["positionSide"] = BITGET_POSITION_SIDE
-    else:
-        try:
-            inferred = "long" if side_key == "buy" else "short"
-            body_obj["positionSide"] = inferred
-        except Exception:
-            pass
+        # positionSide inference - include long/short hint unless explicitly overridden
+        if BITGET_POSITION_SIDE:
+            body_obj["positionSide"] = BITGET_POSITION_SIDE
+        else:
+            try:
+                inferred = "long" if side_key == "buy" else "short"
+                body_obj["positionSide"] = inferred
+            except Exception:
+                pass
 
     return body_obj
 
@@ -2265,10 +2283,10 @@ async def debug_check_creds():
                 sign = build_signature(ts, method, request_path_for_sign, body if body else "", BITGET_SECRET)
 
                 headers = {
-                    "ACCESS-KEY": current_api_key,
+                    "ACCESS-KEY": BITGET_API_KEY,
                     "ACCESS-SIGN": sign,
                     "ACCESS-TIMESTAMP": ts,
-                    "ACCESS-PASSPHRASE": current_passphrase,
+                    "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
                     "Content-Type": "application/json",
                     "paptrading": PAPTRADING,
                     "locale": "en-US",
@@ -3191,7 +3209,7 @@ async def get_all_bitget_positions(current_user: Dict[str, str] = Depends(get_cu
     try:
         # Try multiple endpoints for positions - prioritize demo-compatible endpoints
         endpoints_to_try = [
-            "/api/mix/v1/position/allPosition",  # Mix API v1 all positions (demo compatible)
+            "/api/mix/v2/position/allPosition",  # Mix API v2 all positions (demo compatible)
             "/api/v5/position/list",  # Unified API (fallback)
         ]
 
@@ -3402,7 +3420,7 @@ async def cancel_orders(symbol: str):
             bitget_symbol = sanitized
 
         # Cancel all orders for the symbol
-        request_path = "/api/mix/v1/order/cancel-all-orders"
+        request_path = "/api/mix/v2/order/cancel-all-orders"
         body_obj: Dict[str, Any] = {"symbol": bitget_symbol, "productType": "usdt-futures"}
         if BITGET_MARGIN_COIN:
             body_obj["marginCoin"] = BITGET_MARGIN_COIN
