@@ -281,38 +281,12 @@ def require_role(allowed_roles: List[str]):
 
     return checker
 
-# DB - Use PostgreSQL on Railway, fallback to SQLite with Railway volumes for persistence
+# DB - Use PostgreSQL on Railway, SQLite locally
 DATABASE_URL = os.getenv("DATABASE_URL")  # Railway provides this for PostgreSQL
 if not DATABASE_URL:
-    # For Railway, use persistent volume for SQLite (requires volume to be attached)
-    if os.getenv("RAILWAY_ENVIRONMENT"):
-        # Railway volumes are mounted at /data and persist across deployments
-        db_dir = "/data"
-        db_path = f"{db_dir}/trades.db"
-
-        # Check if volume is mounted (directory should exist and be writable)
-        import os
-        if os.path.exists(db_dir) and os.access(db_dir, os.W_OK):
-            DATABASE_URL = f"sqlite:///{db_path}"
-            print(f"[db] Using Railway persistent volume SQLite database: {db_path}")
-        else:
-            print(f"[db] Warning: Railway volume not mounted at {db_dir}. Add a volume in Railway dashboard.")
-            print("[db] Falling back to PostgreSQL requirement for Railway deployment.")
-            print("[db] Please add a PostgreSQL database service to your Railway project.")
-            # Force failure to prompt user to add PostgreSQL
-            DATABASE_URL = None
-    else:
-        # Local development fallback to SQLite
-        DATABASE_URL = "sqlite:///./trades.db"
-        print("[db] Using local SQLite database")
-
-# Ensure DATABASE_URL is set for Railway
-if os.getenv("RAILWAY_ENVIRONMENT") and not DATABASE_URL:
-    raise RuntimeError(
-        "Railway deployment requires persistent storage. Please either:\n"
-        "1. Add a PostgreSQL database service in Railway dashboard (recommended), or\n"
-        "2. Attach a volume to your Railway service for SQLite persistence"
-    )
+    # Local development fallback to SQLite
+    DATABASE_URL = "sqlite:///./trades.db"
+    print("[db] Using local SQLite database")
 
 database = Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
@@ -345,10 +319,8 @@ else:
     # PostgreSQL for Railway
     engine = sqlalchemy.create_engine(DATABASE_URL)
 
-# Only create tables if not in Railway environment OR if using SQLite with volume
-# (Railway handles PostgreSQL schema, but we need to create SQLite tables)
-if not os.getenv("RAILWAY_ENVIRONMENT") or (DATABASE_URL and DATABASE_URL.startswith("sqlite")):
-    metadata.create_all(engine)
+# Create tables (Railway handles PostgreSQL schema, SQLite needs explicit creation)
+metadata.create_all(engine)
 
 
 def ensure_trade_table_columns():
@@ -2323,24 +2295,10 @@ async def debug_check_creds():
 
 @app.on_event("startup")
 async def startup():
-    # Database setup is now handled in global scope above
-    # Just connect to database and ensure schema
+    # Connect to database and ensure schema
     await database.connect()
+    ensure_trade_table_columns()
 
-    # For Railway with SQLite volumes, ensure tables exist
-    if os.getenv("RAILWAY_ENVIRONMENT") and DATABASE_URL and DATABASE_URL.startswith("sqlite"):
-        try:
-            metadata.create_all(engine)
-            print("[startup] SQLite tables created/verified successfully")
-            ensure_trade_table_columns()
-            print("[startup] SQLite schema migration completed")
-        except Exception as e:
-            print(f"[startup] Error creating/verifying SQLite tables: {e}")
-            raise  # Fail startup if database setup fails
-    else:
-        # Local development - ensure schema
-        ensure_trade_table_columns()
-    
     # Print important runtime info to help verify demo vs prod endpoints and dry-run
     try:
         print(f"[startup] BITGET_BASE={BITGET_BASE} BITGET_DRY_RUN={BITGET_DRY_RUN}")
