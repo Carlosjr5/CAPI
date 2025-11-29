@@ -281,28 +281,38 @@ def require_role(allowed_roles: List[str]):
 
     return checker
 
-# DB - Use PostgreSQL on Railway, fallback to SQLite locally
+# DB - Use PostgreSQL on Railway, fallback to SQLite with Railway volumes for persistence
 DATABASE_URL = os.getenv("DATABASE_URL")  # Railway provides this for PostgreSQL
 if not DATABASE_URL:
-    # For Railway, use a persistent path for SQLite
+    # For Railway, use persistent volume for SQLite (requires volume to be attached)
     if os.getenv("RAILWAY_ENVIRONMENT"):
-        # Railway persistent volume path - create directory if needed
-        import os
+        # Railway volumes are mounted at /data and persist across deployments
         db_dir = "/data"
         db_path = f"{db_dir}/trades.db"
 
-        try:
-            os.makedirs(db_dir, exist_ok=True)
-            print(f"[db] Created Railway persistent directory: {db_dir}")
-        except Exception as e:
-            print(f"[db] Warning: Could not create {db_dir}: {e}")
-
-        DATABASE_URL = f"sqlite:///{db_path}"
-        print(f"[db] Using Railway persistent SQLite database: {db_path}")
+        # Check if volume is mounted (directory should exist and be writable)
+        import os
+        if os.path.exists(db_dir) and os.access(db_dir, os.W_OK):
+            DATABASE_URL = f"sqlite:///{db_path}"
+            print(f"[db] Using Railway persistent volume SQLite database: {db_path}")
+        else:
+            print(f"[db] Warning: Railway volume not mounted at {db_dir}. Add a volume in Railway dashboard.")
+            print("[db] Falling back to PostgreSQL requirement for Railway deployment.")
+            print("[db] Please add a PostgreSQL database service to your Railway project.")
+            # Force failure to prompt user to add PostgreSQL
+            DATABASE_URL = None
     else:
         # Local development fallback to SQLite
         DATABASE_URL = "sqlite:///./trades.db"
         print("[db] Using local SQLite database")
+
+# Ensure DATABASE_URL is set for Railway
+if os.getenv("RAILWAY_ENVIRONMENT") and not DATABASE_URL:
+    raise RuntimeError(
+        "Railway deployment requires persistent storage. Please either:\n"
+        "1. Add a PostgreSQL database service in Railway dashboard (recommended), or\n"
+        "2. Attach a volume to your Railway service for SQLite persistence"
+    )
 
 database = Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
@@ -335,8 +345,9 @@ else:
     # PostgreSQL for Railway
     engine = sqlalchemy.create_engine(DATABASE_URL)
 
-# Only create tables if not in Railway environment (Railway handles this in startup event)
-if not os.getenv("RAILWAY_ENVIRONMENT"):
+# Only create tables if not in Railway environment OR if using SQLite with volume
+# (Railway handles PostgreSQL schema, but we need to create SQLite tables)
+if not os.getenv("RAILWAY_ENVIRONMENT") or (DATABASE_URL and DATABASE_URL.startswith("sqlite")):
     metadata.create_all(engine)
 
 
@@ -2312,32 +2323,22 @@ async def debug_check_creds():
 
 @app.on_event("startup")
 async def startup():
-    # For Railway, ensure /data directory exists before connecting to database
-    if os.getenv("RAILWAY_ENVIRONMENT"):
-        try:
-            os.makedirs("/data", exist_ok=True)
-            print("[startup] Ensured /data directory exists for persistent storage")
-        except Exception as e:
-            print(f"[startup] Warning: Could not create /data directory: {e}")
-
+    # Database setup is now handled in global scope above
+    # Just connect to database and ensure schema
     await database.connect()
 
-    # For Railway deployments, be more conservative with schema changes
-    # Only create tables if they don't exist, never drop them
-    if os.getenv("RAILWAY_ENVIRONMENT"):
-        print("[startup] Railway deployment detected - preserving existing database")
+    # For Railway with SQLite volumes, ensure tables exist
+    if os.getenv("RAILWAY_ENVIRONMENT") and DATABASE_URL and DATABASE_URL.startswith("sqlite"):
         try:
-            # Create tables if they don't exist
             metadata.create_all(engine)
-            print("[startup] Database tables created/verified successfully")
-
-            # Ensure all required columns exist (safe operation for existing tables)
+            print("[startup] SQLite tables created/verified successfully")
             ensure_trade_table_columns()
-            print("[startup] Database schema migration completed")
+            print("[startup] SQLite schema migration completed")
         except Exception as e:
-            print(f"[startup] Error creating/verifying tables: {e}")
+            print(f"[startup] Error creating/verifying SQLite tables: {e}")
+            raise  # Fail startup if database setup fails
     else:
-        # Local development - can be more aggressive with schema changes
+        # Local development - ensure schema
         ensure_trade_table_columns()
     
     # Print important runtime info to help verify demo vs prod endpoints and dry-run
