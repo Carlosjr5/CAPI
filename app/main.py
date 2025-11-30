@@ -1033,10 +1033,10 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
         for endpoint in endpoints_to_try:
             try:
                 if endpoint == "/api/v5/position/list":
-                    body = {"productType": "USDT-FUTURES"}
+                    body = {"productType": BITGET_PRODUCT_TYPE}
                 else:
                     # For mix API, use product type in body
-                    body = {"productType": "USDT-FUTURES"}
+                    body = {"productType": BITGET_PRODUCT_TYPE}
                     if BITGET_MARGIN_COIN:
                         body["marginCoin"] = BITGET_MARGIN_COIN
     
@@ -3180,7 +3180,7 @@ async def get_all_bitget_positions(current_user: Dict[str, str] = Depends(get_cu
                     body = "{}"
                 else:
                     # For mix API, use usdt-futures product type
-                    body_obj = {"productType": "usdt-futures"}
+                    body_obj = {"productType": BITGET_PRODUCT_TYPE.lower()}
                     if BITGET_MARGIN_COIN:
                         body_obj["marginCoin"] = BITGET_MARGIN_COIN
                     body = json.dumps(body_obj, separators=(",", ":"))
@@ -3380,7 +3380,7 @@ async def cancel_orders(symbol: str):
 
         # Cancel all orders for the symbol
         request_path = "/api/mix/v2/order/cancel-all-orders"
-        body_obj: Dict[str, Any] = {"symbol": bitget_symbol, "productType": "usdt-futures"}
+        body_obj: Dict[str, Any] = {"symbol": bitget_symbol, "productType": BITGET_PRODUCT_TYPE.lower()}
         if BITGET_MARGIN_COIN:
             body_obj["marginCoin"] = BITGET_MARGIN_COIN
 
