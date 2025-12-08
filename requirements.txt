@@ -11,3 +11,4 @@ flask
 werkzeug
 gunicorn
 PyJWT
+psycopg2-binary
