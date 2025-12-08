@@ -53,6 +53,10 @@ TRADINGVIEW_SECRET = os.getenv("TRADINGVIEW_SECRET")
 BITGET_BASE = os.getenv("BITGET_BASE") or "https://api.bitget.com"
 BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")  # Use proper API product type for demo futures
 
+# For demo trading, use UMCBL product type
+if PAPTRADING == "1":
+    BITGET_PRODUCT_TYPE = "UMCBL"
+
 # For Railway deployment, override with correct values
 if os.getenv("RAILWAY_ENVIRONMENT"):
     BITGET_PRODUCT_TYPE = "UMCBL"
@@ -531,6 +535,14 @@ def sanitize_symbol_for_bitget(value: Optional[str]) -> str:
         cleaned += "USDT"
     return cleaned
 
+
+def get_bitget_symbol(symbol: str) -> str:
+    """Get the full Bitget symbol including product type suffix for demo trading."""
+    sanitized = sanitize_symbol_for_bitget(symbol)
+    if PAPTRADING == "1":
+        return f"{sanitized}_{BITGET_PRODUCT_TYPE}"
+    return sanitized
+
 # Bitget signature (per docs): timestamp + method + requestPath + [ '?' + queryString ] + body
 def build_signature(timestamp: str, method: str, request_path: str, body: str, secret: str):
     payload = f"{timestamp}{method.upper()}{request_path}{body}"
@@ -745,8 +757,7 @@ async def place_demo_order(
     mapped_symbol = None
 
     # Normalize symbol for Bitget - strip TradingView prefixes/suffixes and whitespace
-    normalized_symbol = sanitize_symbol_for_bitget(symbol)
-    use_symbol = mapped_symbol if mapped_symbol else (normalized_symbol or (normalize_exchange_symbol(symbol) or ""))
+    use_symbol = get_bitget_symbol(symbol)
     body_obj = construct_bitget_payload(
         symbol=use_symbol,
         side=side,
@@ -886,12 +897,7 @@ async def cancel_orders_for_symbol(symbol: str):
 
     try:
         # Normalize symbol for Bitget
-        sanitized = sanitize_symbol_for_bitget(symbol)
-
-        if "_" in sanitized:
-            bitget_symbol = sanitized
-        else:
-            bitget_symbol = sanitized
+        bitget_symbol = get_bitget_symbol(symbol)
 
         # Cancel all orders for the symbol using v5 API
         request_path = "/api/v5/trade/cancel-batch-orders"
@@ -1010,12 +1016,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        sanitized = sanitize_symbol_for_bitget(symbol)
-
-        if "_" in sanitized:
-            bitget_symbol = sanitized
-        else:
-            bitget_symbol = sanitized
+        bitget_symbol = get_bitget_symbol(symbol)
 
         primary_body: Dict[str, Any] = {}
         if BITGET_MARGIN_COIN:
@@ -1035,8 +1036,8 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
                 if endpoint == "/api/v5/position/list":
                     body = {"productType": BITGET_PRODUCT_TYPE}
                 else:
-                    # For mix API, use product type in body
-                    body = {"productType": BITGET_PRODUCT_TYPE}
+                    # For mix API, use product type and symbol in body
+                    body = {"productType": BITGET_PRODUCT_TYPE, "symbol": bitget_symbol}
                     if BITGET_MARGIN_COIN:
                         body["marginCoin"] = BITGET_MARGIN_COIN
     
@@ -1453,7 +1454,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     # or already Bitget style 'BTCUSDT_UMCBL'. Remove prefixes and
     # non-alphanumeric/underscore characters, then construct the
     # Bitget symbol as RAW + '_' + productType when needed.
-    raw = sanitize_symbol_for_bitget(symbol)
+    raw = get_bitget_symbol(symbol)
     # remove dots and any characters except letters, digits and underscore (double-sanitize defensive)
     raw = re.sub(r"[^A-Za-z0-9_]", "", raw)
     
