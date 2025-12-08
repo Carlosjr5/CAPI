@@ -943,7 +943,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
     if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
         return None
 
-    async def _post_bitget(request_path: str, body_obj: Dict[str, Any], label: str) -> Optional[Any]:
+    async def _post_bitget(request_path: str, body_obj: Dict[str, Any], label: str) -> Tuple[Optional[int], Optional[str]]:
         body = json.dumps(body_obj, separators=(",", ":"))
         timestamp = str(int(time.time() * 1000))
         sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
@@ -960,46 +960,25 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+                status_code = resp.status_code
+                resp_text = resp.text
                 try:
-                    data = resp.json()
+                    data_preview = resp.json()
                 except Exception:
-                    # Handle JSON parsing errors gracefully
-                    data = {"error": f"Invalid JSON response: {resp.text[:200]}"}
+                    data_preview = resp_text[:200]
         except Exception as exc:
             try:
                 print(f"[bitget][position] request failure ({label}) for {symbol}: {exc}")
             except Exception:
                 pass
-            return None
+            return None, None
 
         try:
-            print(f"[bitget][position] response ({label}) for {symbol}: status={resp.status_code} data={data}")
+            print(f"[bitget][position] response ({label}) for {symbol}: status={status_code} data={data_preview}")
         except Exception:
             pass
 
-        if not isinstance(data, dict):
-            try:
-                print(f"[bitget][position] invalid response type ({label}) for {symbol}: {type(data)}")
-            except Exception:
-                pass
-            return None
-
-        # Check for error responses
-        if data.get("error"):
-            try:
-                print(f"[bitget][position] API error ({label}) for {symbol}: {data['error']}")
-            except Exception:
-                pass
-            return None
-
-        if str(data.get("code")) != "00000":
-            try:
-                print(f"[bitget][position] API error ({label}) for {symbol}: code={data.get('code')} msg={data.get('msg')}")
-            except Exception:
-                pass
-            return None
-
-        return data.get("data")
+        return status_code, resp_text
 
     def _pick_snapshot(payload: Optional[Any], desired_symbol: str) -> Optional[Dict[str, Any]]:
         if isinstance(payload, dict):
