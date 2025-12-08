@@ -70,10 +70,10 @@ BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN")
 
 DEFAULT_LEVERAGE_RAW = os.getenv("DEFAULT_LEVERAGE")
 try:
-    DEFAULT_LEVERAGE = float(DEFAULT_LEVERAGE_RAW) if DEFAULT_LEVERAGE_RAW not in (None, "") else 30.0
+    DEFAULT_LEVERAGE = float(DEFAULT_LEVERAGE_RAW) if DEFAULT_LEVERAGE_RAW not in (None, "") else 10.0
 except ValueError:
-    print(f"[startup] DEFAULT_LEVERAGE is not a number: {DEFAULT_LEVERAGE_RAW}, using 30.0")
-    DEFAULT_LEVERAGE = 30.0
+    print(f"[startup] DEFAULT_LEVERAGE is not a number: {DEFAULT_LEVERAGE_RAW}, using 10.0")
+    DEFAULT_LEVERAGE = 10.0
 
 # Authentication configuration
 AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY") or secrets.token_urlsafe(32)
@@ -537,10 +537,8 @@ def sanitize_symbol_for_bitget(value: Optional[str]) -> str:
 
 
 def get_bitget_symbol(symbol: str) -> str:
-    """Get the full Bitget symbol including product type suffix for demo trading."""
+    """Get the Bitget symbol (plain, without suffix)."""
     sanitized = sanitize_symbol_for_bitget(symbol)
-    if PAPTRADING == "1":
-        return f"{sanitized}_{BITGET_PRODUCT_TYPE}"
     return sanitized
 
 # Bitget signature (per docs): timestamp + method + requestPath + [ '?' + queryString ] + body
