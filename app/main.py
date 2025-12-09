@@ -69,6 +69,10 @@ BITGET_POSITION_TYPE = os.getenv("BITGET_POSITION_TYPE")  # optional: try values
 BITGET_POSITION_SIDE = os.getenv("BITGET_POSITION_SIDE")  # optional: explicit position side e.g. 'long' or 'short'
 BITGET_DRY_RUN = os.getenv("BITGET_DRY_RUN")
 
+# Default margin coin when env var is missing (common in Railway where we override to USDT)
+if not BITGET_MARGIN_COIN:
+    BITGET_MARGIN_COIN = "USDT"
+
 DEFAULT_LEVERAGE_RAW = os.getenv("DEFAULT_LEVERAGE")
 try:
     DEFAULT_LEVERAGE = float(DEFAULT_LEVERAGE_RAW) if DEFAULT_LEVERAGE_RAW not in (None, "") else 10.0
@@ -575,6 +579,24 @@ def get_bitget_symbol(symbol: str) -> str:
     sanitized = sanitize_symbol_for_bitget(symbol)
     return sanitized
 
+
+def resolve_product_type() -> str:
+    """Return a non-empty productType string for Bitget (defaults to UMCBL for paper)."""
+    pt_upper = (BITGET_PRODUCT_TYPE or "").strip().upper()
+    if not pt_upper:
+        pt_upper = "UMCBL" if PAPTRADING == "1" else "USDT-FUTURES"
+    if pt_upper == "SUMCBL":
+        return "UMCBL"
+    return pt_upper
+
+
+def resolve_margin_coin() -> str:
+    """Return a usable marginCoin, defaulting to USDT when unset."""
+    mc = (BITGET_MARGIN_COIN or "").strip().upper()
+    if not mc:
+        mc = "USDT"
+    return mc
+
 # Bitget signature (per docs): timestamp + method + requestPath + [ '?' + queryString ] + body
 def build_signature(timestamp: str, method: str, request_path: str, body: str, secret: str):
     payload = f"{timestamp}{method.upper()}{request_path}{body}"
@@ -865,7 +887,7 @@ async def place_demo_order(
 
                 # Build fresh timestamp and signature for this specific requestPath
                 ts = str(int(time.time() * 1000))
-                sign = build_signature(ts, "POST", request_path, body, current_secret)
+                sign = build_signature(ts, "POST", request_path_for_sign, body, current_secret)
 
                 headers = {
                     "ACCESS-KEY": current_api_key,
@@ -927,6 +949,7 @@ async def cancel_orders_for_symbol(symbol: str):
 
         # Cancel all orders for the symbol using v5 API
         request_path = "/api/v5/trade/cancel-batch-orders"
+        local_product = resolve_product_type()
         body_obj: Dict[str, Any] = {"symbol": bitget_symbol}
         if BITGET_MARGIN_COIN:
             body_obj["marginCoin"] = BITGET_MARGIN_COIN
@@ -968,18 +991,23 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
     """Fetch current Bitget position details to enrich leverage/margin data."""
     if str(BITGET_DRY_RUN).lower() in ("1", "true", "yes", "on"):
         return None
-    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
+
+    # Gather available credential sets (support multiple API keys)
+    credential_sets = list(zip(BITGET_API_KEYS, BITGET_SECRETS, BITGET_PASSPHRASES))
+    if not credential_sets and BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE:
+        credential_sets = [(BITGET_API_KEY, BITGET_SECRET, BITGET_PASSPHRASE)]
+    if not credential_sets:
         return None
 
-    async def _post_bitget(request_path: str, body_obj: Dict[str, Any], label: str) -> Tuple[Optional[int], Optional[str]]:
+    async def _post_bitget(request_path: str, body_obj: Dict[str, Any], label: str, api_key: str, api_secret: str, api_passphrase: str) -> Tuple[Optional[int], Optional[str]]:
         body = json.dumps(body_obj, separators=(",", ":"))
         timestamp = str(int(time.time() * 1000))
-        sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
+        sign = build_signature(timestamp, "POST", request_path, body, api_secret)
         headers = {
-            "ACCESS-KEY": BITGET_API_KEY,
+            "ACCESS-KEY": api_key,
             "ACCESS-SIGN": sign,
             "ACCESS-TIMESTAMP": timestamp,
-            "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+            "ACCESS-PASSPHRASE": api_passphrase,
             "Content-Type": "application/json",
             "paptrading": PAPTRADING,
             "locale": "en-US",
@@ -1020,12 +1048,30 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
             return payload[0] if payload and isinstance(payload[0], dict) else None
         return None
 
+    def _signature_error(resp_text: Optional[str]) -> bool:
+        try:
+            data = json.loads(resp_text) if resp_text else None
+            if isinstance(data, dict):
+                code_val = str(data.get("code", "")).lower()
+                msg_val = str(data.get("msg", "")).lower()
+                if "40009" in code_val or "sign" in msg_val:
+                    return True
+        except Exception:
+            pass
+        if isinstance(resp_text, str):
+            lower = resp_text.lower()
+            if "signature" in lower or "sign" in lower:
+                return True
+        return False
+
     try:
         bitget_symbol = get_bitget_symbol(symbol)
+        product_type = resolve_product_type()
+        margin_coin = resolve_margin_coin()
 
         primary_body: Dict[str, Any] = {}
-        if BITGET_MARGIN_COIN:
-            primary_body["marginCoin"] = BITGET_MARGIN_COIN
+        if margin_coin:
+            primary_body["marginCoin"] = margin_coin
         if BITGET_POSITION_SIDE:
             primary_body["holdSide"] = BITGET_POSITION_SIDE
 
@@ -1033,81 +1079,97 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
         endpoints_to_try = [
             "/api/v2/mix/position/single-position",  # V2 mix single position
         ]
-    
+
         successful_positions = []
-    
-        for endpoint in endpoints_to_try:
+
+        for cred_idx, (api_key, api_secret, api_passphrase) in enumerate(credential_sets):
             try:
-                if endpoint == "/api/v5/position/list":
-                    body = {"productType": BITGET_PRODUCT_TYPE}
-                else:
-                    # For mix API, use product type and symbol in body
-                    body = {"productType": BITGET_PRODUCT_TYPE, "symbol": bitget_symbol}
-                    if BITGET_MARGIN_COIN:
-                        body["marginCoin"] = BITGET_MARGIN_COIN
-    
-                status_code, resp_text = await _post_bitget(endpoint, body, f"positions-{endpoint.split('/')[-1]}")
-    
+                print(f"[bitget][position] using API key {cred_idx + 1}/{len(credential_sets)}")
+            except Exception:
+                pass
+
+            signature_failed = False
+            for endpoint in endpoints_to_try:
+                try:
+                    if endpoint == "/api/v5/position/list":
+                        body = {"productType": product_type}
+                    else:
+                        # For mix API, use product type and symbol in body
+                        body = {"productType": product_type, "symbol": bitget_symbol}
+                        if margin_coin:
+                            body["marginCoin"] = margin_coin
+
+                    status_code, resp_text = await _post_bitget(endpoint, body, f"positions-{endpoint.split('/')[-1]}", api_key, api_secret, api_passphrase)
+
+                    if status_code == 200:
+                        try:
+                            data = json.loads(resp_text)
+                            if isinstance(data, dict):
+                                # Check for success codes
+                                if data.get("code") == "00000" or data.get("code") == "0":
+                                    positions = data.get("data", [])
+                                    if isinstance(positions, list):
+                                        for pos in positions:
+                                            if isinstance(pos, dict) and pos.get("symbol") == bitget_symbol.upper():
+                                                successful_positions.append(pos)
+                                                print(f"[bitget][position] Found position for {bitget_symbol}: {pos}")
+                                    elif isinstance(positions, dict) and positions.get("symbol") == bitget_symbol.upper():
+                                        successful_positions.append(positions)
+                                        print(f"[bitget][position] Found position for {bitget_symbol}: {positions}")
+                                    # Also check if positions contains our symbol regardless of exact match
+                                    elif isinstance(positions, list):
+                                        for pos in positions:
+                                            if isinstance(pos, dict) and pos.get("symbol"):
+                                                print(f"[bitget][position] Available position symbol: {pos.get('symbol')}")
+                                elif data.get("msg"):
+                                    try:
+                                        print(f"[bitget][position] {endpoint} error: {data.get('msg')}")
+                                    except Exception:
+                                        pass
+                        except json.JSONDecodeError:
+                            pass
+                    else:
+                        try:
+                            print(f"[bitget][position] {endpoint} HTTP {status_code}: {resp_text[:100]}...")
+                        except Exception:
+                            pass
+
+                    # If we see a signature error, rotate to next credential set
+                    if _signature_error(resp_text):
+                        signature_failed = True
+                        try:
+                            print(f"[bitget][position] signature error with credential {cred_idx + 1}; trying next")
+                        except Exception:
+                            pass
+                        break
+                except Exception as e:
+                    try:
+                        print(f"[bitget][position] Exception with {endpoint}: {e}")
+                    except Exception:
+                        pass
+
+            if successful_positions:
+                return successful_positions[0]
+            if signature_failed:
+                # Try next credential set
+                continue
+
+            # Try account info as final verification for this credential
+            try:
+                status_code, resp_text = await _post_bitget("/api/v5/account/account-info", {}, "account", api_key, api_secret, api_passphrase)
                 if status_code == 200:
                     try:
                         data = json.loads(resp_text)
-                        if isinstance(data, dict):
-                            # Check for success codes
-                            if data.get("code") == "00000" or data.get("code") == "0":
-                                positions = data.get("data", [])
-                                if isinstance(positions, list):
-                                    for pos in positions:
-                                        if isinstance(pos, dict) and pos.get("symbol") == bitget_symbol.upper():
-                                            successful_positions.append(pos)
-                                            print(f"[bitget][position] Found position for {bitget_symbol}: {pos}")
-                                elif isinstance(positions, dict) and positions.get("symbol") == bitget_symbol.upper():
-                                    successful_positions.append(positions)
-                                    print(f"[bitget][position] Found position for {bitget_symbol}: {positions}")
-                                # Also check if positions contains our symbol regardless of exact match
-                                elif isinstance(positions, list):
-                                    for pos in positions:
-                                        if isinstance(pos, dict) and pos.get("symbol"):
-                                            print(f"[bitget][position] Available position symbol: {pos.get('symbol')}")
-                            elif data.get("msg"):
-                                try:
-                                    print(f"[bitget][position] {endpoint} error: {data.get('msg')}")
-                                except Exception:
-                                    pass
+                        if isinstance(data, dict) and (data.get("code") == "00000" or data.get("code") == "0"):
+                            print(f"[bitget][position] Account API works for {symbol}, but position APIs returned no data")
+                        else:
+                            print(f"[bitget][position] Account API error: {data.get('msg', 'unknown')}")
                     except json.JSONDecodeError:
-                        pass
+                        print(f"[bitget][position] Account API returned invalid JSON")
                 else:
-                    try:
-                        print(f"[bitget][position] {endpoint} HTTP {status_code}: {resp_text[:100]}...")
-                    except Exception:
-                        pass
+                    print(f"[bitget][position] Account API HTTP {status_code}")
             except Exception as e:
-                try:
-                    print(f"[bitget][position] Exception with {endpoint}: {e}")
-                except Exception:
-                    pass
-    
-        # Return first successful position found
-        if successful_positions:
-            return successful_positions[0]
-    
-        # Try account info as final verification
-        try:
-            status_code, resp_text = await _post_bitget("/api/v5/account/account-info", {}, "account")
-            if status_code == 200:
-                try:
-                    data = json.loads(resp_text)
-                    if isinstance(data, dict) and (data.get("code") == "00000" or data.get("code") == "0"):
-                        print(f"[bitget][position] Account API works for {symbol}, but position APIs returning 404 - check if account has live positions")
-                    else:
-                        print(f"[bitget][position] Account API error: {data.get('msg', 'unknown')}")
-                except json.JSONDecodeError:
-                    print(f"[bitget][position] Account API returned invalid JSON")
-            else:
-                print(f"[bitget][position] Account API HTTP {status_code}")
-        except Exception as e:
-            print(f"[bitget][position] Account API exception: {e}")
-    
-        return None
+                print(f"[bitget][position] Account API exception: {e}")
 
         try:
             print(f"[bitget][position] no position snapshot found for {symbol} after fallbacks")
@@ -1465,12 +1527,10 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     
     # Resolve margin coin defaults per product type. Bitget demo markets expect
     # USDT for UMCBL and SUSDT for SUMCBL unless explicitly overridden.
-    margin_coin_env = (BITGET_MARGIN_COIN or "").strip()
-    pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-    local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
+    local_product = resolve_product_type()
 
     # For USDT futures, use USDT as margin coin
-    use_margin_coin = margin_coin_env or "USDT"
+    use_margin_coin = resolve_margin_coin()
     margin_mode = (BITGET_MARGIN_MODE or "crossed").lower()
     if margin_mode not in ("cross", "crossed", "isolated"):
         margin_mode = "crossed"
