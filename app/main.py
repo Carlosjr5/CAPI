@@ -712,6 +712,35 @@ async def close_existing_bitget_position(trade_row) -> Tuple[bool, Optional[str]
                 continue
             break
 
+        # Fallback: send a reduce-only market order via place-order endpoint if close-positions failed
+        try:
+            print(f"[close_position] Fallback reduce-only order for trade {trade_id} side={close_side} size={size_value}")
+            fb_status, fb_resp = await place_demo_order(
+                symbol=symbol,
+                side=close_side,
+                size=size_value,
+                reduce_only=True,
+                close_position=False,
+                extra_fields={"holdSide": hold_side},
+            )
+            fb_text = fb_resp if isinstance(fb_resp, str) else json.dumps(fb_resp) if fb_resp is not None else None
+            print(f"[close_position] Fallback response status={fb_status} resp={fb_text}")
+
+            fb_parsed = None
+            if fb_resp:
+                try:
+                    fb_parsed = json.loads(fb_resp) if isinstance(fb_resp, str) else fb_resp
+                except Exception:
+                    fb_parsed = None
+            if fb_status == 200 and isinstance(fb_parsed, dict) and fb_parsed.get("code") == "00000":
+                print(f"[close_position] Fallback reduce-only order accepted for trade {trade_id}")
+                return True, None
+        except Exception as fb_exc:
+            try:
+                print(f"[close_position] Fallback reduce-only order failed for trade {trade_id}: {fb_exc}")
+            except Exception:
+                pass
+
         try:
             snapshot = await fetch_bitget_position(symbol)
             normalized = normalize_bitget_position(symbol, snapshot) if snapshot else None
@@ -779,26 +808,31 @@ async def place_demo_order(
         extra_fields=extra_fields,
     )
 
-    # Set side for all products
-    side_key = side.lower()
-    body_obj["side"] = side_key
+    # For close-position requests, Bitget expects holdSide and symbol; omit side/position hints to avoid rejections.
+    if not close_position:
+        side_key = side.lower()
+        body_obj["side"] = side_key
 
-    # Optional: include position hints when configured. Respect any values set by construct_bitget_payload.
-    if BITGET_POSITION_MODE and "positionMode" not in body_obj:
-        body_obj["positionMode"] = normalize_position_mode(BITGET_POSITION_MODE)
+        # Optional: include position hints when configured. Respect any values set by construct_bitget_payload.
+        if BITGET_POSITION_MODE and "positionMode" not in body_obj:
+            body_obj["positionMode"] = normalize_position_mode(BITGET_POSITION_MODE)
 
-    if BITGET_POSITION_SIDE and "positionSide" not in body_obj:
-        body_obj["positionSide"] = BITGET_POSITION_SIDE
-    elif "positionSide" not in body_obj:
-        try:
-            # Ensure positionSide matches order side: buy -> long, sell -> short
-            inferred = "long" if side_key == "buy" else "short"
-            body_obj["positionSide"] = inferred
-        except Exception:
-            pass
+        if BITGET_POSITION_SIDE and "positionSide" not in body_obj:
+            body_obj["positionSide"] = BITGET_POSITION_SIDE
+        elif "positionSide" not in body_obj:
+            try:
+                # Ensure positionSide matches order side: buy -> long, sell -> short
+                inferred = "long" if side_key == "buy" else "short"
+                body_obj["positionSide"] = inferred
+            except Exception:
+                pass
 
-    if BITGET_POSITION_TYPE and "positionType" not in body_obj:
-        body_obj["positionType"] = normalize_position_type(BITGET_POSITION_TYPE)
+        if BITGET_POSITION_TYPE and "positionType" not in body_obj:
+            body_obj["positionType"] = normalize_position_type(BITGET_POSITION_TYPE)
+    else:
+        # Explicitly drop any side/position hints if caller passed them via extra_fields
+        for noisy_key in ("side", "positionSide", "positionMode", "positionType"):
+            body_obj.pop(noisy_key, None)
 
     body = json.dumps(body_obj, separators=(',', ':'))  # compact body
     # If dry-run is enabled, don't call Bitget — return a simulated successful response
@@ -946,7 +980,10 @@ async def cancel_orders_for_symbol(symbol: str):
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                data = resp.text
 
             # Log the cancellation result
             try:
