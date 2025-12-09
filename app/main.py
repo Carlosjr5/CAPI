@@ -598,12 +598,6 @@ async def close_existing_bitget_position(trade_row) -> Tuple[bool, Optional[str]
         paptrading = os.getenv("PAPTRADING", "1")
         product_type = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")
         print(f"[close_position] PAPTRADING={paptrading}, BITGET_PRODUCT_TYPE={product_type}")
-        if paptrading == "1" or product_type == "UMCBL":
-            print(f"[close_position] Skipping close in demo mode for trade {trade_id}")
-            # Mark as closed without actually closing
-            update_vals = {"status": "closed", "reservation_key": None}
-            await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_vals))
-            return True, "Skipped in demo mode"
 
         # Determine opposite side for closing
         close_side = "sell" if signal.upper() in ("BUY", "LONG") else "buy"
@@ -1176,9 +1170,9 @@ def normalize_bitget_position(requested_symbol: str, snapshot: Dict[str, Any]) -
     if size is not None:
         signed_size = size
         if side in ("short", "sell"):
-            signed_size = abs(size)
-        elif side in ("long", "buy"):
             signed_size = -abs(size)
+        elif side in ("long", "buy"):
+            signed_size = abs(size)
 
     normalized = {
         "requested_symbol": requested_symbol,
