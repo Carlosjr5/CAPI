@@ -1334,24 +1334,8 @@ function App() {
                          </div>
                          <div className="hero-stats" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                            <div className={`hero-stat pnl ${pnlTone}`}>
-                             <span className="stat-label">P&L @ 10x</span>
-                             <span className="stat-value">
-                               {(() => {
-                                 // Calculate P&L at 10x leverage for positions that have leverage data
-                                 if (bitgetPosition?.found && bitgetPosition.unrealized_pnl !== null && bitgetPosition.unrealized_pnl !== undefined) {
-                                   const pnlValue = parseFloat(bitgetPosition.unrealized_pnl)
-                                   // If leverage is available and not 10x, adjust the P&L to 10x equivalent
-                                   if (bitgetPosition.leverage && bitgetPosition.leverage !== 10) {
-                                     const pnlAt10x = pnlValue * (10 / bitgetPosition.leverage)
-                                     return formatCurrency(pnlAt10x)
-                                   }
-                                   // If leverage is 10x or unknown, show as-is
-                                   return formatCurrency(pnlValue)
-                                 }
-                                 // Fallback to calculated PnL
-                                 return pnlDisplay
-                               })()}
-                             </span>
+                             <span className="stat-label">P&L</span>
+                             <span className="stat-value">{pnlDisplay}</span>
                            </div>
                            {isAdmin && trade && (
                              <button
@@ -1392,18 +1376,6 @@ function App() {
                          </div>
                          {hasSnapshot && (
                            <div className="position-metric-grid" style={{ marginTop: '10px', justifyContent: 'center' }}>
-                             <div className="position-metric">
-                               <span className="label">Size</span>
-                               <span className="value">
-                                 {bitgetPosition.sizeValue !== null ? formatNumber(bitgetPosition.sizeValue) : '—'}
-                               </span>
-                             </div>
-                             <div className="position-metric">
-                               <span className="label">Entry Price</span>
-                               <span className="value">
-                                 {bitgetPosition.avg_open_price !== null ? formatCurrency(bitgetPosition.avg_open_price) : '—'}
-                               </span>
-                             </div>
                              <div className="position-metric">
                                <span className="label">Mark Price</span>
                                <span className="value">
