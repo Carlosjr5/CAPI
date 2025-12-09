@@ -618,20 +618,6 @@ async def close_existing_bitget_position(trade_row) -> Tuple[bool, Optional[str]
 
             await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_vals))
             return True, None
-
-
-          # Skip closing in demo mode as close-positions API may not be supported
-        paptrading = os.getenv("PAPTRADING", "1")
-        product_type = os.getenv("BITGET_PRODUCT_TYPE", "UMCBL")
-        print(f"[close_position] PAPTRADING={paptrading}, BITGET_PRODUCT_TYPE={product_type}")
-        if paptrading == "1" or product_type == "UMCBL":
-            print(f"[close_position] Skipping close in demo mode for trade {trade_id}")
-            # Mark as closed without actually closing
-            update_vals = {"status": "closed", "reservation_key": None}
-            await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_vals))
-            return True, "Skipped in demo mode"
-
-
         # Determine opposite side for closing
         close_side = "sell" if signal.upper() in ("BUY", "LONG") else "buy"
 
