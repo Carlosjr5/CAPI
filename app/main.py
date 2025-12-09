@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import socket
 import re
 from urllib.parse import urlparse
+import urllib.parse
 import httpx
 import sqlalchemy
 from sqlalchemy import text
@@ -973,10 +974,10 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
     if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE and BITGET_BASE):
         return None
 
-    async def _post_bitget(request_path: str, body_obj: Dict[str, Any], label: str) -> Optional[Any]:
-        body = json.dumps(body_obj, separators=(",", ":"))
+    async def _bitget_request(method: str, request_path: str, body_obj: Optional[Dict[str, Any]], label: str) -> Tuple[int, str]:
+        body = json.dumps(body_obj, separators=(",", ":")) if body_obj is not None else ""
         timestamp = str(int(time.time() * 1000))
-        sign = build_signature(timestamp, "POST", request_path, body, BITGET_SECRET)
+        sign = build_signature(timestamp, method.upper(), request_path, body, BITGET_SECRET)
         headers = {
             "ACCESS-KEY": BITGET_API_KEY,
             "ACCESS-SIGN": sign,
@@ -989,47 +990,24 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
 
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
-                resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
-                try:
-                    data = resp.json()
-                except Exception:
-                    # Handle JSON parsing errors gracefully
-                    data = {"error": f"Invalid JSON response: {resp.text[:200]}"}
+                if method.upper() == "GET":
+                    resp = await client.get(BITGET_BASE + request_path, headers=headers)
+                else:
+                    resp = await client.post(BITGET_BASE + request_path, headers=headers, content=body)
+                resp_text = resp.text
         except Exception as exc:
             try:
                 print(f"[bitget][position] request failure ({label}) for {symbol}: {exc}")
             except Exception:
                 pass
-            return None
+            return 0, json.dumps({"error": str(exc)})
 
         try:
-            print(f"[bitget][position] response ({label}) for {symbol}: status={resp.status_code} data={data}")
+            print(f"[bitget][position] response ({label}) for {symbol}: status={resp.status_code} data={resp_text[:200]}")
         except Exception:
             pass
 
-        if not isinstance(data, dict):
-            try:
-                print(f"[bitget][position] invalid response type ({label}) for {symbol}: {type(data)}")
-            except Exception:
-                pass
-            return None
-
-        # Check for error responses
-        if data.get("error"):
-            try:
-                print(f"[bitget][position] API error ({label}) for {symbol}: {data['error']}")
-            except Exception:
-                pass
-            return None
-
-        if str(data.get("code")) != "00000":
-            try:
-                print(f"[bitget][position] API error ({label}) for {symbol}: code={data.get('code')} msg={data.get('msg')}")
-            except Exception:
-                pass
-            return None
-
-        return data.get("data")
+        return resp.status_code, resp_text
 
     def _pick_snapshot(payload: Optional[Any], desired_symbol: str) -> Optional[Dict[str, Any]]:
         if isinstance(payload, dict):
@@ -1051,7 +1029,11 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
         else:
             bitget_symbol = sanitized
 
-        primary_body: Dict[str, Any] = {}
+        # Normalize product type for Bitget mix endpoints
+        pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
+        local_product = "UMCBL" if pt_upper in ("SUMCBL", "USDT-FUTURES") else pt_upper
+
+        primary_body: Dict[str, Any] = {"symbol": bitget_symbol, "productType": local_product}
         if BITGET_MARGIN_COIN:
             primary_body["marginCoin"] = BITGET_MARGIN_COIN
         if BITGET_POSITION_SIDE:
@@ -1067,14 +1049,18 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
         for endpoint in endpoints_to_try:
             try:
                 if endpoint == "/api/v5/position/list":
-                    body = {"productType": BITGET_PRODUCT_TYPE}
+                    body = {"productType": local_product}
+                    status_code, resp_text = await _bitget_request("POST", endpoint, body, f"positions-{endpoint.split('/')[-1]}")
                 else:
-                    # For mix API, use product type in body
-                    body = {"productType": BITGET_PRODUCT_TYPE}
+                    # For the v2 mix single-position endpoint, Bitget expects GET with signed query string
+                    params: Dict[str, Any] = {"symbol": bitget_symbol, "productType": local_product}
                     if BITGET_MARGIN_COIN:
-                        body["marginCoin"] = BITGET_MARGIN_COIN
-    
-                status_code, resp_text = await _post_bitget(endpoint, body, f"positions-{endpoint.split('/')[-1]}")
+                        params["marginCoin"] = BITGET_MARGIN_COIN
+                    if BITGET_POSITION_SIDE:
+                        params["holdSide"] = BITGET_POSITION_SIDE
+                    query = urllib.parse.urlencode(params)
+                    request_path_with_qs = f"{endpoint}?{query}"
+                    status_code, resp_text = await _bitget_request("GET", request_path_with_qs, None, f"positions-{endpoint.split('/')[-1]}")
     
                 if status_code == 200:
                     try:
@@ -1105,7 +1091,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
                         pass
                 else:
                     try:
-                        print(f"[bitget][position] {endpoint} HTTP {status_code}: {resp_text[:100]}...")
+                        print(f"[bitget][position] {endpoint} HTTP {status_code}: {resp_text[:180]}")
                     except Exception:
                         pass
             except Exception as e:
@@ -1120,7 +1106,7 @@ async def fetch_bitget_position(symbol: str) -> Optional[Dict[str, Any]]:
     
         # Try account info as final verification
         try:
-            status_code, resp_text = await _post_bitget("/api/v5/account/account-info", {}, "account")
+            status_code, resp_text = await _bitget_request("GET", "/api/v5/account/account-info", None, "account")
             if status_code == 200:
                 try:
                     data = json.loads(resp_text)
