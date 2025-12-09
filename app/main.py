@@ -52,6 +52,7 @@ PAPTRADING = os.getenv("PAPTRADING", "1")
 TRADINGVIEW_SECRET = os.getenv("TRADINGVIEW_SECRET")
 BITGET_BASE = os.getenv("BITGET_BASE") or "https://api.bitget.com"
 BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")  # Use proper API product type for demo futures
+BITGET_MARGIN_MODE = os.getenv("BITGET_MARGIN_MODE", "isolated")  # default isolated; set env to override
 
 # For Railway deployment, override with correct values
 if os.getenv("RAILWAY_ENVIRONMENT"):
@@ -1495,6 +1496,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     margin_coin_env = (BITGET_MARGIN_COIN or "").strip()
     pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
     local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
+    margin_mode_value = str(BITGET_MARGIN_MODE or "isolated").lower()
 
     # For USDT futures, use USDT as margin coin
     use_margin_coin = margin_coin_env or "USDT"
@@ -1508,6 +1510,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
             "symbol": "",  # Will be set below
             "productType": local_product,  # Use UMCBL for demo
             "marginCoin": use_margin_coin,
+            "marginMode": margin_mode_value,
         }
         if extra_fields:
             body_obj.update(extra_fields)
@@ -1518,7 +1521,8 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
             "orderType": "market",
             "size": str(size) if size is not None else "0.001",  # Smaller default size like debug script
             "marginCoin": use_margin_coin,
-            "marginMode": "crossed",  # Use crossed like the working debug script
+            "marginMode": margin_mode_value,
+            "leverage": str(DEFAULT_LEVERAGE),
             "clientOid": client_oid  # Unique per order to avoid Bitget duplicate errors
         }
 
