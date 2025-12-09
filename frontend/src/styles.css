@@ -124,8 +124,8 @@ body{margin:0;background:#0f172a;color:#e2e8f0;-webkit-font-smoothing:antialiase
 .symbol-toggle.active{background:rgba(96,165,250,0.1);color:#60a5fa;border-color:rgba(255,255,255,0.6)}
 .refresh-btn .refresh-icon{font-size:16px}
 
-.positions-grid{display:flex;gap:2px;align-items:stretch;flex-wrap:wrap;max-width:100%;justify-content:center}
-.positions-grid .card{flex:1 1 100%;min-width:100%;max-width:100%;padding:6px 8px}
+.positions-grid{display:flex;gap:8px;align-items:stretch;flex-wrap:wrap;max-width:100%;justify-content:center}
+.positions-grid .card{flex:1 1 360px;min-width:320px;max-width:520px;padding:10px 12px}
 .position-metric-grid.compact{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
 .position-metric{background:rgba(15,23,42,0.7);border:1px solid rgba(148,163,184,0.12);border-radius:14px;padding:12px 14px;display:flex;flex-direction:column;gap:6px;box-shadow:0 12px 22px rgba(8,15,35,0.26)}
 .position-metric .label{font-size:12px;text-transform:uppercase;letter-spacing:1.5px;color:rgba(148,163,184,0.7)}

@@ -1325,6 +1325,22 @@ function App() {
                  const pnlDisplay = positionPnL !== null && isFiniteNumber(positionPnL) ? formatCurrency(positionPnL) : '—'
                  const pnlTone = positionPnL > 0 ? 'positive' : positionPnL < 0 ? 'negative' : 'neutral'
 
+                 // Build metric tiles explicitly (no Size/Entry). Prefer Bitget snapshot, fallback to live price/leverage hints
+                 const metricItems = []
+                 const markValue = Number.isFinite(Number(bitgetPosition?.mark_price))
+                   ? Number(bitgetPosition.mark_price)
+                   : Number.isFinite(Number(currentPrices[symbol]))
+                     ? Number(currentPrices[symbol])
+                     : null
+                 const leverageValue = bitgetPosition?.leverage ?? trade?.leverage ?? null
+
+                 if (markValue !== null) {
+                   metricItems.push({ label: 'Mark Price', value: formatCurrency(markValue) })
+                 }
+                 if (leverageValue !== null && leverageValue !== undefined && leverageValue !== '') {
+                   metricItems.push({ label: 'Leverage', value: `${leverageValue}x` })
+                 }
+
                  return (
                    <div key={tradeId} className="card current-position-card">
                      <div className="position-content">
@@ -1374,20 +1390,14 @@ function App() {
                              </button>
                            )}
                          </div>
-                         {hasSnapshot && (
-                           <div className="position-metric-grid" style={{ marginTop: '10px', justifyContent: 'center' }}>
-                             <div className="position-metric">
-                               <span className="label">Mark Price</span>
-                               <span className="value">
-                                 {bitgetPosition.mark_price !== null ? formatCurrency(bitgetPosition.mark_price) : '—'}
-                               </span>
-                             </div>
-                             <div className="position-metric">
-                               <span className="label">Leverage</span>
-                               <span className="value">
-                                 {bitgetPosition.leverage !== null ? `${bitgetPosition.leverage}x` : '—'}
-                               </span>
-                             </div>
+                         {metricItems.length > 0 && (
+                           <div className="position-metric-grid compact" style={{ marginTop: '10px', justifyContent: 'center' }}>
+                             {metricItems.map((item) => (
+                               <div key={item.label} className="position-metric">
+                                 <span className="label">{item.label}</span>
+                                 <span className="value">{item.value}</span>
+                               </div>
+                             ))}
                            </div>
                          )}
                          <div className="muted" style={{ marginTop: '6px', fontSize: '11px' }}>
