@@ -2357,9 +2357,25 @@ async def webhook(req: Request):
         # else: allow anyway but note in logs (you can change this to reject)
     # Extract fields
     event = payload.get("event")  # SIGNAL, ENTRY, EXIT
-    signal = payload.get("signal") or payload.get("action") or ""
-    if not signal and event:
-        signal = str(event).upper()
+    raw_signal = payload.get("signal") or payload.get("action") or ""
+    if (not raw_signal) and event:
+        raw_signal = str(event)
+    signal = str(raw_signal).upper()
+    # Enforce explicit LONG/SHORT labels; ignore BUY/SELL or any other aliases
+    if signal in ("BUY", "SELL"):
+        reason = "Only LONG/SHORT signals are accepted; ignoring BUY/SELL alias"
+        try:
+            await broadcast({"type": "ignored", "reason": reason, "payload": payload})
+        except Exception:
+            pass
+        return {"ok": False, "ignored": True, "reason": reason}
+    if signal and signal not in ("LONG", "SHORT"):
+        reason = f"Unknown signal '{signal}'. Only LONG/SHORT are accepted."
+        try:
+            await broadcast({"type": "ignored", "reason": reason, "payload": payload})
+        except Exception:
+            pass
+        return {"ok": False, "ignored": True, "reason": reason}
     trade_id_from_payload = payload.get("trade_id")
     raw_symbol = payload.get("symbol") or payload.get("ticker") or ""
     symbol = sanitize_symbol_for_bitget(raw_symbol) or (normalize_exchange_symbol(raw_symbol) or "")
