@@ -619,6 +619,19 @@ async def close_existing_bitget_position(trade_row) -> Tuple[bool, Optional[str]
             await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_vals))
             return True, None
 
+
+          # Skip closing in demo mode as close-positions API may not be supported
+        paptrading = os.getenv("PAPTRADING", "1")
+        product_type = os.getenv("BITGET_PRODUCT_TYPE", "UMCBL")
+        print(f"[close_position] PAPTRADING={paptrading}, BITGET_PRODUCT_TYPE={product_type}")
+        if paptrading == "1" or product_type == "UMCBL":
+            print(f"[close_position] Skipping close in demo mode for trade {trade_id}")
+            # Mark as closed without actually closing
+            update_vals = {"status": "closed", "reservation_key": None}
+            await database.execute(trades.update().where(trades.c.id == trade_id).values(**update_vals))
+            return True, "Skipped in demo mode"
+
+
         # Determine opposite side for closing
         close_side = "sell" if signal.upper() in ("BUY", "LONG") else "buy"
 
@@ -852,7 +865,7 @@ async def place_demo_order(
 
                 # Build fresh timestamp and signature for this specific requestPath
                 ts = str(int(time.time() * 1000))
-                sign = build_signature(ts, "POST", request_path, body, current_secret)
+                sign = build_signature(ts, "POST", request_path_for_sign, body, current_secret)
 
                 headers = {
                     "ACCESS-KEY": current_api_key,
@@ -916,6 +929,12 @@ async def cancel_orders_for_symbol(symbol: str):
             bitget_symbol = sanitized
         else:
             bitget_symbol = sanitized
+
+        pt_upper = (BITGET_PRODUCT_TYPE or "UMCBL").upper()
+        if pt_upper in ("SUMCBL", "USDT-FUTURES", "UMCBL"):
+            local_product = "UMCBL"
+        else:
+            local_product = pt_upper or "UMCBL"
 
         # Cancel all orders for the symbol using v5 API
         request_path = "/api/v5/trade/cancel-batch-orders"
@@ -1469,8 +1488,11 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
     # Resolve margin coin defaults per product type. Bitget demo markets expect
     # USDT for UMCBL and SUSDT for SUMCBL unless explicitly overridden.
     margin_coin_env = (BITGET_MARGIN_COIN or "").strip()
-    pt_upper = (BITGET_PRODUCT_TYPE or "").upper()
-    local_product = "UMCBL" if pt_upper == "SUMCBL" else pt_upper
+    pt_upper = (BITGET_PRODUCT_TYPE or "UMCBL").upper()
+    if pt_upper in ("SUMCBL", "USDT-FUTURES", "UMCBL"):
+        local_product = "UMCBL"
+    else:
+        local_product = pt_upper or "UMCBL"
     margin_mode_value = str(BITGET_MARGIN_MODE or "isolated").lower()
 
     # For USDT futures, use USDT as margin coin
