@@ -32,10 +32,32 @@ BITGET_API_KEY = os.getenv("BITGET_API_KEY")
 BITGET_SECRET = os.getenv("BITGET_SECRET")
 BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
 
-# Support multiple API keys (comma-separated for load balancing/failover)
-BITGET_API_KEYS = [key.strip() for key in (BITGET_API_KEY or "").split(",") if key.strip()]
-BITGET_SECRETS = [secret.strip() for secret in (BITGET_SECRET or "").split(",") if secret.strip()]
-BITGET_PASSPHRASES = [passphrase.strip() for passphrase in (BITGET_PASSPHRASE or "").split(",") if passphrase.strip()]
+
+def _collect_numbered_creds(prefix: str) -> List[str]:
+    collected = []
+    idx = 1
+    while True:
+        val = os.getenv(f"{prefix}_{idx}")
+        if not val:
+            break
+        collected.append(val.strip())
+        idx += 1
+    return [v for v in collected if v]
+
+
+# Support multiple API keys: either comma-separated or numbered envs (BITGET_API_KEY_1, _2, ...)
+numbered_keys = _collect_numbered_creds("BITGET_API_KEY")
+numbered_secrets = _collect_numbered_creds("BITGET_SECRET")
+numbered_passphrases = _collect_numbered_creds("BITGET_PASSPHRASE")
+
+if numbered_keys or numbered_secrets or numbered_passphrases:
+    BITGET_API_KEYS = numbered_keys
+    BITGET_SECRETS = numbered_secrets
+    BITGET_PASSPHRASES = numbered_passphrases
+else:
+    BITGET_API_KEYS = [key.strip() for key in (BITGET_API_KEY or "").split(",") if key.strip()]
+    BITGET_SECRETS = [secret.strip() for secret in (BITGET_SECRET or "").split(",") if secret.strip()]
+    BITGET_PASSPHRASES = [passphrase.strip() for passphrase in (BITGET_PASSPHRASE or "").split(",") if passphrase.strip()]
 
 # Validate that we have matching sets of credentials
 if len(BITGET_API_KEYS) != len(BITGET_SECRETS) or len(BITGET_SECRETS) != len(BITGET_PASSPHRASES):
