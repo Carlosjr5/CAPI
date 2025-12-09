@@ -2339,13 +2339,20 @@ async def debug_check_creds():
     # whether credentials are accepted (some endpoints expect POST with a body,
     # others accept GET with a query string). We'll report each attempt's
     # status and response so you can see whether the failure is auth-related
-    # (400) or path-related (404).
+    # (400) or path-related (404). Include a mix-account endpoint that requires
+    # productType to reduce false 404s.
     attempts = []
     candidates = []
     # Candidate: POST /api/v5/account/account-info
     candidates.append(("POST", "/api/v5/account/account-info", "{}"))
     # Candidate: GET /api/v5/account/account-info
     candidates.append(("GET", "/api/v5/account/account-info", ""))
+    # Candidate: POST mix account info (demo/prod futures)
+    mix_body = json.dumps({
+        "productType": resolve_product_type(),
+        "marginCoin": resolve_margin_coin(),
+    }, separators=(",", ":"))
+    candidates.append(("POST", "/api/v2/mix/account/account", mix_body))
 
     async with httpx.AsyncClient(timeout=8.0) as client:
         for method, path, body in candidates:
