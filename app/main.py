@@ -52,6 +52,7 @@ PAPTRADING = os.getenv("PAPTRADING", "1")
 TRADINGVIEW_SECRET = os.getenv("TRADINGVIEW_SECRET")
 BITGET_BASE = os.getenv("BITGET_BASE") or "https://api.bitget.com"
 BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")  # Use proper API product type for demo futures
+BITGET_MARGIN_MODE = os.getenv("BITGET_MARGIN_MODE", "isolated")  # crossed or isolated (default isolated)
 
 # For demo trading, use UMCBL product type
 if PAPTRADING == "1":
@@ -1437,6 +1438,9 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
 
     # For USDT futures, use USDT as margin coin
     use_margin_coin = margin_coin_env or "USDT"
+    margin_mode = (BITGET_MARGIN_MODE or "crossed").lower()
+    if margin_mode not in ("cross", "crossed", "isolated"):
+        margin_mode = "crossed"
 
     # Initialize body_obj with default values - use the working parameters from debug_order.py
     client_oid = f"capi-{uuid.uuid4().hex[:20]}"
@@ -1457,7 +1461,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
             "orderType": "market",
             "size": str(size) if size is not None else "0.001",  # Smaller default size like debug script
             "marginCoin": use_margin_coin,
-            "marginMode": "crossed",  # Use crossed like the working debug script
+            "marginMode": margin_mode,
             "clientOid": client_oid  # Unique per order to avoid Bitget duplicate errors
         }
 
