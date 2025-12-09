@@ -1514,6 +1514,12 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
         }
         if extra_fields:
             body_obj.update(extra_fields)
+        # Fallback holdSide for close requests if caller did not supply one
+        if "holdSide" not in body_obj:
+            try:
+                body_obj["holdSide"] = "long" if side.lower() == "buy" else "short"
+            except Exception:
+                pass
     else:
         body_obj = {
             "symbol": "",  # Will be set below
@@ -1561,6 +1567,13 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
             try:
                 inferred = "long" if side_key == "buy" else "short"
                 body_obj["positionSide"] = inferred
+            except Exception:
+                pass
+
+        # Explicit holdSide is required by some Bitget modes; align with side
+        if "holdSide" not in body_obj:
+            try:
+                body_obj["holdSide"] = "long" if side_key == "buy" else "short"
             except Exception:
                 pass
 
