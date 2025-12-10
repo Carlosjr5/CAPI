@@ -2770,6 +2770,7 @@ async def webhook(req: Request):
 
     # If opposite direction, close existing and open new
     if current_direction and current_direction != intended_direction and current_size and current_size > 0:
+        print(f"[webhook] Processing ENTRY alert for {symbol}: closing {current_direction} to open {intended_direction}")
         print(f"[webhook] Closing previous {current_direction} position for {symbol} before opening {intended_direction}")
         close_outcome = await close_open_positions_for_rotation(symbol, price_numeric, payload)
         print(f"[webhook] Close result: {close_outcome}")
