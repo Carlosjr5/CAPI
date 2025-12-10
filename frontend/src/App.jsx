@@ -869,11 +869,29 @@ function App() {
   const positionPnL = latestOpenTrade ? calculatePnL(latestOpenTrade) : null
 
   // Calculate total PnL metrics
-  const totalUnrealizedPnL = trades
-    .filter(t => mapStatus(t.status) === 'open')
-    .map(t => calculatePnL(t))
-    .filter(pnl => Number.isFinite(Number(pnl)))
-    .reduce((sum, pnl) => sum + pnl, 0)
+  // Prefer Bitget's live unrealized_pnl when we have a snapshot; fall back to calculatePnL(trade)
+  const totalUnrealizedPnL = (() => {
+    // Sum all Bitget snapshots first
+    const bitgetSum = Object.values(bitgetPositions || {})
+      .filter(p => p && p.found)
+      .map(p => Number(p.unrealized_pnl ?? p.unrealizedPnl ?? p.upl ?? p.unrealizedPL))
+      .filter(v => Number.isFinite(v))
+      .reduce((acc, v) => acc + v, 0)
+
+    // For any open trade that does NOT have a corresponding Bitget snapshot, use calculated PnL
+    const tradeFallbackSum = trades
+      .filter(t => mapStatus(t.status) === 'open')
+      .filter(t => {
+        const key = normalizeSymbolKey(t.symbol)
+        const snap = bitgetPositions[key]
+        return !(snap && snap.found)
+      })
+      .map(t => calculatePnL(t))
+      .filter(pnl => Number.isFinite(Number(pnl)))
+      .reduce((sum, pnl) => sum + pnl, 0)
+
+    return bitgetSum + tradeFallbackSum
+  })()
 
   const totalRealizedPnL = trades
     .filter(t => mapStatus(t.status) === 'closed')
