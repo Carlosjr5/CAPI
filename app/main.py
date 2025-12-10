@@ -2528,12 +2528,8 @@ async def webhook(req: Request):
                 p = float(price)
                 fetched_price = p
             else:
-                if price_hint:
-                    p = price_hint
-                    fetched_price = p
-                else:
-                    p = await get_market_price_with_retries(symbol)
-                    fetched_price = p
+                p = await get_market_price_with_retries(symbol)
+                fetched_price = p
             if p and p != 0:
                 # simple conversion: number of contracts = usd / price
                 computed_size = usd / p
@@ -2558,7 +2554,7 @@ async def webhook(req: Request):
             pass
 
     # If we fetched a market price to compute size, prefer that for DB storage
-    price_for_db = price or price_hint or (p if 'p' in locals() and p is not None else 0.0)
+    price_for_db = price or (p if 'p' in locals() and p is not None else 0.0)
     # If price still missing, attempt to fetch a market price (with retries).
     if not price_for_db:
         fetched = await get_market_price_with_retries(symbol)
