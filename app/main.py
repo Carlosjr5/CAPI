@@ -712,13 +712,39 @@ async def close_existing_bitget_position(trade_row) -> Tuple[bool, Optional[str]
                 continue
             break
 
+        # Try to size the fallback order to the live Bitget position to avoid oversizing errors
+        size_for_close = size_value
+        try:
+            pre_snapshot = await fetch_bitget_position(symbol)
+            pre_normalized = normalize_bitget_position(symbol, pre_snapshot) if pre_snapshot else None
+            if pre_normalized:
+                remaining = pre_normalized.get("size")
+                if remaining is None and pre_normalized.get("signed_size") is not None:
+                    try:
+                        remaining = abs(float(pre_normalized.get("signed_size")))
+                    except Exception:
+                        remaining = pre_normalized.get("signed_size")
+                if remaining is not None:
+                    try:
+                        size_for_close = min(size_value, float(remaining)) if size_value else float(remaining)
+                    except Exception:
+                        size_for_close = remaining
+        except Exception as lookup_exc:
+            try:
+                print(f"[close_position] failed to inspect Bitget position before fallback close: {lookup_exc}")
+            except Exception:
+                pass
+
+        if size_for_close is None or size_for_close <= 0:
+            size_for_close = 0.001
+
         # Fallback: send a reduce-only market order via place-order endpoint if close-positions failed
         try:
-            print(f"[close_position] Fallback reduce-only order for trade {trade_id} side={close_side} size={size_value}")
+            print(f"[close_position] Fallback reduce-only order for trade {trade_id} side={close_side} size={size_for_close}")
             fb_status, fb_resp = await place_demo_order(
                 symbol=symbol,
                 side=close_side,
-                size=size_value,
+                size=size_for_close,
                 reduce_only=True,
                 close_position=False,
                 extra_fields={"holdSide": hold_side},
@@ -835,6 +861,25 @@ async def place_demo_order(
             body_obj.pop(noisy_key, None)
 
     body = json.dumps(body_obj, separators=(',', ':'))  # compact body
+
+    # Some Bitget close-position endpoints expect key params in the query string.
+    # Mirror critical fields into the URL when closing so productType is never treated as missing.
+    if close_position:
+        query_params = {}
+        if body_obj.get("productType"):
+            query_params["productType"] = body_obj.get("productType")
+        if body_obj.get("symbol"):
+            query_params["symbol"] = body_obj.get("symbol")
+        if body_obj.get("marginCoin"):
+            query_params["marginCoin"] = body_obj.get("marginCoin")
+        if body_obj.get("marginMode"):
+            query_params["marginMode"] = body_obj.get("marginMode")
+        if query_params:
+            query_str = urllib.parse.urlencode(query_params)
+            request_path = request_path.split("?")[0]  # ensure no duplicate qs
+            request_path = f"{request_path}?{query_str}"
+            url = BITGET_BASE + request_path
+            candidates = [url]
     # If dry-run is enabled, don't call Bitget — return a simulated successful response
     # before we attempt to build signatures or make network calls. This avoids
     # errors when secrets are intentionally not provided during local testing.
@@ -1618,6 +1663,13 @@ async def debug_payload(req: Request, _: Dict[str, str] = Depends(require_role([
     payload["raw_symbol"] = raw_symbol
     payload["symbol"] = symbol
     price = payload.get("price")
+    price_hint = safe_float(
+        payload.get("position_avg_price")
+        or payload.get("avg_price")
+        or payload.get("avgPrice")
+        or payload.get("average_price")
+        or payload.get("averagePrice")
+    )
     # support both explicit size and USD-based size (mirrors /webhook behavior)
     size = payload.get("size")
     size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
@@ -2433,6 +2485,7 @@ async def webhook(req: Request):
     size = payload.get("size")
     size_usd = payload.get("size_usd") or payload.get("sizeUsd") or payload.get("sizeUSD")
     computed_size = None
+    fetched_price = None
     if size is not None:
         try:
             computed_size = float(size)
@@ -2445,13 +2498,24 @@ async def webhook(req: Request):
                 p = float(price)
                 fetched_price = p
             else:
-                p = await get_market_price_with_retries(symbol)
-                fetched_price = p
+                if price_hint:
+                    p = price_hint
+                    fetched_price = p
+                else:
+                    p = await get_market_price_with_retries(symbol)
+                    fetched_price = p
             if p and p != 0:
                 # simple conversion: number of contracts = usd / price
                 computed_size = usd / p
             else:
                 raise HTTPException(status_code=400, detail="Missing price and unable to fetch market price; include price in the webhook or try again")
+        except Exception:
+            computed_size = None
+
+    # Fallback to explicit position size supplied by TradingView when size_usd conversion fails
+    if computed_size is None and payload.get("position_size") not in (None, ""):
+        try:
+            computed_size = float(payload.get("position_size"))
         except Exception:
             computed_size = None
 
@@ -2464,7 +2528,7 @@ async def webhook(req: Request):
             pass
 
     # If we fetched a market price to compute size, prefer that for DB storage
-    price_for_db = price or (p if 'p' in locals() and p is not None else 0.0)
+    price_for_db = price or price_hint or (p if 'p' in locals() and p is not None else 0.0)
     # If price still missing, attempt to fetch a market price (with retries).
     if not price_for_db:
         fetched = await get_market_price_with_retries(symbol)
