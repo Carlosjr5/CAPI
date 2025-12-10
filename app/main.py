@@ -799,42 +799,16 @@ async def place_demo_order(
     reduce_only: bool = False,
     close_position: bool = False,
     extra_fields: Optional[Dict[str, Any]] = None,
-    try:
-        fetched_rows = await database.fetch_all(trades.select().where((trades.c.status == "placed") & (trades.c.symbol == new_symbol)))
-    else:
-        fetched_rows = await database.fetch_all(trades.select().where(trades.c.status == "placed"))
-    closing_rows = [dict(row) for row in fetched_rows]
-    except Exception:
-        closing_rows = []
+):
+    """
+    Place an order on Bitget demo futures (v2 mix order)
+    We'll place a market order by default. Modify `orderType` to 'limit' if you want limit.
+    """
+    # Use Bitget mix API for futures order placement
+    if close_position:
         candidates = [
             BITGET_BASE + "/api/v2/mix/order/close-positions",
-        # If DB has no placed rows, attempt a direct Bitget close using the live position snapshot
-        synthetic_closed: List[str] = []
-        synthetic_failed: List[str] = []
-        failure_details: Dict[str, Optional[str]] = {}
-        try:
-            snapshot = await fetch_bitget_position(new_symbol) if new_symbol else None
-            normalized = normalize_bitget_position(new_symbol, snapshot) if snapshot else None
-            if normalized and normalized.get("size"):
-                synthetic_row = {
-                    "id": f"bitget-live-{new_symbol}-{int(time.time())}",
-                    "symbol": new_symbol,
-                    "signal": "SELL" if str(normalized.get("side") or "").lower() in ("long", "buy") else "BUY",
-                    "size": normalized.get("size"),
-                    "price": normalized.get("avg_open_price") or normalized.get("mark_price") or fallback_price,
-                    "size_usd": normalized.get("size_usd"),
-                }
-                success, detail = await close_existing_bitget_position(synthetic_row)
-                if success:
-                    synthetic_closed.append(synthetic_row["id"])
-                else:
-                    synthetic_failed.append(synthetic_row["id"])
-                    if detail:
-                        failure_details[synthetic_row["id"]] = detail
-        except Exception as synthetic_exc:
-            synthetic_failed.append(f"bitget-live-{new_symbol or 'unknown'}")
-            failure_details[f"bitget-live-{new_symbol or 'unknown'}"] = str(synthetic_exc)
-        return {"closed": synthetic_closed, "failed": synthetic_failed, "errors": failure_details}
+        ]
     else:
         candidates = [
             BITGET_BASE + "/api/v2/mix/order/place-order",
@@ -1370,7 +1344,34 @@ async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_
         closing_rows = []
 
     if not closing_rows:
-        return {"closed": [], "failed": []}
+        # If DB has no placed rows, attempt to close any live Bitget position so rotation can proceed
+        synthetic_closed: List[str] = []
+        synthetic_failed: List[str] = []
+        failure_details: Dict[str, Optional[str]] = {}
+        try:
+            snapshot = await fetch_bitget_position(new_symbol) if new_symbol else None
+            normalized = normalize_bitget_position(new_symbol, snapshot) if snapshot else None
+            if normalized and normalized.get("size"):
+                synthetic_row = {
+                    "id": f"bitget-live-{new_symbol}-{int(time.time())}",
+                    "symbol": new_symbol,
+                    # If live side is long, closing requires sell; if short, closing requires buy
+                    "signal": "SELL" if str(normalized.get("side") or "").lower() in ("long", "buy") else "BUY",
+                    "size": normalized.get("size"),
+                    "price": normalized.get("avg_open_price") or normalized.get("mark_price") or fallback_price,
+                    "size_usd": normalized.get("size_usd"),
+                }
+                success, detail = await close_existing_bitget_position(synthetic_row)
+                if success:
+                    synthetic_closed.append(synthetic_row["id"])
+                else:
+                    synthetic_failed.append(synthetic_row["id"])
+                    if detail:
+                        failure_details[synthetic_row["id"]] = detail
+        except Exception as synthetic_exc:
+            synthetic_failed.append(f"bitget-live-{new_symbol or 'unknown'}")
+            failure_details[f"bitget-live-{new_symbol or 'unknown'}"] = str(synthetic_exc)
+        return {"closed": synthetic_closed, "failed": synthetic_failed, "errors": failure_details}
 
     payload_dict = payload if isinstance(payload, dict) else {}
     price_cache: Dict[str, Optional[float]] = {}
