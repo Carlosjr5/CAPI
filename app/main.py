@@ -1612,7 +1612,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
         # Fallback holdSide for close requests if caller did not supply one
         if "holdSide" not in body_obj:
             try:
-                body_obj["holdSide"] = "long" if side.lower() == "buy" else "short"
+                body_obj["holdSide"] = "long" if side.lower() == "sell" else "short"
             except Exception:
                 pass
     else:
@@ -1660,7 +1660,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
             body_obj["positionSide"] = BITGET_POSITION_SIDE
         else:
             try:
-                inferred = "long" if side_key == "buy" else "short"
+                inferred = "long" if side_key == "sell" else "short"
                 body_obj["positionSide"] = inferred
             except Exception:
                 pass
@@ -1668,7 +1668,7 @@ def construct_bitget_payload(symbol: str, side: str, size: float = None, *, redu
         # Explicit holdSide is required by some Bitget modes; align with side
         if "holdSide" not in body_obj:
             try:
-                body_obj["holdSide"] = "long" if side_key == "buy" else "short"
+                body_obj["holdSide"] = "long" if side_key == "sell" else "short"
             except Exception:
                 pass
 
@@ -2710,11 +2710,11 @@ async def webhook(req: Request):
 
     intended_direction = None
     if signal and signal.upper() in ("BUY", "LONG"):
-        intended_direction = "long"
-        side = "buy"
-    elif signal and signal.upper() in ("SELL", "SHORT"):
-        intended_direction = "short"
+        intended_direction = "short"  # Inverted: BUY now means short
         side = "sell"
+    elif signal and signal.upper() in ("SELL", "SHORT"):
+        intended_direction = "long"  # Inverted: SELL now means long
+        side = "buy"
     else:
         await database.execute(trades.update().where(trades.c.id==trade_id_from_payload).values(status="ignored", response="Unknown signal", reservation_key=None))
         await broadcast({"type":"ignored","id":trade_id_from_payload,"reason":"unknown signal"})
