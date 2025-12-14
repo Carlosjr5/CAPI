@@ -2710,11 +2710,11 @@ async def webhook(req: Request):
 
     intended_direction = None
     if signal and signal.upper() in ("BUY", "LONG"):
-        intended_direction = "short"  # Inverted: BUY now means short
-        side = "sell"
-    elif signal and signal.upper() in ("SELL", "SHORT"):
-        intended_direction = "long"  # Inverted: SELL now means long
+        intended_direction = "long"
         side = "buy"
+    elif signal and signal.upper() in ("SELL", "SHORT"):
+        intended_direction = "short"
+        side = "sell"
     else:
         await database.execute(trades.update().where(trades.c.id==trade_id_from_payload).values(status="ignored", response="Unknown signal", reservation_key=None))
         await broadcast({"type":"ignored","id":trade_id_from_payload,"reason":"unknown signal"})
