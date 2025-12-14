@@ -1355,8 +1355,8 @@ async def close_open_positions_for_rotation(new_symbol: Optional[str], fallback_
                 synthetic_row = {
                     "id": f"bitget-live-{new_symbol}-{int(time.time())}",
                     "symbol": new_symbol,
-                    # If live side is long, closing requires sell; if short, closing requires buy
-                    "signal": "SELL" if str(normalized.get("side") or "").lower() in ("long", "buy") else "BUY",
+                    # Signal should match the position side for correct holdSide calculation
+                    "signal": "BUY" if str(normalized.get("side") or "").lower() in ("long", "buy") else "SELL",
                     "size": normalized.get("size"),
                     "price": normalized.get("avg_open_price") or normalized.get("mark_price") or fallback_price,
                     "size_usd": normalized.get("size_usd"),
